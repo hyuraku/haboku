@@ -1,0 +1,13 @@
+[package]
+name = "haboku"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# iced 0.14。features の理由（ADR-0001 / spike の実測）:
+#   highlighter … コードブロックのシンタックスハイライト（syntect を iced_highlighter 越しに使う）
+#   advanced    … text_input / editor の低レベル API に触るため
+#   tokio       … `iced::time::every` は iced_futures のランタイム backend 越しに生える。
+#                 tokio か smol を選ぶまで `time::every` はそもそも名前解決に失敗する（自動保存のデバウンスに要る）
+[dependencies]
+iced = { version = "0.14", features = ["highlighter", "advanced", "tokio"] }

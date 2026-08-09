@@ -1,0 +1,221 @@
+//! あいまい一致。`Cmd+P` の心臓部。
+//!
+//! 「文字が飛び飛びでも当たる」＝ クエリが対象の**部分列**であればマッチ、という定義。
+//! `bstnt` が `Boostnote 終了の件` に当たるのはこの性質による。
+//!
+//! 総当りの DP なら最適なマッチ位置を選べるが、貪欲法で十分実用になる。
+//! 約 1200 件 × 数十文字 × クエリ数文字を毎打鍵で回すので、速いほうを採る。
+
+use std::ops::Range;
+
+#[derive(Debug, Clone)]
+pub struct Match {
+    /// 大きいほど良い。並び替えにのみ使い、絶対値に意味は無い。
+    pub score: i32,
+    /// マッチした文字の**バイト範囲**。そのままハイライトに渡せる。
+    pub ranges: Vec<Range<usize>>,
+}
+
+/// 先頭一致のご褒美。「打ち始めた文字で始まるもの」を最優先したい。
+const BONUS_FIRST: i32 = 16;
+/// 単語の頭に当たったご褒美。`fx` が `foo-xyz` に当たる類。
+const BONUS_WORD_START: i32 = 10;
+/// 連続して当たったご褒美。ばらけたマッチより固まったマッチを上に出す。
+const BONUS_CONSECUTIVE: i32 = 8;
+/// 読み飛ばした分の減点。離れたマッチを下げる。累積しすぎないよう頭打ちにする。
+const PENALTY_GAP: i32 = 1;
+const PENALTY_GAP_MAX: i32 = 12;
+
+/// `query` が `target` の部分列なら `Some`。大文字小文字は無視する。
+///
+/// 空クエリは「全部当たる」= スコア 0 で返す。呼び出し側で分岐せずに済む。
+pub fn match_query(query: &str, target: &str) -> Option<Match> {
+    if query.is_empty() {
+        return Some(Match {
+            score: 0,
+            ranges: Vec::new(),
+        });
+    }
+
+    // 対象を (元文字列でのバイト範囲, 正規化後の文字) で持つ。
+    // 半角カナの濁点合成（ｶ+ﾞ → が）で 2 文字が 1 文字に畳まれることがあるため、
+    // 位置は開始バイトではなく範囲で持つ。ハイライトにそのまま渡せる。
+    let chars = fold(target);
+
+    let mut score = 0;
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let mut ti = 0usize; // target 側の走査位置
+    let mut last_matched: Option<usize> = None;
+
+    for (_, qc) in fold(query) {
+        // qc に当たる最初の位置まで進める
+        let found = chars[ti..]
+            .iter()
+            .position(|(_, tc)| *tc == qc)
+            .map(|off| ti + off)?; // 見つからなければ即 None（部分列でない）
+
+        // ── 加点 ──
+        if found == 0 {
+            score += BONUS_FIRST;
+        } else if is_word_boundary(&chars, found) {
+            score += BONUS_WORD_START;
+        }
+        if last_matched == Some(found.wrapping_sub(1)) {
+            score += BONUS_CONSECUTIVE;
+        }
+
+        // ── 減点：読み飛ばした距離 ──
+        let skipped = match last_matched {
+            Some(prev) => found.saturating_sub(prev + 1),
+            None => found,
+        } as i32;
+        score -= (skipped * PENALTY_GAP).min(PENALTY_GAP_MAX);
+
+        ranges.push(chars[found].0.clone());
+        last_matched = Some(found);
+        ti = found + 1;
+    }
+
+    // 短い対象を優先する。同じだけ当たったなら、余計な文字が少ないほうが狙いに近い。
+    score -= (chars.len() as i32) / 8;
+
+    Some(Match { score, ranges })
+}
+
+/// 文字列を (バイト範囲, 正規化済み文字) の列に畳む。
+///
+/// 半角カナの濁点・半濁点（ﾞ ﾟ）は直前の文字と合成する（ｶ+ﾞ → が）。
+/// 合成できたときは範囲が元の 2 文字分に広がるので、ハイライトも自然に繋がる。
+fn fold(s: &str) -> Vec<(Range<usize>, char)> {
+    let mut out: Vec<(Range<usize>, char)> = Vec::new();
+    for (i, c) in s.char_indices() {
+        let end = i + c.len_utf8();
+        if matches!(c, '\u{FF9E}' | '\u{FF9F}')
+            && let Some(last) = out.last_mut()
+            && let Some(voiced) = voice(last.1, c == '\u{FF9F}')
+        {
+            last.0.end = end;
+            last.1 = voiced;
+            continue;
+        }
+        out.push((i..end, lower(c)));
+    }
+    out
+}
+
+/// ひらがな1文字に濁点（semi=false）/ 半濁点（semi=true）を付ける。付かない文字は None。
+/// ひらがなブロックは清音の直後に濁音（は→ば）、その次に半濁音（ぱ）が並ぶ。
+fn voice(c: char, semi: bool) -> Option<char> {
+    if semi {
+        return matches!(c, 'は' | 'ひ' | 'ふ' | 'へ' | 'ほ')
+            .then(|| char::from_u32(c as u32 + 2))
+            .flatten();
+    }
+    match c {
+        'か' | 'き' | 'く' | 'け' | 'こ' | 'さ' | 'し' | 'す' | 'せ' | 'そ' | 'た' | 'ち'
+        | 'つ' | 'て' | 'と' | 'は' | 'ひ' | 'ふ' | 'へ' | 'ほ' => {
+            char::from_u32(c as u32 + 1)
+        }
+        'う' => Some('ゔ'),
+        _ => None,
+    }
+}
+
+/// 半角カナ（U+FF66..=U+FF9D）→ ひらがな。濁点合成は fold 側でやる。
+const HALFWIDTH_KANA: [char; 56] = [
+    'を', 'ぁ', 'ぃ', 'ぅ', 'ぇ', 'ぉ', 'ゃ', 'ゅ', 'ょ', 'っ', 'ー', 'あ', 'い', 'う', 'え', 'お',
+    'か', 'き', 'く', 'け', 'こ', 'さ', 'し', 'す', 'せ', 'そ', 'た', 'ち', 'つ', 'て', 'と', 'な',
+    'に', 'ぬ', 'ね', 'の', 'は', 'ひ', 'ふ', 'へ', 'ほ', 'ま', 'み', 'む', 'め', 'も', 'や', 'ゆ',
+    'よ', 'ら', 'り', 'る', 'れ', 'ろ', 'わ', 'ん',
+];
+
+/// 比較用に1文字を均す。**全角→半角に加えて、かなも一つの表記に寄せる。**
+///
+/// 日本語入力モードのまま数字や英字を打つと全角（`６０` `Ａ`）になり、
+/// タイトル側はほぼ半角なので素朴に比較すると一件も当たらない
+/// （実際「1 や 60 に反応しない」という形で表面化した）。
+/// カタカナ⇄ひらがな・半角カナも、IME の状態や書いた時の気分で揺れるだけで
+/// 検索する人にとっては同じ文字。全部ひらがなに畳んで比較する。
+fn lower(c: char) -> char {
+    let c = match c {
+        // 全角 ASCII（！..～ = U+FF01..U+FF5E）は 0xFEE0 引くと半角 ASCII になる。
+        '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+        // 全角スペースも半角に寄せる。
+        '\u{3000}' => ' ',
+        // カタカナ（ァ..ヶ）→ ひらがな。0x60 引くだけで対応が取れる。
+        '\u{30A1}'..='\u{30F6}' => char::from_u32(c as u32 - 0x60).unwrap_or(c),
+        // 半角カナ → ひらがな。
+        '\u{FF66}'..='\u{FF9D}' => HALFWIDTH_KANA[(c as u32 - 0xFF66) as usize],
+        other => other,
+    };
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+/// 単語の先頭か。区切り文字の直後、または camelCase の切れ目。
+/// 日本語には単語境界がほぼ無いので、実質的には連続ボーナスが効く。
+fn is_word_boundary(chars: &[(Range<usize>, char)], i: usize) -> bool {
+    if i == 0 {
+        return true;
+    }
+    let prev = chars[i - 1].1;
+    let cur = chars[i].1;
+    matches!(prev, ' ' | '-' | '_' | '/' | '.' | '(' | '[' | '、' | '・')
+        || (prev.is_lowercase() && cur.is_uppercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subsequence_matches() {
+        assert!(match_query("bstnt", "Boostnote 終了の件").is_some());
+        assert!(match_query("xyz", "Boostnote").is_none());
+    }
+
+    #[test]
+    fn japanese_matches() {
+        assert!(match_query("移行メモ", "ブーストノート移行メモ").is_some());
+    }
+
+    /// 日本語入力モードのまま打つと全角になる。ここが当たらないと
+    /// 「数字で検索できない」という形で壊れる（実際に踏んだ）。
+    #[test]
+    fn fullwidth_query_matches_halfwidth_target() {
+        assert!(match_query("６０", "60分で学ぶ最新Webフロントエンド").is_some());
+        assert!(match_query("１", "1 Billion Row Challenge (1BRC)").is_some());
+        assert!(match_query("ＬＬＭ", "1-bit LLM / Ternary LLM").is_some());
+    }
+
+    /// 逆向き（半角クエリ・全角タイトル）も当たること。
+    #[test]
+    fn halfwidth_query_matches_fullwidth_target() {
+        assert!(match_query("60", "６０分で学ぶ").is_some());
+    }
+
+    /// カタカナ⇄ひらがな・半角カナは同じ文字として当たること。
+    /// 濁点付き半角カナ（ﾎﾞ = 2文字）も合成して1文字（ぼ）として扱う。
+    #[test]
+    fn kana_variants_match() {
+        assert!(match_query("ぶーすと", "Boostnote ブースト移行").is_some());
+        assert!(match_query("ブースト", "ぶーすとのメモ").is_some());
+        assert!(match_query("ﾎﾞｰﾄ", "ボート競技").is_some());
+        assert!(match_query("ぼーと", "ﾎﾞｰﾄの写真").is_some());
+        assert!(match_query("ぱん", "ﾊﾟﾝの店").is_some());
+    }
+
+    /// 濁点合成のハイライト範囲は半角カナ2文字分をひとつながりで覆うこと。
+    #[test]
+    fn halfwidth_dakuten_highlight_spans_both_chars() {
+        let m = match_query("ぼ", "ﾎﾞｰﾄ").unwrap();
+        // ﾎ(3byte) + ﾞ(3byte) = 0..6
+        assert_eq!(m.ranges, vec![0..6]);
+    }
+
+    #[test]
+    fn prefix_scores_higher_than_scattered() {
+        let prefix = match_query("boo", "Boostnote").unwrap();
+        let scattered = match_query("boo", "abcbdoeo").unwrap();
+        assert!(prefix.score > scattered.score);
+    }
+}
