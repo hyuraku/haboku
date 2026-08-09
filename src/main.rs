@@ -45,6 +45,13 @@ const TICK: Duration = Duration::from_millis(100);
 /// パレットの入力欄を名指しする ID。開いた瞬間にフォーカスを飛ばすのに要る。
 const PALETTE_INPUT_ID: &str = "palette-input";
 
+/// エディタを名指しする ID。`Cmd+N` の直後にフォーカスを飛ばすのに要る。
+const EDITOR_ID: &str = "editor";
+
+/// 新規ノートのファイル名。秒精度なので同一秒の連打は衝突する
+/// （`vault::reserve_unique` が枝番を付けて防ぐ）。
+const NEW_NOTE_NAME_FORMAT: &str = "%Y-%m-%d-%H%M%S";
+
 /// パレットに一度に描く最大件数。約 1200 件を全部並べても人は読まない。
 /// 絞り込むための道具なので上位だけ出せば足りる。
 const PALETTE_MAX_RESULTS: usize = 50;
@@ -139,6 +146,8 @@ enum Message {
     PaletteQueryChanged(String),
     /// パレットを閉じる。✕ ボタンと背景クリックから飛ぶ。
     PaletteClose,
+    /// ノートを新規作成する（`Cmd+N`）。
+    NewNote,
 }
 
 /// **いつディスクへ書くかを決める、この機能の心臓部。**
@@ -178,6 +187,16 @@ fn count_folders(notes: &[vault::Note]) -> Vec<(String, usize)> {
         .collect();
     out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     out
+}
+
+/// `notes` を触ったあとに、そこから導かれる状態（フォルダ件数・一覧）を作り直す。
+///
+/// **`notes` を変更したら必ずここを通すこと。** 派生状態が 2 つあると片方だけ更新する
+/// コードが書けてしまい、「新規作成してもサイドバーの件数が増えない」という食い違いになる
+/// （実際に踏んだ）。約 1200 件を数え直すが、作成・削除は打鍵と違ってホットパスではない。
+fn refresh_derived(app: &mut App) {
+    app.folders = count_folders(&app.notes);
+    app.visible = visible_indices(&app.notes, app.selected_folder.as_deref());
 }
 
 /// 一覧に出すノートの index を作り直す。フォルダ選択が変わった時だけ呼ぶ。
@@ -276,6 +295,58 @@ fn open_note(app: &mut App, index: usize) {
     }
 }
 
+/// 新規ノートを作って `notes` の先頭に差し込む。返り値は挿入した位置（常に 0）。
+///
+/// 置き場所は**いま絞り込んでいるフォルダ**。絞り込んでいなければ開いているノートと
+/// 同じフォルダ、それも無ければ vault ルート。
+///
+/// 順序が逆だと（開いているノートを優先すると）、`topics` のノートを開いたまま `notes` で
+/// 絞り込んで `Cmd+N` したときに `topics` へ作られ、それを見せるために絞り込みが解除される。
+/// **見ているフォルダに増える**ほうが期待に近い（実際に触って分かった）。
+///
+/// 先頭に差し込むのは、一覧が読み込み時の順序（更新日時の新しい順）で固定されているから。
+/// 末尾に足すと 約 1200 件スクロールした先に出て「作ったのに見えない」になる。
+fn create_note(app: &mut App) -> Result<usize, String> {
+    let dir = app
+        .selected_folder
+        .as_ref()
+        .map(|folder| app.root.join(folder))
+        .or_else(|| {
+            app.selected
+                .and_then(|i| app.notes[i].path.parent().map(|p| p.to_path_buf()))
+        })
+        .unwrap_or_else(|| app.root.clone());
+
+    let name = format!("{}.md", chrono::Local::now().format(NEW_NOTE_NAME_FORMAT));
+    // `reserve_unique` は `create_new` で空ファイルを確保するので、同一秒に連打しても
+    // 既存を上書きしない（`-2`, `-3` と枝番が付く）。
+    let path = vault::reserve_unique(&dir, &name).map_err(|e| format!("作成に失敗: {e}"))?;
+    let note = vault::parse_note(&app.root, path, String::new(), std::time::SystemTime::now());
+
+    // **先頭への差し込みで既存のインデックスが全部 1 つずれる。** ここを忘れると
+    // 「作成した瞬間に、開いていたノートが隣のノートにすり替わる」バグになる。
+    app.notes.insert(0, note);
+    if let Some(selected) = app.selected {
+        app.selected = Some(selected + 1);
+    }
+
+    // 作ったノートが絞り込みの外に出るなら、絞り込みを解除する。
+    // 「作成したノートは必ず一覧に見える」を保つための最後の砦（パレットと同じ規則）。
+    // 絞り込み中は必ずそのフォルダに作るので通常は発火しない。フォルダ名とパスの対応が
+    // 崩れたとき（vault の外を指す絞り込み等）に、見えないノートを作らないための保険。
+    if app
+        .selected_folder
+        .as_deref()
+        .is_some_and(|folder| folder != app.notes[0].folder)
+    {
+        app.selected_folder = None;
+    }
+    // フォルダ件数も作り直す。忘れるとサイドバーの数字が増えない。
+    refresh_derived(app);
+
+    Ok(0)
+}
+
 /// クエリで全ノートを絞り込む。**パレットが開いている間ずっとではなく、クエリが変わった時だけ。**
 ///
 /// 絞り込み中のフォルダは無視して**全ノート**を対象にする。`Cmd+P` は「どのフォルダにいても
@@ -324,9 +395,16 @@ fn handle_palette_key(app: &mut App, key: &keyboard::Key, modifiers: keyboard::M
             }
             app.palette = None;
             // 検索は全ノートが対象なので、別フォルダのノートが当たる。そのまま開くと
-            // 「選択中のノートが左の一覧に無い」状態になるため、絞り込みを解除して
-            // 開いたノートが必ず一覧に見えるようにする。
-            if app.selected_folder.is_some() {
+            // 「選択中のノートが左の一覧に無い」状態になるため、そのときだけ絞り込みを解除する。
+            //
+            // **絞り込みの中のノートなら何もしない。** 以前はここで無条件に解除していて、
+            // 「topics で絞り込んで topics のノートを開いたのに、すべてに戻る」動きになっていた。
+            // 守りたいのは「開いたノートが一覧に見える」ことであって、解除そのものではない。
+            let hidden_by_filter = app
+                .selected_folder
+                .as_deref()
+                .is_some_and(|folder| folder != app.notes[index].folder);
+            if hidden_by_filter {
                 app.selected_folder = None;
                 app.visible = visible_indices(&app.notes, None);
             }
@@ -398,6 +476,22 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::PaletteClose => app.palette = None,
+        Message::NewNote => {
+            // 作成もエディタを上書きする操作なので、切替と同じ保存ガードを通す。
+            if !save_now(app) {
+                return Task::none();
+            }
+            // インデックスがずれるので、古い `matches` を持ったパレットは畳む。
+            app.palette = None;
+            match create_note(app) {
+                Ok(index) => {
+                    open_note(app, index);
+                    // 作った直後に打ち始められるようにフォーカスを移す。
+                    return iced::widget::operation::focus(iced::widget::Id::new(EDITOR_ID));
+                }
+                Err(e) => app.error = Some(e),
+            }
+        }
         Message::Key(event) => {
             let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
                 return Task::none();
@@ -421,6 +515,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 });
                 // 開いた瞬間に入力欄へフォーカスを飛ばす。これが無いと「開いたのに打てない」。
                 return iced::widget::operation::focus(iced::widget::Id::new(PALETTE_INPUT_ID));
+            }
+
+            // `Cmd+N` で新規作成。パレットが開いていても効く（中で畳む）。
+            if modifiers.command() && matches!(&key, keyboard::Key::Character(c) if c == "n") {
+                return update(app, Message::NewNote);
             }
 
             handle_palette_key(app, &key, modifiers);
@@ -517,6 +616,7 @@ fn note_pane(app: &App) -> Element<'_, Message> {
 
 fn editor_pane(app: &App) -> Element<'_, Message> {
     text_editor(&app.content)
+        .id(iced::widget::Id::new(EDITOR_ID))
         .on_action(Message::Edit)
         .font(EDITOR_FONT)
         // 日本語には単語境界がほぼ無く、既定の `Word` だと長い段落が 1 つの巨大な単語になる。
@@ -926,6 +1026,149 @@ mod tests {
         assert!(!should_save(now, last_edit, dirty_since));
     }
 
+    /// 新規ノートは**開いているノートと同じフォルダ**に作られ、一覧の先頭に出ること。
+    #[test]
+    fn new_note_lands_next_to_the_open_note_and_appears_first() {
+        let (dir, mut app) =
+            app_with_folders("new-note", &[("topics", "設計メモ"), ("notes", "走り書き")]);
+
+        // notes フォルダのノートを開いてから作る。
+        let open = app
+            .notes
+            .iter()
+            .position(|n| n.folder == "notes")
+            .expect("notes のノートが無い");
+        send(&mut app, Message::NoteSelected(open));
+        send(&mut app, Message::NewNote);
+
+        let created = app.selected.expect("作ったノートが開かれていない");
+        assert_eq!(created, 0, "新規ノートが一覧の先頭に来ていない");
+        assert_eq!(app.notes[0].folder, "notes", "開いていたノートと別のフォルダに作られた");
+        assert!(app.notes[0].path.exists(), "ファイルが作られていない");
+        assert!(app.visible.contains(&0), "作ったノートが一覧に見えていない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **作成したらサイドバーのフォルダ件数も増えること。**
+    ///
+    /// `folders` は起動時に 1 回数えるだけだったので、作っても数字が動かなかった。
+    /// `notes` から導かれる状態を更新し忘れる類の食い違いなので、回帰テストとして残す。
+    #[test]
+    fn creating_a_note_updates_the_folder_count() {
+        let (dir, mut app) =
+            app_with_folders("folder-count", &[("notes", "あ"), ("notes", "い")]);
+        let before = app
+            .folders
+            .iter()
+            .find(|(name, _)| name == "notes")
+            .map(|(_, count)| *count)
+            .expect("notes フォルダが無い");
+        assert_eq!(before, 2);
+
+        send(&mut app, Message::FolderSelected(Some("notes".to_string())));
+        send(&mut app, Message::NewNote);
+
+        let after = app
+            .folders
+            .iter()
+            .find(|(name, _)| name == "notes")
+            .map(|(_, count)| *count)
+            .expect("notes フォルダが消えた");
+        assert_eq!(after, before + 1, "サイドバーの件数が増えていない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **先頭への差し込みで既存インデックスがずれても、開いているノートがすり替わらないこと。**
+    ///
+    /// `selected` の付け替えを忘れると、作成した瞬間に隣のノートを編集し始める。
+    /// 再現条件が分かりにくいので回帰テストとして残す。
+    #[test]
+    fn creating_a_note_does_not_swap_the_previously_open_note() {
+        let (dir, mut app) =
+            app_with_folders("reindex", &[("topics", "あ"), ("topics", "い"), ("topics", "う")]);
+        send(&mut app, Message::NoteSelected(2));
+        let before = app.notes[2].title.clone();
+
+        // 作った直後は新規ノートが開くので、元のノートへ戻って同じものかを見る。
+        send(&mut app, Message::NewNote);
+        let moved = app
+            .notes
+            .iter()
+            .position(|n| n.title == before)
+            .expect("元のノートが消えた");
+        send(&mut app, Message::NoteSelected(moved));
+
+        assert_eq!(app.notes[app.selected.unwrap()].title, before);
+        assert!(
+            app.content.text().contains("本文"),
+            "別のノートの本文が開いている"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同一秒に連打しても両方残ること（ファイル名は秒精度）。
+    #[test]
+    fn creating_twice_in_the_same_second_keeps_both() {
+        let (dir, mut app) = app_with_folders("same-second", &[("topics", "あ")]);
+        send(&mut app, Message::NoteSelected(0));
+
+        send(&mut app, Message::NewNote);
+        let first = app.notes[0].path.clone();
+        send(&mut app, Message::NewNote);
+        let second = app.notes[0].path.clone();
+
+        assert_ne!(first, second, "同じパスを 2 回使っている");
+        assert!(first.exists() && second.exists(), "先に作ったファイルが消えた");
+        assert_eq!(app.notes.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **保存に失敗したら新規作成もしないこと。** 作成もエディタを上書きする操作。
+    #[test]
+    fn new_note_is_blocked_when_saving_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, mut app) = app_with_folders("new-note-blocked", &[("topics", "あ")]);
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, insert('X'));
+
+        let sub = dir.join("topics");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        send(&mut app, Message::NewNote);
+
+        assert_eq!(app.notes.len(), 1, "保存に失敗したのにノートが増えた");
+        assert!(app.content.text().contains('X'), "編集内容が消えた");
+        assert!(app.error.is_some());
+
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **絞り込み中は、開いているノートのフォルダより絞り込みが優先されること。**
+    ///
+    /// 逆にすると「`notes` を見ているのに `topics` に作られ、それを見せるために
+    /// 一覧がすべてに戻る」という動きになる（実際に触って直した）。
+    #[test]
+    fn creating_while_filtered_uses_that_folder_and_keeps_the_filter() {
+        let (dir, mut app) =
+            app_with_folders("filter-wins", &[("topics", "設計メモ"), ("notes", "走り書き")]);
+
+        // topics のノートを開いたまま、notes で絞り込んで作る。
+        let topics = app.notes.iter().position(|n| n.folder == "topics").unwrap();
+        send(&mut app, Message::NoteSelected(topics));
+        send(&mut app, Message::FolderSelected(Some("notes".to_string())));
+        send(&mut app, Message::NewNote);
+
+        assert_eq!(app.notes[0].folder, "notes", "見ているフォルダに作られていない");
+        assert_eq!(
+            app.selected_folder.as_deref(),
+            Some("notes"),
+            "絞り込みが勝手に解除された"
+        );
+        assert!(app.visible.contains(&0), "作ったノートが一覧に見えていない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **実データで `view()` の構築時間を測る。** Done の定義は打鍵時 1ms 未満。
     ///
     /// 実データが要るので既定では走らせない（環境依存のテストを CI に混ぜない）。
@@ -1021,6 +1264,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **絞り込みの中のノートをパレットから開いたときは、絞り込みを維持すること。**
+    ///
+    /// 以前は無条件に解除していて「topics で絞り込んで topics のノートを開いたのに
+    /// すべてに戻る」動きになっていた。解除は「開いたノートが一覧から消える」ときだけの手段。
+    #[test]
+    fn palette_keeps_the_filter_when_the_note_is_already_visible() {
+        let (dir, mut app) = app_with_folders(
+            "palette-keeps-filter",
+            &[("topics", "設計メモ"), ("topics", "別の設計"), ("notes", "走り書き")],
+        );
+        send(&mut app, Message::FolderSelected(Some("topics".to_string())));
+
+        open_palette(&mut app, "設計メモ");
+        handle_palette_key(&mut app, &named(keyboard::key::Named::Enter), <_>::default());
+
+        assert_eq!(app.notes[app.selected.unwrap()].title, "設計メモ");
+        assert_eq!(
+            app.selected_folder.as_deref(),
+            Some("topics"),
+            "同じフォルダのノートを開いただけで絞り込みが解除された"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **保存に失敗したらパレットからも遷移しないこと。** 一覧クリックと同じガードが要る。
     /// パレットは閉じない（閉じてから中断すると、なぜ切り替わらないのかが分からなくなる）。
     #[test]
@@ -1092,6 +1359,14 @@ mod tests {
         // 推論が決まらない（そして `()` は何もしないダミーなので、この検証には使えない）。
         let content: text_editor::Content = text_editor::Content::with_text(raw);
         assert_eq!(content.text(), raw, "エディタを往復しただけで本文が変わっている");
+    }
+
+    /// **空のノートでも往復が一致すること。** `Cmd+N` が作るのは空ファイルなので、
+    /// ここで改行が 1 つ生えると、作った直後に開いて閉じるだけで書き込みが走る。
+    #[test]
+    fn editor_roundtrip_keeps_an_empty_note_empty() {
+        let content: text_editor::Content = text_editor::Content::with_text("");
+        assert_eq!(content.text(), "");
     }
 
     /// 末尾改行が無いファイルでも往復が一致すること。
