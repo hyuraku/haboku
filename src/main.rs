@@ -5,6 +5,7 @@
 //! **必ず release で動かすこと。** debug だと vault 読み込みの数字が一桁変わる
 //! （実測: cold 185.1ms / warm 32.8ms @ release・約 1200 件）。
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -113,6 +114,15 @@ struct App {
     saves: usize,
     /// 起動時の vault 読み込み時間。Done の定義（50ms）を常に目視できるようにする。
     load_ms: f64,
+    /// 直前の `view()` 構築にかかった時間（マイクロ秒）。**恒久の計器。**
+    ///
+    /// 前身では `render()` の中でタグ集計をしていて、1 文字打つたびに全ノートを走査していた。
+    /// iced でも `view()` に重い処理を置けば同じ穴が開く。Done の定義は「打鍵時の `view()`
+    /// 構築が 1ms 未満」なので、常に画面に出して**書いた瞬間に気づける**ようにしておく。
+    ///
+    /// `view()` は `&App` しか取れないので `Cell` で内部可変にする。表示されるのは
+    /// 1 フレーム前の値（構築中の時間は構築が終わるまで確定しない）。
+    last_view_us: Cell<u128>,
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +213,7 @@ fn boot(root: PathBuf, notes: Vec<vault::Note>, load_ms: f64) -> App {
         saved_flash_until: None,
         saves: 0,
         load_ms,
+        last_view_us: Cell::new(0),
     }
 }
 
@@ -633,6 +644,8 @@ fn palette_overlay(app: &App, palette: &Palette) -> Element<'static, Message> {
 }
 
 fn view(app: &App) -> Element<'_, Message> {
+    let t0 = Instant::now();
+
     let panes = row![
         container(folder_pane(app)).width(Length::Fixed(SIDEBAR_WIDTH)),
         container(note_pane(app)).width(Length::Fixed(LIST_WIDTH)),
@@ -644,6 +657,12 @@ fn view(app: &App) -> Element<'_, Message> {
     let status = row![
         text(format!("{} notes", app.visible.len())).size(11),
         text(format!("load {:.1}ms", app.load_ms)).size(11),
+        // Done の定義は 1ms 未満。ここが太りだしたら `view()` に重い処理が入った合図。
+        text(format!(
+            "view {:.2}ms",
+            app.last_view_us.get() as f64 / 1000.0
+        ))
+        .size(11),
         // 編集していないのに増えるなら「無編集でも書いている」ということ。
         text(format!("saves {}", app.saves)).size(11),
         text(if app.show_marker {
@@ -678,10 +697,13 @@ fn view(app: &App) -> Element<'_, Message> {
     .padding(8)
     .into();
 
-    match &app.palette {
+    let element = match &app.palette {
         Some(palette) => stack![base, palette_overlay(app, palette)].into(),
         None => base,
-    }
+    };
+
+    app.last_view_us.set(t0.elapsed().as_micros());
+    element
 }
 
 fn main() -> ExitCode {
@@ -902,6 +924,58 @@ mod tests {
         let now = dirty_since + AUTOSAVE_MAX_WAIT - Duration::from_millis(1);
         let last_edit = now - Duration::from_millis(1);
         assert!(!should_save(now, last_edit, dirty_since));
+    }
+
+    /// **実データで `view()` の構築時間を測る。** Done の定義は打鍵時 1ms 未満。
+    ///
+    /// 実データが要るので既定では走らせない（環境依存のテストを CI に混ぜない）。
+    ///
+    /// 実行: `VAULT="$HOME/..." cargo test --release -- --ignored --nocapture`
+    /// **必ず --release で。** debug の数字は判断材料にならない。
+    #[test]
+    #[ignore = "実データの vault が要る。VAULT を指定して --ignored で走らせる"]
+    fn measure_view_construction_with_real_vault() {
+        let root = vault_root().expect("VAULT に実データの vault を指定して実行する");
+        let notes = vault::load_dir(&root);
+        let count = notes.len();
+        let mut app = boot(root, notes, 0.0);
+
+        // 一番大きいノートを開く。エディタの負荷が最大になる条件で測る。
+        let biggest = app
+            .notes
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, note)| note.raw.len())
+            .map(|(i, _)| i)
+            .expect("vault が空");
+        send(&mut app, Message::NoteSelected(biggest));
+
+        let measure = |app: &App, label: &str| {
+            const RUNS: usize = 20;
+            let mut worst = 0.0_f64;
+            let mut total = 0.0_f64;
+            for _ in 0..RUNS {
+                let t0 = Instant::now();
+                let element = view(app);
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                drop(element);
+                worst = worst.max(ms);
+                total += ms;
+            }
+            let avg = total / RUNS as f64;
+            println!("  {label}: 平均 {avg:.3}ms / 最悪 {worst:.3}ms");
+            worst
+        };
+
+        println!("vault: {count} notes / 開いたノート {} 文字", app.notes[biggest].raw.len());
+        let plain = measure(&app, "一覧のみ      ");
+        open_palette(&mut app, "");
+        let with_palette = measure(&app, "パレット表示中");
+
+        assert!(
+            plain < 1.0 && with_palette < 1.0,
+            "view() の構築が 1ms を超えた（Done の定義違反）"
+        );
     }
 
     /// 上位 `PALETTE_MAX_RESULTS` 件で打ち切ること。約 1200 件を全部描いても人は読まない。
