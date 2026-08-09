@@ -1,0 +1,13 @@
+# 秘密情報。コードに直書きせずここへ置く（CLAUDE.md のセキュリティ最小則）
+.env
+.env.*
+
+# Rust のビルド成果物
+/target
+
+# 自分のメモ。vault は haboku の外に置く前提だが、開発中に紛れ込んだものを追跡しない
+/notes
+/vault
+
+# macOS
+.DS_Store
