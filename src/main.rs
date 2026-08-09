@@ -48,6 +48,9 @@ const PALETTE_INPUT_ID: &str = "palette-input";
 /// エディタを名指しする ID。`Cmd+N` の直後にフォーカスを飛ばすのに要る。
 const EDITOR_ID: &str = "editor";
 
+/// リネームの入力欄を名指しする ID。
+const RENAME_INPUT_ID: &str = "rename-input";
+
 /// 新規ノートのファイル名。秒精度なので同一秒の連打は衝突する
 /// （`vault::reserve_unique` が枝番を付けて防ぐ）。
 const NEW_NOTE_NAME_FORMAT: &str = "%Y-%m-%d-%H%M%S";
@@ -97,6 +100,9 @@ struct App {
     content: text_editor::Content,
     /// 浮きパレット（`Cmd+P` のノート検索）。開いていないときは `None`。
     palette: Option<Palette>,
+    /// リネーム入力中の名前（`Cmd+R`）。開いていないときは `None`。
+    /// パレットとは同時に開かない（開くときに互いを畳む）。
+    rename: Option<String>,
 
     // ── 自動保存 ────────────────────────────────────────────
     dirty: bool,
@@ -148,6 +154,13 @@ enum Message {
     PaletteClose,
     /// ノートを新規作成する（`Cmd+N`）。
     NewNote,
+    /// リネームを開始する（`Cmd+R`）。入力欄に現在のファイル名を入れて開く。
+    RenameStarted,
+    RenameChanged(String),
+    RenameCancel,
+    RenameCommit,
+    /// 開いているノートを `.trash` へ退避する（`Cmd+Delete`）。
+    DeleteNote,
 }
 
 /// **いつディスクへ書くかを決める、この機能の心臓部。**
@@ -224,6 +237,7 @@ fn boot(root: PathBuf, notes: Vec<vault::Note>, load_ms: f64) -> App {
             "左の一覧からノートを選ぶか、Cmd+P で検索すると、ここに本文が出ます。",
         ),
         palette: None,
+        rename: None,
         dirty: false,
         dirty_since: None,
         last_edit: Instant::now(),
@@ -345,6 +359,92 @@ fn create_note(app: &mut App) -> Result<usize, String> {
     refresh_derived(app);
 
     Ok(0)
+}
+
+/// リネーム先の名前を検証して、実際に使うファイル名へ整える。
+///
+/// **拒否する理由はどれも「一覧から消えるから」に集約される。**
+///
+/// - **dot 始まり**: `load_dir()` が dot 始まりを走査から除外する。`.secret` に改名すると
+///   再起動後に一覧から消える（前身で実際に踏んだ）
+/// - **`/` `\` を含む**: 別ディレクトリへ移動してしまう。リネームは名前を変える操作であって
+///   移動ではない
+/// - **空**: ファイル名にならない
+///
+/// 拡張子は補う。`load_dir()` は `.md` しか拾わないので、`設計メモ` のまま保存すると
+/// dot 始まりと**同じ理由で**一覧から消える。
+fn validate_note_name(input: &str) -> Result<String, String> {
+    let name = input.trim();
+    if name.is_empty() {
+        return Err("名前が空です".to_string());
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Err("名前に / や \\ は使えません".to_string());
+    }
+    if name.starts_with('.') {
+        return Err(". で始まる名前は一覧から消えるため使えません".to_string());
+    }
+    Ok(if name.ends_with(".md") {
+        name.to_string()
+    } else {
+        format!("{name}.md")
+    })
+}
+
+/// リネームを確定する。**ファイル名だけを変える**（本文には触らない）。
+///
+/// 表示タイトルは frontmatter の `title:` > 本文の `# 見出し` > ファイル名の stem で決まるので、
+/// frontmatter を持つノートは**リネームしても一覧の見た目が変わらない**。仕様どおり。
+fn commit_rename(app: &mut App, input: &str) -> Result<(), String> {
+    let Some(index) = app.selected else {
+        return Err("ノートが開かれていません".to_string());
+    };
+    let name = validate_note_name(input)?;
+
+    let path = app.notes[index].path.clone();
+    let dir = path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| app.root.clone());
+    if path.file_name().is_some_and(|current| current == name.as_str()) {
+        return Ok(()); // 同じ名前。書き込みも枝番も起こさない
+    }
+
+    // 衝突は枝番で避ける（`move_to` が `reserve_unique` 経由で予約してから rename する）。
+    let dest = vault::move_to(&path, &dir, &name).map_err(|e| format!("リネームに失敗: {e}"))?;
+
+    // ファイル名が変わるとタイトルが変わり得る（frontmatter も見出しも無いノート）。
+    // 本文と mtime はそのまま持ち越す。rename は中身にも mtime にも触らない。
+    let raw = app.notes[index].raw.clone();
+    let modified = app.notes[index].modified;
+    app.notes[index] = vault::parse_note(&app.root, dest, raw, modified);
+    refresh_derived(app);
+    Ok(())
+}
+
+/// 開いているノートを `.trash` へ退避する。
+///
+/// **確認ダイアログは出さない。** vault 内 `.trash/` への移動で取り消せる操作なので、
+/// 確認を挟むほうが邪魔になる（前身と同じ判断）。
+///
+/// **保存もしない。** 捨てるノートをわざわざ書き戻す意味がなく、保存に失敗したときに
+/// 削除できなくなるほうが困る。エディタの内容は破棄される。
+fn delete_note(app: &mut App) -> Result<(), String> {
+    let Some(index) = app.selected else {
+        return Err("ノートが開かれていません".to_string());
+    };
+
+    let path = app.notes[index].path.clone();
+    vault::move_to_trash(&app.root, &path).map_err(|e| format!("削除に失敗: {e}"))?;
+
+    // 取り除くと後ろのインデックスが繰り上がる。開いていたのは消したノート自身なので
+    // 選択を外し、エディタを空にする（繰り上げの計算そのものを不要にする）。
+    app.notes.remove(index);
+    app.selected = None;
+    app.content = text_editor::Content::with_text("");
+    clear_dirty(app);
+    refresh_derived(app);
+    Ok(())
 }
 
 /// クエリで全ノートを絞り込む。**パレットが開いている間ずっとではなく、クエリが変わった時だけ。**
@@ -492,6 +592,51 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 Err(e) => app.error = Some(e),
             }
         }
+        Message::RenameStarted => {
+            let Some(index) = app.selected else {
+                app.error = Some("リネームするノートが開かれていません".to_string());
+                return Task::none();
+            };
+            app.palette = None;
+            let current = app.notes[index]
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            app.rename = Some(current);
+            return iced::widget::operation::focus(iced::widget::Id::new(RENAME_INPUT_ID));
+        }
+        Message::RenameChanged(name) => {
+            if let Some(current) = &mut app.rename {
+                *current = name;
+            }
+        }
+        Message::RenameCancel => app.rename = None,
+        Message::RenameCommit => {
+            let Some(input) = app.rename.clone() else {
+                return Task::none();
+            };
+            // 名前を変える前に本文を書き戻す。ここを飛ばすと、未保存分が
+            // 古いパス宛のまま宙に浮く。失敗したら中断（切替と同じガード）。
+            if !save_now(app) {
+                return Task::none();
+            }
+            match commit_rename(app, &input) {
+                Ok(()) => {
+                    app.rename = None;
+                    app.error = None;
+                }
+                // **入力欄は開いたままにする。** 閉じてしまうと打ち直せない。
+                Err(e) => app.error = Some(e),
+            }
+        }
+        Message::DeleteNote => {
+            app.palette = None;
+            app.rename = None;
+            if let Err(e) = delete_note(app) {
+                app.error = Some(e);
+            }
+        }
         Message::Key(event) => {
             let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
                 return Task::none();
@@ -520,6 +665,29 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             // `Cmd+N` で新規作成。パレットが開いていても効く（中で畳む）。
             if modifiers.command() && matches!(&key, keyboard::Key::Character(c) if c == "n") {
                 return update(app, Message::NewNote);
+            }
+
+            // `Cmd+R` でリネーム、`Cmd+Delete` で `.trash` へ退避。
+            if modifiers.command() && matches!(&key, keyboard::Key::Character(c) if c == "r") {
+                return update(app, Message::RenameStarted);
+            }
+            if modifiers.command() && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Backspace))
+            {
+                return update(app, Message::DeleteNote);
+            }
+
+            // リネーム入力中のキー。Enter で確定、Escape で取り消し。
+            if app.rename.is_some() {
+                match &key {
+                    keyboard::Key::Named(keyboard::key::Named::Enter) => {
+                        return update(app, Message::RenameCommit);
+                    }
+                    keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                        app.rename = None;
+                        return Task::none();
+                    }
+                    _ => {}
+                }
             }
 
             handle_palette_key(app, &key, modifiers);
@@ -743,6 +911,55 @@ fn palette_overlay(app: &App, palette: &Palette) -> Element<'static, Message> {
     stack![scrim, container(panel).center_x(Fill).padding(80)].into()
 }
 
+/// リネームの入力欄。パレットと同じ「スクリム + 中央パネル」の作りに揃える。
+fn rename_overlay(current: &str) -> Element<'static, Message> {
+    let input = text_input("新しいファイル名", current)
+        .id(iced::widget::Id::new(RENAME_INPUT_ID))
+        .on_input(Message::RenameChanged)
+        .on_submit(Message::RenameCommit)
+        .padding(10)
+        .size(15);
+
+    let panel = container(
+        column![
+            text("ファイル名を変更").size(13),
+            input,
+            // 「リネームしたのに一覧の見た目が変わらない」を先に説明しておく。
+            // タイトルは frontmatter / 見出しが優先されるため、仕様どおりでも驚く。
+            text("変えるのはファイル名だけ。一覧のタイトルは frontmatter の title: や本文の # 見出しが優先されます")
+                .size(10),
+            text("enter で確定、esc・✕・背景クリックで取り消し").size(10),
+        ]
+        .spacing(8),
+    )
+    .padding(12)
+    .width(Length::Fixed(520.0))
+    .style(|theme: &iced::Theme| {
+        let palette = theme.extended_palette();
+        container::Style {
+            background: Some(palette.background.base.color.into()),
+            border: iced::Border {
+                color: palette.background.strong.color,
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..container::Style::default()
+        }
+    });
+
+    let scrim = mouse_area(
+        container(iced::widget::Space::new().width(Fill).height(Fill))
+            .width(Fill)
+            .height(Fill)
+            .style(|_theme: &iced::Theme| {
+                container::background(Color::from_rgba(0.0, 0.0, 0.0, 0.45))
+            }),
+    )
+    .on_press(Message::RenameCancel);
+
+    stack![scrim, container(panel).center_x(Fill).padding(120)].into()
+}
+
 fn view(app: &App) -> Element<'_, Message> {
     let t0 = Instant::now();
 
@@ -797,9 +1014,11 @@ fn view(app: &App) -> Element<'_, Message> {
     .padding(8)
     .into();
 
-    let element = match &app.palette {
-        Some(palette) => stack![base, palette_overlay(app, palette)].into(),
-        None => base,
+    // パレットとリネームは同時に開かない（開くときに互いを畳んでいる）。
+    let element = match (&app.palette, &app.rename) {
+        (Some(palette), _) => stack![base, palette_overlay(app, palette)].into(),
+        (None, Some(name)) => stack![base, rename_overlay(name)].into(),
+        (None, None) => base,
     };
 
     app.last_view_us.set(t0.elapsed().as_micros());
@@ -1166,6 +1385,118 @@ mod tests {
             "絞り込みが勝手に解除された"
         );
         assert!(app.visible.contains(&0), "作ったノートが一覧に見えていない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **一覧から消える名前は拒否し、拡張子は補うこと。**
+    ///
+    /// dot 始まりは前身で実際に踏んだ（`load_dir()` が走査から除外する）。
+    /// 拡張子落ちは**同型の穴**で、`load_dir()` が `.md` しか拾わないため同じく消える。
+    #[test]
+    fn note_names_that_would_vanish_are_rejected_or_repaired() {
+        assert_eq!(validate_note_name("設計メモ").unwrap(), "設計メモ.md");
+        assert_eq!(validate_note_name(" 設計メモ.md ").unwrap(), "設計メモ.md");
+
+        assert!(validate_note_name("").is_err(), "空を通した");
+        assert!(validate_note_name("   ").is_err(), "空白だけを通した");
+        assert!(validate_note_name(".secret").is_err(), "dot 始まりを通した");
+        assert!(validate_note_name("a/b.md").is_err(), "/ を通した");
+        assert!(validate_note_name("a\\b.md").is_err(), "\\ を通した");
+    }
+
+    /// リネームはファイル名だけを変え、本文には触らないこと。
+    #[test]
+    fn rename_changes_the_file_name_and_keeps_the_body() {
+        let (dir, mut app) = app_with_folders("rename", &[("topics", "設計メモ")]);
+        send(&mut app, Message::NoteSelected(0));
+        let before = app.notes[0].raw.clone();
+
+        send(&mut app, Message::RenameStarted);
+        send(&mut app, Message::RenameChanged("新しい名前".to_string()));
+        send(&mut app, Message::RenameCommit);
+
+        assert!(app.rename.is_none(), "リネーム後も入力欄が開いている");
+        assert_eq!(
+            app.notes[0].path.file_name().unwrap(),
+            "新しい名前.md",
+            "拡張子が補われていない"
+        );
+        assert!(app.notes[0].path.exists(), "移動先にファイルが無い");
+        assert_eq!(app.notes[0].raw, before, "本文が書き換わった");
+        // frontmatter の title: があるので、表示タイトルは変わらないのが仕様。
+        assert_eq!(app.notes[0].title, "設計メモ");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **同名が居たら枝番へ逃がし、既存を絶対に潰さないこと。**
+    #[test]
+    fn rename_into_an_existing_name_gets_a_suffix() {
+        let (dir, mut app) =
+            app_with_folders("rename-collision", &[("topics", "先客"), ("topics", "動くほう")]);
+        let moving = app.notes.iter().position(|n| n.title == "動くほう").unwrap();
+        let victim = app.notes.iter().position(|n| n.title == "先客").unwrap();
+        let victim_name = app.notes[victim]
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let victim_body = app.notes[victim].raw.clone();
+
+        send(&mut app, Message::NoteSelected(moving));
+        send(&mut app, Message::RenameStarted);
+        send(&mut app, Message::RenameChanged(victim_name.clone()));
+        send(&mut app, Message::RenameCommit);
+
+        assert_eq!(
+            app.notes[moving].path.file_name().unwrap(),
+            format!("{}-2.md", victim_name.trim_end_matches(".md")).as_str()
+        );
+        assert_eq!(app.notes[victim].raw, victim_body, "先客が潰された");
+        assert!(app.notes[victim].path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一覧から消える名前は、エラーを出して**入力欄を開いたまま**にすること。
+    /// 閉じてしまうと打ち直せない。
+    #[test]
+    fn rejected_rename_keeps_the_input_open() {
+        let (dir, mut app) = app_with_folders("rename-rejected", &[("topics", "設計メモ")]);
+        send(&mut app, Message::NoteSelected(0));
+        let before = app.notes[0].path.clone();
+
+        send(&mut app, Message::RenameStarted);
+        send(&mut app, Message::RenameChanged(".secret".to_string()));
+        send(&mut app, Message::RenameCommit);
+
+        assert!(app.rename.is_some(), "打ち直せない");
+        assert!(app.error.is_some(), "理由が表に出ていない");
+        assert_eq!(app.notes[0].path, before, "拒否したのにリネームされた");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 削除は `.trash` へ退避し、一覧とフォルダ件数から消えること。ファイルは残ること。
+    #[test]
+    fn delete_moves_the_note_to_trash() {
+        let (dir, mut app) =
+            app_with_folders("delete", &[("topics", "残るほう"), ("topics", "消すほう")]);
+        let target = app.notes.iter().position(|n| n.title == "消すほう").unwrap();
+        send(&mut app, Message::NoteSelected(target));
+
+        send(&mut app, Message::DeleteNote);
+
+        assert_eq!(app.notes.len(), 1, "一覧から消えていない");
+        assert_eq!(app.notes[0].title, "残るほう");
+        assert_eq!(app.selected, None, "消したノートが開いたままになっている");
+        assert_eq!(
+            app.folders.iter().find(|(n, _)| n == "topics").unwrap().1,
+            1,
+            "フォルダ件数が減っていない"
+        );
+
+        // ファイルとしては .trash に残っている（Finder で戻せる）。
+        let trashed: Vec<_> = std::fs::read_dir(dir.join(".trash")).unwrap().collect();
+        assert_eq!(trashed.len(), 1, ".trash に退避されていない");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

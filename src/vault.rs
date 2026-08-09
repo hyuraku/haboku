@@ -140,6 +140,32 @@ pub fn reserve_unique(dir: &Path, file_name: &str) -> std::io::Result<PathBuf> {
     unreachable!("u32 の全候補が埋まることはない")
 }
 
+/// ファイルを `dir` の `file_name` へ移す。**衝突は枝番で避け、既存を絶対に置換しない。**
+///
+/// `std::fs::rename` は宛先が存在しても黙って置換する。`save()` のアトミック保存には
+/// この性質が必須だが、**同じ道具を移動に流用すると後勝ちの上書きでノートが消える**
+/// （前身のデータ喪失欠陥 3 件の共通の根がこれ）。`reserve_unique` で先に空きを予約し、
+/// その予約済みパスへ rename する。返り値は実際の移動先。
+pub fn move_to(from: &Path, dir: &Path, file_name: &str) -> std::io::Result<PathBuf> {
+    let dest = reserve_unique(dir, file_name)?;
+    std::fs::rename(from, &dest)?;
+    Ok(dest)
+}
+
+/// vault 内の `.trash/` へ退避する。返り値は退避先。
+///
+/// dot 始まりのディレクトリは `load_dir` の走査から外れるので、退避したノートは
+/// 一覧から消えるが**ファイルとしては残る**（Finder で戻せる）。
+pub fn move_to_trash(root: &Path, path: &Path) -> std::io::Result<PathBuf> {
+    let trash = root.join(".trash");
+    std::fs::create_dir_all(&trash)?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "untitled.md".to_string());
+    move_to(path, &trash, &name)
+}
+
 /// 保存後にメタ情報（タイトル・プレビュー・タグ）を取り直すための公開版。
 pub fn parse_note(root: &Path, path: PathBuf, raw: String, modified: SystemTime) -> Note {
     parse(root, path, raw, modified)
@@ -327,6 +353,41 @@ mod tests {
             "既存の中身",
             "既存ファイルが置換された"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 移動先が埋まっていても既存を置換せず、枝番を付けて逃がすこと。
+    /// **`fs::rename` を直接使うとここで既存が消える**（前身のデータ喪失欠陥の根）。
+    #[test]
+    fn move_to_never_replaces_an_existing_file() {
+        let dir = tmp_dir("move-collision");
+        std::fs::write(dir.join("a.md"), "先客").unwrap();
+        std::fs::write(dir.join("b.md"), "移動するほう").unwrap();
+
+        let dest = move_to(&dir.join("b.md"), &dir, "a.md").unwrap();
+
+        assert_eq!(dest, dir.join("a-2.md"));
+        assert_eq!(std::fs::read_to_string(dir.join("a.md")).unwrap(), "先客");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "移動するほう");
+        assert!(!dir.join("b.md").exists(), "移動元が残っている");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `.trash` へ退避すると、ファイルは残るが `load_dir` の走査からは外れること。
+    /// 同名を 2 回捨てても先に捨てたほうが消えないこと。
+    #[test]
+    fn move_to_trash_hides_the_note_but_keeps_the_file() {
+        let dir = tmp_dir("trash");
+        std::fs::create_dir_all(dir.join("topics")).unwrap();
+        std::fs::write(dir.join("topics/a.md"), "一件目").unwrap();
+
+        let first = move_to_trash(&dir, &dir.join("topics/a.md")).unwrap();
+        std::fs::write(dir.join("topics/a.md"), "二件目").unwrap();
+        let second = move_to_trash(&dir, &dir.join("topics/a.md")).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "一件目");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "二件目");
+        assert!(load_dir(&dir).is_empty(), "捨てたノートが一覧に残っている");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
