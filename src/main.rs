@@ -10,10 +10,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use iced::widget::{button, column, container, row, scrollable, text, text_editor};
-use iced::{Element, Fill, Font, Length, Subscription, Task};
+use iced::keyboard;
+use iced::widget::{
+    button, column, container, mouse_area, rich_text, row, scrollable, span, stack, text,
+    text_editor, text_input,
+};
+use iced::{Color, Element, Fill, Font, Length, Subscription, Task};
 
-use haboku::vault;
+use haboku::{fuzzy, vault};
 
 // ── 自動保存の閾値。CLAUDE.md の Done の定義がそのまま数値になっている ──
 
@@ -37,10 +41,29 @@ const SAVED_FLASH: Duration = Duration::from_millis(1500);
 /// dirty を監視する間隔。dirty でない間は subscription ごと止まる。
 const TICK: Duration = Duration::from_millis(100);
 
+/// パレットの入力欄を名指しする ID。開いた瞬間にフォーカスを飛ばすのに要る。
+const PALETTE_INPUT_ID: &str = "palette-input";
+
+/// パレットに一度に描く最大件数。約 1200 件を全部並べても人は読まない。
+/// 絞り込むための道具なので上位だけ出せば足りる。
+const PALETTE_MAX_RESULTS: usize = 50;
+
 /// サイドバー（フォルダ）の幅。
 const SIDEBAR_WIDTH: f32 = 180.0;
 /// ノート一覧の幅。
 const LIST_WIDTH: f32 = 320.0;
+
+/// 開いているパレットの状態。閉じているときは `None`。
+struct Palette {
+    query: String,
+    /// 絞り込み結果。`(notes のインデックス, マッチ情報)`。
+    ///
+    /// **`view()` では絞り込みを一切やらない。** クエリが変わった時だけ計算してここに置く。
+    /// 打鍵のたびに全ノートを走査する穴（前身の `render()` で開けた穴）を塞ぐため。
+    matches: Vec<(usize, fuzzy::Match)>,
+    /// いま選んでいる `matches` の位置。
+    selected: usize,
+}
 
 struct App {
     /// vault のルート。保存後に `parse_note` へ渡すのに要る。
@@ -64,6 +87,8 @@ struct App {
     /// 開いているノート（`notes` のインデックス）。
     selected: Option<usize>,
     content: text_editor::Content,
+    /// 浮きパレット（`Cmd+P` のノート検索）。開いていないときは `None`。
+    palette: Option<Palette>,
 
     // ── 自動保存 ────────────────────────────────────────────
     dirty: bool,
@@ -99,6 +124,11 @@ enum Message {
     Edit(text_editor::Action),
     /// 自動保存の監視。dirty の間だけ流れてくる。
     Tick(Instant),
+    /// キー入力。フォーカスの位置に関係なく全部流れてくる。
+    Key(keyboard::Event),
+    PaletteQueryChanged(String),
+    /// パレットを閉じる。✕ ボタンと背景クリックから飛ぶ。
+    PaletteClose,
 }
 
 /// **いつディスクへ書くかを決める、この機能の心臓部。**
@@ -162,8 +192,9 @@ fn boot(root: PathBuf, notes: Vec<vault::Note>, load_ms: f64) -> App {
         visible,
         selected: None,
         content: text_editor::Content::with_text(
-            "左の一覧からノートを選ぶと、ここに本文が出ます。",
+            "左の一覧からノートを選ぶか、Cmd+P で検索すると、ここに本文が出ます。",
         ),
+        palette: None,
         dirty: false,
         dirty_since: None,
         last_edit: Instant::now(),
@@ -234,6 +265,81 @@ fn open_note(app: &mut App, index: usize) {
     }
 }
 
+/// クエリで全ノートを絞り込む。**パレットが開いている間ずっとではなく、クエリが変わった時だけ。**
+///
+/// 絞り込み中のフォルダは無視して**全ノート**を対象にする。`Cmd+P` は「どのフォルダにいても
+/// 目的のノートへ飛ぶ」道具なので、いまの絞り込みに引きずられると用を成さない。
+fn refilter(notes: &[vault::Note], query: &str) -> Vec<(usize, fuzzy::Match)> {
+    let mut hits: Vec<(usize, fuzzy::Match)> = notes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, note)| fuzzy::match_query(query, &note.title).map(|m| (i, m)))
+        .collect();
+
+    // スコアの高い順。同点はタイトル順で安定させる（同じクエリで並びが変わらないように）。
+    hits.sort_by(|a, b| {
+        b.1.score
+            .cmp(&a.1.score)
+            .then_with(|| notes[a.0].title.cmp(&notes[b.0].title))
+    });
+    hits.truncate(PALETTE_MAX_RESULTS);
+    hits
+}
+
+/// パレットが開いている間のキー操作。処理したら `true`。
+fn handle_palette_key(app: &mut App, key: &keyboard::Key, modifiers: keyboard::Modifiers) -> bool {
+    use keyboard::key::Named;
+
+    let Some(palette) = &mut app.palette else {
+        return false;
+    };
+    let len = palette.matches.len();
+
+    match key {
+        keyboard::Key::Named(Named::Escape) => {
+            app.palette = None;
+            true
+        }
+        keyboard::Key::Named(Named::Enter) => {
+            let Some(index) = palette.matches.get(palette.selected).map(|(i, _)| *i) else {
+                app.palette = None;
+                return true;
+            };
+            // ここにも保存ガードが要る。パレットからの選択もエディタを上書きする操作。
+            // **パレットは閉じない**。閉じてから中断すると、なぜ切り替わらないのかが
+            // 分からなくなる（エラーはステータス行に常駐する）。
+            if !save_now(app) {
+                return true;
+            }
+            app.palette = None;
+            // 検索は全ノートが対象なので、別フォルダのノートが当たる。そのまま開くと
+            // 「選択中のノートが左の一覧に無い」状態になるため、絞り込みを解除して
+            // 開いたノートが必ず一覧に見えるようにする。
+            if app.selected_folder.is_some() {
+                app.selected_folder = None;
+                app.visible = visible_indices(&app.notes, None);
+            }
+            open_note(app, index);
+            true
+        }
+        // **矢印キーではなく ctrl-n / ctrl-p。** `text_input` が矢印を消費して親に届かない
+        // （gpui 版でも同じ回避策が要った）。
+        keyboard::Key::Character(c) if c == "n" && modifiers.control() => {
+            if len > 0 {
+                palette.selected = (palette.selected + 1) % len;
+            }
+            true
+        }
+        keyboard::Key::Character(c) if c == "p" && modifiers.control() => {
+            if len > 0 {
+                palette.selected = (palette.selected + len - 1) % len;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
         Message::FolderSelected(folder) => {
@@ -273,19 +379,63 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 }
             }
         }
+        Message::PaletteQueryChanged(query) => {
+            if let Some(palette) = &mut app.palette {
+                palette.matches = refilter(&app.notes, &query);
+                palette.selected = 0;
+                palette.query = query;
+            }
+        }
+        Message::PaletteClose => app.palette = None,
+        Message::Key(event) => {
+            let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+                return Task::none();
+            };
+
+            // `Cmd+P` で開く。**トグルにはしない。**
+            //
+            // subscription は**イベントを観測できても消費できない**ので、再押下で閉じても
+            // 同じイベントが `text_input` にも渡って "p" が入力欄に挿入される
+            // （「p が入ってから閉じる」という挙動になる）。iced に subscription 側から
+            // イベントを `Captured` にする手段は無い。よって閉じる操作は
+            // Escape / ✕ / 背景クリックに寄せた。
+            if modifiers.command()
+                && matches!(&key, keyboard::Key::Character(c) if c == "p")
+                && app.palette.is_none()
+            {
+                app.palette = Some(Palette {
+                    query: String::new(),
+                    matches: refilter(&app.notes, ""),
+                    selected: 0,
+                });
+                // 開いた瞬間に入力欄へフォーカスを飛ばす。これが無いと「開いたのに打てない」。
+                return iced::widget::operation::focus(iced::widget::Id::new(PALETTE_INPUT_ID));
+            }
+
+            handle_palette_key(app, &key, modifiers);
+        }
     }
     Task::none()
 }
 
-/// **dirty（か、消すべき表示がある）ときだけタイマーを回す。**
+/// キー入力と自動保存の tick。
 ///
-/// `Subscription` は state を見て出し分けられるので、何も編集していない間はタイマーが
-/// そもそも存在しない。常時ポーリングにならずに済む。
+/// キーは **`keyboard::listen()` ではなく `event::listen_with()` で拾う。**
+/// 前者は `Status::Ignored` のイベントしか流さないので、パレットを開いた瞬間に
+/// `text_input` へフォーカスが移り、そこで `Captured` になったキーが届かなくなる。
+///
+/// tick は **dirty（か、消すべき表示がある）ときだけ**回す。`Subscription` は state を見て
+/// 出し分けられるので、何も編集していない間はタイマーがそもそも存在しない。
 fn subscription(app: &App) -> Subscription<Message> {
+    let keys = iced::event::listen_with(|event, _status, _window| match event {
+        iced::event::Event::Keyboard(key_event) => Some(Message::Key(key_event)),
+        _ => None,
+    });
+
     if app.dirty || app.saved_flash_until.is_some() {
-        iced::time::every(TICK).map(Message::Tick)
+        Subscription::batch([keys, iced::time::every(TICK).map(Message::Tick)])
     } else {
-        Subscription::none()
+        keys
     }
 }
 
@@ -365,6 +515,123 @@ fn editor_pane(app: &App) -> Element<'_, Message> {
         .into()
 }
 
+/// マッチした文字だけ色を変えたタイトルを作る。
+///
+/// `fuzzy::Match::ranges` は**バイト範囲**なので `get()` で受ける。日本語タイトルで
+/// 文字境界を跨いだときに panic しないため（`&title[range]` だと落ちる）。
+fn highlighted_title(title: &str, ranges: &[std::ops::Range<usize>]) -> Element<'static, Message> {
+    let hit = Color::from_rgb(1.0, 0.78, 0.25);
+    let mut spans: Vec<iced::advanced::text::Span<'static, ()>> = Vec::new();
+    let mut last = 0;
+
+    for range in ranges {
+        if range.start > last
+            && let Some(plain) = title.get(last..range.start)
+        {
+            spans.push(span(plain.to_string()));
+        }
+        if let Some(matched) = title.get(range.clone()) {
+            spans.push(span(matched.to_string()).color(hit));
+        }
+        last = range.end;
+    }
+    if let Some(rest) = title.get(last..) {
+        spans.push(span(rest.to_string()));
+    }
+
+    rich_text(spans).size(13).into()
+}
+
+/// 浮きパレット本体。iced にモーダル用の標準ウィジェットは無いので、
+/// 「画面いっぱいの半透明コンテナ（スクリム）＋中央のパネル」を `stack` で自前に組む。
+fn palette_overlay(app: &App, palette: &Palette) -> Element<'static, Message> {
+    let input = text_input("ノートを検索…", &palette.query)
+        .id(iced::widget::Id::new(PALETTE_INPUT_ID))
+        .on_input(Message::PaletteQueryChanged)
+        .padding(10)
+        .size(15);
+
+    let rows = palette
+        .matches
+        .iter()
+        .enumerate()
+        .map(|(row, (note_index, m))| {
+            let note = &app.notes[*note_index];
+            let is_selected = row == palette.selected;
+
+            container(
+                iced::widget::column![
+                    highlighted_title(&note.title, &m.ranges),
+                    text(note.folder.clone()).size(10),
+                ]
+                .spacing(1),
+            )
+            .padding(6)
+            .width(Fill)
+            .style(move |theme: &iced::Theme| {
+                if is_selected {
+                    container::background(theme.extended_palette().primary.weak.color)
+                } else {
+                    container::Style::default()
+                }
+            })
+            .into()
+        })
+        .collect::<Vec<_>>();
+
+    // 閉じ方が見えていること自体が実用上効く（`Cmd+P` のトグルが使えないため）。
+    let header = row![
+        input,
+        button(text("✕").size(15))
+            .on_press(Message::PaletteClose)
+            .padding(8)
+            .style(button::text),
+    ]
+    .spacing(4);
+
+    let panel = container(
+        column![
+            header,
+            scrollable(column(rows).spacing(1)).height(Length::Fixed(360.0)),
+            text(format!(
+                "{} 件中 上位 {} 件 / ctrl-n・ctrl-p で移動、enter で開く、esc・✕・背景クリックで閉じる",
+                app.notes.len(),
+                palette.matches.len()
+            ))
+            .size(10),
+        ]
+        .spacing(8),
+    )
+    .padding(12)
+    .width(Length::Fixed(640.0))
+    .style(|theme: &iced::Theme| {
+        let palette = theme.extended_palette();
+        container::Style {
+            background: Some(palette.background.base.color.into()),
+            border: iced::Border {
+                color: palette.background.strong.color,
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..container::Style::default()
+        }
+    });
+
+    // スクリムは背景側だけを覆う層として敷き、その上にパネルを重ねる。
+    // パネルごと `mouse_area` で包むと、パネル内のクリックまで「背景クリック」として拾う。
+    let scrim = mouse_area(
+        container(iced::widget::Space::new().width(Fill).height(Fill))
+            .width(Fill)
+            .height(Fill)
+            .style(|_theme: &iced::Theme| {
+                container::background(Color::from_rgba(0.0, 0.0, 0.0, 0.45))
+            }),
+    )
+    .on_press(Message::PaletteClose);
+
+    stack![scrim, container(panel).center_x(Fill).padding(80)].into()
+}
+
 fn view(app: &App) -> Element<'_, Message> {
     let panes = row![
         container(folder_pane(app)).width(Length::Fixed(SIDEBAR_WIDTH)),
@@ -402,14 +669,19 @@ fn view(app: &App) -> Element<'_, Message> {
 
     // **高さを固定する。** 可変にすると表示の桁数が変わるたびに下段の高さが動き、
     // 「打った文字が1つ上の行に入った」ように見える（`Fill` の隣に可変長を置く罠）。
-    column![
+    let base: Element<'_, Message> = column![
         panes,
         container(status).height(Length::Fixed(18.0)),
         container(error).height(Length::Fixed(16.0)),
     ]
     .spacing(6)
     .padding(8)
-    .into()
+    .into();
+
+    match &app.palette {
+        Some(palette) => stack![base, palette_overlay(app, palette)].into(),
+        None => base,
+    }
 }
 
 fn main() -> ExitCode {
@@ -491,8 +763,43 @@ mod tests {
         let _ = update(app, message);
     }
 
+    /// フォルダ違いのノートを持つ vault を作る。`(フォルダ, タイトル)` の順で置き、
+    /// 後に書いたものほど新しい = 一覧の上に来る。
+    fn app_with_folders(name: &str, entries: &[(&str, &str)]) -> (PathBuf, App) {
+        let dir = std::env::temp_dir().join(format!("haboku-app-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        for (i, (folder, title)) in entries.iter().enumerate() {
+            let sub = dir.join(folder);
+            std::fs::create_dir_all(&sub).unwrap();
+            let body = format!("---\ntitle: \"{title}\"\n---\n\n本文。\n");
+            std::fs::write(sub.join(format!("n-{i}.md")), body).unwrap();
+        }
+
+        let notes = vault::load_dir(&dir);
+        let app = boot(dir.clone(), notes, 0.0);
+        (dir, app)
+    }
+
     fn insert(c: char) -> Message {
         Message::Edit(text_editor::Action::Edit(text_editor::Edit::Insert(c)))
+    }
+
+    fn key(c: &str) -> keyboard::Key {
+        keyboard::Key::Character(c.into())
+    }
+
+    fn named(k: keyboard::key::Named) -> keyboard::Key {
+        keyboard::Key::Named(k)
+    }
+
+    /// パレットを開いた状態にする（`Cmd+P` の処理と同じ初期値）。
+    fn open_palette(app: &mut App, query: &str) {
+        app.palette = Some(Palette {
+            query: query.to_string(),
+            matches: refilter(&app.notes, query),
+            selected: 0,
+        });
     }
 
     fn mtime(path: &std::path::Path) -> std::time::SystemTime {
@@ -595,6 +902,106 @@ mod tests {
         let now = dirty_since + AUTOSAVE_MAX_WAIT - Duration::from_millis(1);
         let last_edit = now - Duration::from_millis(1);
         assert!(!should_save(now, last_edit, dirty_since));
+    }
+
+    /// 上位 `PALETTE_MAX_RESULTS` 件で打ち切ること。約 1200 件を全部描いても人は読まない。
+    #[test]
+    fn refilter_truncates_to_the_max_results() {
+        let entries: Vec<(String, String)> = (0..PALETTE_MAX_RESULTS + 10)
+            .map(|i| ("topics".to_string(), format!("メモ {i}")))
+            .collect();
+        let refs: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(f, t)| (f.as_str(), t.as_str()))
+            .collect();
+        let (dir, app) = app_with_folders("truncate", &refs);
+
+        assert_eq!(refilter(&app.notes, "").len(), PALETTE_MAX_RESULTS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **パレットは絞り込み中のフォルダを無視して全ノートを探し、開いたら絞り込みを解除すること。**
+    ///
+    /// 解除しないと「選択中のノートが左の一覧に無い」状態が生まれる。
+    #[test]
+    fn palette_opens_a_note_from_another_folder_and_clears_the_filter() {
+        let (dir, mut app) =
+            app_with_folders("cross-folder", &[("topics", "設計メモ"), ("notes", "走り書き")]);
+
+        send(&mut app, Message::FolderSelected(Some("notes".to_string())));
+        assert_eq!(app.visible.len(), 1, "フォルダ絞り込みが効いていない");
+
+        // 絞り込み対象外（topics）のノートを検索して開く。
+        open_palette(&mut app, "設計");
+        assert_eq!(app.palette.as_ref().unwrap().matches.len(), 1);
+        handle_palette_key(&mut app, &named(keyboard::key::Named::Enter), <_>::default());
+
+        let opened = app.selected.expect("ノートが開かれていない");
+        assert_eq!(app.notes[opened].title, "設計メモ");
+        assert!(app.palette.is_none(), "開いたのにパレットが残っている");
+        assert!(app.selected_folder.is_none(), "絞り込みが解除されていない");
+        assert!(
+            app.visible.contains(&opened),
+            "開いたノートが一覧に見えていない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **保存に失敗したらパレットからも遷移しないこと。** 一覧クリックと同じガードが要る。
+    /// パレットは閉じない（閉じてから中断すると、なぜ切り替わらないのかが分からなくなる）。
+    #[test]
+    fn palette_enter_is_blocked_when_saving_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, mut app) =
+            app_with_folders("palette-save-fails", &[("topics", "あ"), ("topics", "い")]);
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, insert('X'));
+
+        let sub = dir.join("topics");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        open_palette(&mut app, "");
+        // 先頭以外を選んでから Enter（自分自身を開き直すのでは検証にならない）。
+        app.palette.as_mut().unwrap().selected = 1;
+        handle_palette_key(&mut app, &named(keyboard::key::Named::Enter), <_>::default());
+
+        assert_eq!(app.selected, Some(0), "保存に失敗したのに切り替わった");
+        assert!(app.palette.is_some(), "中断したのにパレットが閉じた");
+        assert!(app.error.is_some(), "保存失敗が表に出ていない");
+        assert!(app.content.text().contains('X'), "編集内容が消えた");
+
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ctrl-n / ctrl-p が循環すること。矢印キーは `text_input` に消費されて届かない。
+    #[test]
+    fn palette_selection_cycles_with_ctrl_n_and_ctrl_p() {
+        let (dir, mut app) =
+            app_with_folders("cycle", &[("topics", "あ"), ("topics", "い"), ("topics", "う")]);
+        open_palette(&mut app, "");
+        assert_eq!(app.palette.as_ref().unwrap().matches.len(), 3);
+
+        let ctrl = keyboard::Modifiers::CTRL;
+        handle_palette_key(&mut app, &key("n"), ctrl);
+        assert_eq!(app.palette.as_ref().unwrap().selected, 1);
+        handle_palette_key(&mut app, &key("p"), ctrl);
+        assert_eq!(app.palette.as_ref().unwrap().selected, 0);
+        // 先頭で戻ると末尾へ回り込む。
+        handle_palette_key(&mut app, &key("p"), ctrl);
+        assert_eq!(app.palette.as_ref().unwrap().selected, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Escape で閉じること（`Cmd+P` のトグルが使えないので、閉じ方はこちらに寄せている）。
+    #[test]
+    fn palette_closes_on_escape() {
+        let (dir, mut app) = app_with_folders("escape", &[("topics", "あ")]);
+        open_palette(&mut app, "");
+        handle_palette_key(&mut app, &named(keyboard::key::Named::Escape), <_>::default());
+        assert!(app.palette.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **エディタに入れて出しただけの本文が、元ファイルと 1 バイトも違わないこと。**
