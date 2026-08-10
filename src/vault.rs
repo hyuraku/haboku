@@ -67,6 +67,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Note>) {
         if name.starts_with('.') || name == "node_modules" || name == "target" {
             continue;
         }
+
         // **symlink は辿らない。`path.is_dir()` ではなく `entry.file_type()` で見る。**
         //
         // `is_dir()` はリンクを解決するので、vault の外を指すディレクトリ symlink を
@@ -188,6 +189,42 @@ pub fn move_to(from: &Path, dir: &Path, file_name: &str) -> std::io::Result<Path
     let dest = reserve_unique(dir, file_name)?;
     std::fs::rename(from, &dest)?;
     Ok(dest)
+}
+
+/// 保存できなかった本文を、書ける場所へ退避する。返り値は実際の退避先。
+///
+/// **最後の手段。** 通常の保存経路（`save`）が失敗し、なおユーザーが終了を選んだときだけ通る。
+/// ここまで来て黙って捨てると、打った本文はディスクにもメモリにも残らない。
+///
+/// `dirs` は**優先順**で渡し、書けた最初の場所を使う。保存が失敗する原因（権限・容量・
+/// ドライブが外れた）は特定のディレクトリだけで起きるとは限らないので、退避先も 1 つに賭けない。
+///
+/// 名前は `<元のファイル名>.rescue`。拡張子が `.md` でないので `load_dir` は拾わず、
+/// 一覧を汚さないまま Finder からは見える。`reserve_unique` 経由なので**既存を絶対に潰さない**。
+pub fn write_rescue(dirs: &[PathBuf], file_name: &str, contents: &str) -> std::io::Result<PathBuf> {
+    let name = format!("{file_name}.rescue");
+    let mut last: Option<std::io::Error> = None;
+
+    for dir in dirs {
+        let path = match reserve_unique(dir, &name) {
+            Ok(path) => path,
+            Err(e) => {
+                last = Some(e);
+                continue;
+            }
+        };
+        match std::fs::write(&path, contents) {
+            Ok(()) => return Ok(path),
+            Err(e) => {
+                // 予約だけ済んで書けなかった空ファイルを残さない。
+                // 中身ゼロの `.rescue` は「退避できた」という誤った合図になる。
+                let _ = std::fs::remove_file(&path);
+                last = Some(e);
+            }
+        }
+    }
+
+    Err(last.unwrap_or_else(|| std::io::Error::other("退避先が 1 つも指定されていない")))
 }
 
 /// vault 内の `.trash/` へ退避する。返り値は退避先。
@@ -471,6 +508,55 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, ["a.md"], "一時ファイルが残っている");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **退避は書けない場所を飛ばして次の候補へ落ちること。** 保存が失敗した原因が
+    /// ノートのあるディレクトリにあるとは限らないので、退避先を 1 つに賭けない。
+    /// 空の `.rescue`（＝予約はできたが書けなかった残骸）を残さないことも見る。
+    #[test]
+    fn write_rescue_falls_through_to_a_writable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let locked = tmp_dir("rescue-locked");
+        let open = tmp_dir("rescue-open");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let path = write_rescue(
+            &[locked.clone(), open.clone()],
+            "メモ.md",
+            "失われては困る本文",
+        )
+        .unwrap();
+
+        assert_eq!(path, open.join("メモ.md.rescue"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "失われては困る本文"
+        );
+        assert_eq!(
+            std::fs::read_dir(&locked).unwrap().count(),
+            0,
+            "書けなかった場所に残骸ができた"
+        );
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&locked);
+        let _ = std::fs::remove_dir_all(&open);
+    }
+
+    /// 退避は既存を絶対に潰さないこと。2 回続けて退避しても 1 回目が残る。
+    /// **最後の手段が前回の最後の手段を消したら意味がない。**
+    #[test]
+    fn write_rescue_never_replaces_an_earlier_rescue() {
+        let dir = tmp_dir("rescue-collision");
+
+        let first = write_rescue(std::slice::from_ref(&dir), "メモ.md", "1 回目").unwrap();
+        let second = write_rescue(std::slice::from_ref(&dir), "メモ.md", "2 回目").unwrap();
+
+        assert_ne!(first, second, "同じパスへ 2 回書いている");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "1 回目");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "2 回目");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

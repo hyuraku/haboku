@@ -117,6 +117,11 @@ struct App {
     show_marker: bool,
     /// 保存に失敗した等の常駐エラー。消えないこと自体がシグナル。
     error: Option<String>,
+    /// 保存できずに閉じるのを一度断ったか。**2 回目の要求で退避して閉じる**ための記憶。
+    ///
+    /// 保存が通れば `clear_dirty` で畳む。問題が直ったあとの初回はまた警告から始めたい
+    /// （立てっぱなしだと、次に別の失敗を踏んだとき警告なしで終了してしまう）。
+    close_refused: bool,
     /// 「保存しました」を消す時刻。
     saved_flash_until: Option<Instant>,
     /// 実際にディスクへ書いた回数。**検証用の計器。**
@@ -161,6 +166,12 @@ enum Message {
     RenameCommit,
     /// 開いているノートを `.trash` へ退避する（`Cmd+Delete`）。
     DeleteNote,
+    /// ウィンドウを閉じる要求（`Cmd+W`・✕・`Cmd+Q`）。
+    ///
+    /// **既定の `exit_on_close_request = true` のままだと、これを受け取る前にプロセスが
+    /// 終わる。** デバウンス（1 秒）の途中で閉じれば、その分の編集はディスクにも
+    /// メモリにも残らず消える。`main` で false にして、保存を挟めるようにしてある。
+    CloseRequested(iced::window::Id),
 }
 
 /// **いつディスクへ書くかを決める、この機能の心臓部。**
@@ -243,6 +254,7 @@ fn boot(root: PathBuf, notes: Vec<vault::Note>, load_ms: f64) -> App {
         last_edit: Instant::now(),
         show_marker: false,
         error: None,
+        close_refused: false,
         saved_flash_until: None,
         saves: 0,
         load_ms,
@@ -255,6 +267,9 @@ fn clear_dirty(app: &mut App) {
     app.dirty = false;
     app.dirty_since = None;
     app.show_marker = false;
+    // 書けたなら、閉じるのを断った記憶も畳む。次に閉じられなくなったときは
+    // また警告から始める（`close_refused` の doc 参照）。
+    app.close_refused = false;
 }
 
 /// 選択中のノートをファイルへ書き戻す。
@@ -450,6 +465,66 @@ fn delete_note(app: &mut App) -> Result<(), String> {
     clear_dirty(app);
     refresh_derived(app);
     Ok(())
+}
+
+/// 閉じる要求を受けたときに、書き戻してから閉じるか、踏みとどまるかを決める。
+///
+/// **これが最後のデータ喪失の穴だった。** 一覧の切替・作成・リネーム・削除には
+/// すべて `save_now` のガードが入っていたのに、「閉じる」だけが素通りしていた。
+/// デバウンス（1 秒）の途中で `Cmd+W` を打てば、その 1 秒分は消える。
+///
+/// `save_now` が true を返したなら本文は全部ディスクに乗っているので、迷わず閉じてよい。
+/// 判断が要るのは **false（書けなかった）** のときで、そこは 2 段階にしてある。
+///
+/// - **1 回目**: 閉じない。理由をステータス行に出す（気づく機会を作り、手で退避もできる）
+/// - **2 回目**: 明確な意思表示とみなし、**本文を `.rescue` へ退避してから**閉じる
+///
+/// **「閉じない」だけで通さなかった理由。** メモ帳で保存が失敗する現実的な原因は
+/// 容量不足・ドライブが外れた・権限が変わった、のどれかで、**待っても直らない**。
+/// 踏みとどまり続けても再試行が失敗するだけで、出口は強制終了しかなく、結局本文を失う。
+/// それは「安全装置が、失敗したときに何が起きるかまで設計されていない」状態そのもの。
+///
+/// 逆に 1 回目で退避して閉じると、ユーザーは**何が起きたか知らないまま**終了する。
+/// だから警告を 1 回挟む。
+fn close_window(app: &mut App, id: iced::window::Id) -> Task<Message> {
+    if save_now(app) {
+        return iced::window::close(id);
+    }
+
+    if !app.close_refused {
+        app.close_refused = true;
+        app.show_marker = true;
+        // **次に何が起きるかまで伝える。** 「閉じられない」だけだと打つ手が分からない。
+        if let Some(error) = &mut app.error {
+            error.push_str("／もう一度閉じると、本文を .rescue に退避して終了します");
+        }
+        return Task::none();
+    }
+
+    // ── 2 回目。ここから先は必ず閉じる ──
+    //
+    // 退避先は**優先順で複数**渡す。保存が失敗した原因がノートのあるディレクトリに
+    // あるとは限らないし、逆にそこだけの問題なら vault ルートには書ける。
+    // 一時ディレクトリは最後の砦（見つけにくいので優先度は最低）。
+    let note = app.selected.map(|i| &app.notes[i]);
+    let name = note
+        .and_then(|n| n.path.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "untitled.md".to_string());
+    let dirs: Vec<PathBuf> = note
+        .and_then(|n| n.path.parent().map(|p| p.to_path_buf()))
+        .into_iter()
+        .chain([app.root.clone(), std::env::temp_dir()])
+        .collect();
+
+    // 画面はもう無くなるので、伝える経路は stderr しかない。vault 直下に落ちれば
+    // Finder からは見えるし、`.rescue` は `load_dir` が拾わないので一覧は汚れない。
+    match vault::write_rescue(&dirs, &name, &app.content.text()) {
+        Ok(path) => eprintln!("haboku: 保存できなかったので退避しました: {}", path.display()),
+        Err(e) => eprintln!("haboku: 退避にも失敗しました（本文は失われます）: {e}"),
+    }
+
+    iced::window::close(id)
 }
 
 /// クエリで全ノートを絞り込む。**パレットが開いている間ずっとではなく、クエリが変わった時だけ。**
@@ -661,6 +736,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.error = Some(e);
             }
         }
+        Message::CloseRequested(id) => return close_window(app, id),
         Message::Key(event) => {
             let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
                 return Task::none();
@@ -734,10 +810,14 @@ fn subscription(app: &App) -> Subscription<Message> {
         _ => None,
     });
 
+    // 閉じる要求は **dirty かどうかに関わらず**常に拾う。dirty のときだけ購読すると、
+    // 「閉じた瞬間に dirty が解ける」ような競合で取りこぼしたときに黙って終了する。
+    let close = iced::window::close_requests().map(Message::CloseRequested);
+
     if app.dirty || app.saved_flash_until.is_some() {
-        Subscription::batch([keys, iced::time::every(TICK).map(Message::Tick)])
+        Subscription::batch([keys, close, iced::time::every(TICK).map(Message::Tick)])
     } else {
-        keys
+        Subscription::batch([keys, close])
     }
 }
 
@@ -1071,6 +1151,10 @@ fn main() -> ExitCode {
     )
     .title("haboku")
     .subscription(subscription)
+    // **既定（true）だと、閉じる要求はアプリに届く前にプロセスを終わらせる。**
+    // デバウンス（1 秒）の途中で閉じた分の編集が、ディスクにもメモリにも残らず消える。
+    // false にして `Message::CloseRequested` を自分で処理し、保存を挟む。
+    .exit_on_close_request(false)
     .run();
 
     match result {
@@ -1232,6 +1316,123 @@ mod tests {
         );
 
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **ウィンドウを閉じるときに、デバウンス途中の編集が書き戻されること。**
+    ///
+    /// 切替・作成・リネーム・削除には保存ガードがあったのに、「閉じる」だけが
+    /// 素通りしていた。`Cmd+W` を打った瞬間に直前 1 秒分が消えるので、
+    /// 一番踏みやすいデータ喪失の穴だった。
+    #[test]
+    fn closing_the_window_saves_pending_edits() {
+        let (dir, mut app) = app_with_vault("close-saves");
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, insert('X'));
+        assert!(app.dirty, "編集したのに dirty が立っていない");
+
+        // デバウンス（1 秒）を待たずに閉じる。ここが実際の操作と同じ条件。
+        let _ = close_window(&mut app, iced::window::Id::unique());
+
+        assert_eq!(app.saves, 1, "閉じるときに保存されていない");
+        assert!(!app.dirty, "保存したのに dirty が残っている");
+        let on_disk = std::fs::read_to_string(&app.notes[0].path).unwrap();
+        assert!(on_disk.contains('X'), "閉じる直前の編集がディスクに届いていない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **保存に失敗したら、1 回目は閉じないこと。** 黙って終了すると、切替を中断してまで
+    /// 守った本文が最後の一歩で消える。
+    ///
+    /// Task は中身を覗けないので、「閉じなかった」ことは踏みとどまった痕跡
+    /// （dirty が残る・エラーが出る・未保存マーカーが立つ）で確かめる。
+    #[test]
+    fn first_close_attempt_is_refused_when_saving_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, mut app) = app_with_vault("close-blocked");
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, insert('X'));
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let _ = close_window(&mut app, iced::window::Id::unique());
+
+        assert!(app.dirty, "保存できていないのに dirty が畳まれている");
+        assert!(app.show_marker, "閉じられない理由が画面に出ていない");
+        assert!(app.content.text().contains('X'), "未保存の編集がエディタから消えた");
+        // **次に何が起きるかまで伝わっていること。** 「閉じられない」だけでは打つ手がない。
+        let error = app.error.as_deref().unwrap_or_default();
+        assert!(error.contains("退避"), "2 回目に何が起きるかが伝わっていない: {error}");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **2 回目の要求では、本文を退避してから閉じること。**
+    ///
+    /// 踏みとどまり続けると強制終了しか出口が無くなり、結局全部失う。保存が失敗する原因
+    /// （容量・ドライブ・権限）は待っても直らないので、2 回目は必ず閉じる。ただし黙っては捨てない。
+    ///
+    /// ノートのあるフォルダだけを書けなくして、**退避先が vault ルートへ落ちる**ことも同時に見る。
+    #[test]
+    fn second_close_attempt_rescues_the_text_before_closing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, mut app) = app_with_folders("close-rescue", &[("topics", "消えては困る")]);
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, insert('X'));
+
+        let sub = dir.join("topics");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let id = iced::window::Id::unique();
+        let _ = close_window(&mut app, id); // 1 回目: 断る
+        let _ = close_window(&mut app, id); // 2 回目: 退避して閉じる
+
+        // topics は書けないので、vault ルートへ落ちているはず。
+        let rescued: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "rescue"))
+            .collect();
+        assert_eq!(rescued.len(), 1, "本文が退避されていない");
+        let body = std::fs::read_to_string(&rescued[0]).unwrap();
+        assert!(body.contains('X'), "退避したのに編集内容が入っていない");
+
+        // `.rescue` は `.md` ではないので、一覧には出てこない（vault を汚さない）。
+        assert!(
+            vault::load_dir(&dir).iter().all(|n| n.path != rescued[0]),
+            "退避ファイルが一覧に出ている"
+        );
+
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **保存が通ったら「一度断った」記憶を畳むこと。**
+    ///
+    /// 立てっぱなしだと、問題が直ったあとに別の失敗を踏んだとき、**警告なしで**
+    /// 1 回目の要求がそのまま退避＋終了になる。2 段階にした意味が消える。
+    #[test]
+    fn a_successful_save_resets_the_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, mut app) = app_with_folders("close-reset", &[("topics", "あ")]);
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, insert('X'));
+
+        let sub = dir.join("topics");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let _ = close_window(&mut app, iced::window::Id::unique());
+        assert!(app.close_refused, "1 回目を断った記録が残っていない");
+
+        // 権限を直して保存が通れば、記憶は畳まれる。
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        send(&mut app, Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
+
+        assert_eq!(app.saves, 1, "権限を戻したのに保存されていない");
+        assert!(!app.close_refused, "保存が通ったのに断った記憶が残っている");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
