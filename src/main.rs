@@ -559,13 +559,26 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.saved_flash_until = None;
             }
 
-            if let Some(dirty_since) = app.dirty_since {
-                if should_save(now, app.last_edit, dirty_since) {
-                    save_now(app);
-                } else if now.duration_since(dirty_since) >= DIRTY_MARKER_DELAY {
-                    // ここへ到達すること自体が「自動保存が動いていない」シグナル。
-                    app.show_marker = true;
-                }
+            if let Some(dirty_since) = app.dirty_since
+                && should_save(now, app.last_edit, dirty_since)
+            {
+                save_now(app);
+            }
+
+            // **保存を試みた「あと」に、独立して判定する。**
+            //
+            // 以前はここが `should_save` の `else if` だった。`DIRTY_MARKER_DELAY` は
+            // `AUTOSAVE_MAX_WAIT` より長いので、marker の条件が真になるときは
+            // 上限の条件も必ず真 → `else` 側へは原理的に到達せず、**異常時こそ点灯しない**
+            // 安全装置になっていた。
+            //
+            // 保存が成功していれば `clear_dirty` が `dirty_since` を畳んでいるので、
+            // ここに残っているのは「書こうとしたのに書けていない」状態だけ。
+            if app
+                .dirty_since
+                .is_some_and(|since| now.duration_since(since) >= DIRTY_MARKER_DELAY)
+            {
+                app.show_marker = true;
             }
         }
         Message::PaletteQueryChanged(query) => {
@@ -1208,6 +1221,51 @@ mod tests {
         );
 
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **未保存マーカーが実際に点灯すること。**
+    ///
+    /// 以前は `should_save` の `else if` に置かれていて、`DIRTY_MARKER_DELAY` >
+    /// `AUTOSAVE_MAX_WAIT` である以上**原理的に到達しなかった**。
+    /// 「異常のシグナル」と doc に書かれた安全装置が、異常時に沈黙していた。
+    #[test]
+    fn dirty_marker_lights_up_when_saving_keeps_failing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, mut app) = app_with_vault("marker");
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, insert('X'));
+        let edited = Instant::now();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // 上限（2.5 秒）は超えたがマーカー（3 秒）には届かない時点。まだ黙っている。
+        send(&mut app, Message::Tick(edited + AUTOSAVE_MAX_WAIT));
+        assert!(app.dirty, "保存に失敗したのに dirty が畳まれた");
+        assert!(!app.show_marker, "マーカーの時間に届く前に点灯した");
+
+        // マーカーの時間を越えたら点灯する。
+        send(&mut app, Message::Tick(edited + DIRTY_MARKER_DELAY));
+        assert!(app.show_marker, "保存できていないのに「未保存」が出ない");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 正常に保存できているうちはマーカーを出さないこと。
+    /// 常時点灯したらシグナルとして役に立たない。
+    #[test]
+    fn dirty_marker_stays_off_while_saves_succeed() {
+        let (dir, mut app) = app_with_vault("marker-quiet");
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, insert('X'));
+        let edited = Instant::now();
+
+        send(&mut app, Message::Tick(edited + DIRTY_MARKER_DELAY));
+
+        assert_eq!(app.saves, 1);
+        assert!(!app.show_marker, "保存できているのに「未保存」が出た");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
