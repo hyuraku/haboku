@@ -151,16 +151,18 @@ fn lower(c: char) -> char {
     c.to_lowercase().next().unwrap_or(c)
 }
 
-/// 単語の先頭か。区切り文字の直後、または camelCase の切れ目。
+/// 単語の先頭か。**区切り文字の直後だけ**を見る。
 /// 日本語には単語境界がほぼ無いので、実質的には連続ボーナスが効く。
+///
+/// camelCase の切れ目（`prev.is_lowercase() && cur.is_uppercase()`）も見ていたが、
+/// **原理的に到達しないので落とした。** ここへ渡る `chars` は `fold()` が `lower()` を
+/// 通したあとの文字で、大文字は残っていない。判定に要る情報を、判定の前に潰していた。
 fn is_word_boundary(chars: &[(Range<usize>, char)], i: usize) -> bool {
     if i == 0 {
         return true;
     }
     let prev = chars[i - 1].1;
-    let cur = chars[i].1;
     matches!(prev, ' ' | '-' | '_' | '/' | '.' | '(' | '[' | '、' | '・')
-        || (prev.is_lowercase() && cur.is_uppercase())
 }
 
 #[cfg(test)]
