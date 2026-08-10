@@ -427,8 +427,13 @@ fn commit_rename(app: &mut App, input: &str) -> Result<(), String> {
 /// **確認ダイアログは出さない。** vault 内 `.trash/` への移動で取り消せる操作なので、
 /// 確認を挟むほうが邪魔になる（前身と同じ判断）。
 ///
-/// **保存もしない。** 捨てるノートをわざわざ書き戻す意味がなく、保存に失敗したときに
-/// 削除できなくなるほうが困る。エディタの内容は破棄される。
+/// **書き戻しは呼び出し元（`Message::DeleteNote`）でやる。** 確認を出さない以上、
+/// 取り消しの綱は `.trash` のファイルだけ。そこに「最後に自動保存された内容」しか
+/// 残らないと、直前に打った分は誤って消した瞬間に取り返せない。
+///
+/// 以前は「保存に失敗したときに削除できなくなるほうが困る」として書き戻していなかったが、
+/// **その心配は成立しない。** `.trash` への退避は同じディレクトリからの rename なので、
+/// 保存が権限で失敗する状況では削除もどのみち失敗する。守れるものが増えるだけ。
 fn delete_note(app: &mut App) -> Result<(), String> {
     let Some(index) = app.selected else {
         return Err("ノートが開かれていません".to_string());
@@ -646,6 +651,12 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::DeleteNote => {
             app.palette = None;
             app.rename = None;
+            // 捨てる前に書き戻す。`.trash` に残るのが「最後に自動保存された内容」ではなく
+            // 「消す直前の内容」になり、誤って消しても打った分まで戻せる。
+            // 失敗したら中断（切替・作成・リネームと同じガード）。
+            if !save_now(app) {
+                return Task::none();
+            }
             if let Err(e) = delete_note(app) {
                 app.error = Some(e);
             }
@@ -1266,6 +1277,27 @@ mod tests {
 
         assert_eq!(app.saves, 1);
         assert!(!app.show_marker, "保存できているのに「未保存」が出た");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **捨てる前に書き戻すこと。** `.trash` に残るのが「最後に自動保存された内容」だと、
+    /// 誤って消したときに直前に打った分だけが戻せない。
+    #[test]
+    fn deleting_saves_the_pending_edits_into_trash() {
+        let (dir, mut app) = app_with_folders("delete-saves", &[("topics", "消すほう")]);
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, insert('X'));
+
+        send(&mut app, Message::DeleteNote);
+
+        assert_eq!(app.notes.len(), 0, "一覧から消えていない");
+        let trashed: Vec<_> = std::fs::read_dir(dir.join(".trash"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(trashed.len(), 1, ".trash に退避されていない");
+        let body = std::fs::read_to_string(trashed[0].path()).unwrap();
+        assert!(body.contains('X'), "消す直前の編集が .trash に残っていない");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
