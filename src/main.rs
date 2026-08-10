@@ -20,6 +20,112 @@ use iced::{Color, Element, Fill, Font, Length, Subscription, Task};
 
 use haboku::{fuzzy, vault};
 
+mod highlight;
+
+// ── 幽玄パレット。6 トークン + 派生値（ADR-0009、値の正は意匠 Artifact）──
+//
+// 琥珀だけが「今どこにいるか」の合図で、枯茶は警告専用。赤・青は使わない。
+// 派生値（soft / wash / hairline）は 6 トークンからアルファと明度だけで作る。
+
+/// 濃墨。地の色（ウィンドウ・サイドバーの底）。
+const KOBOKU: Color = Color::from_rgb8(0x18, 0x16, 0x1A);
+/// 淡墨。一段浮いた面（エディタ・オーバーレイのパネル）。
+const TANBOKU: Color = Color::from_rgb8(0x2A, 0x26, 0x2C);
+/// 生成り。主文字。
+const KINARI: Color = Color::from_rgb8(0xE9, 0xE3, 0xD5);
+/// 霞。副文字（件数・プレビュー・注釈・ステータス行）。地・淡墨の両方に 4.5:1 以上。
+const KASUMI: Color = Color::from_rgb8(0x9E, 0x96, 0x89);
+/// 琥珀。唯一のアクセント（選択・保存済・検索の一致文字）。
+const KOHAKU: Color = Color::from_rgb8(0xC8, 0x9C, 0x62);
+/// 琥珀の明るい側。一致文字・選択中タイトル・「保存しました」。
+const KOHAKU_SOFT: Color = Color::from_rgb8(0xD8, 0xB9, 0x88);
+/// 枯茶。警告・未保存・エラー。**赤は使わない。** 地に対し 4.5:1 を確保した値。
+const KARACHA: Color = Color::from_rgb8(0xC1, 0x7F, 0x4E);
+
+/// 琥珀の薄い wash。選択中の行の背景。
+const KOHAKU_WASH: Color = Color { a: 0.14, ..KOHAKU };
+/// 琥珀の濃い wash。エディタの選択範囲。
+const KOHAKU_WASH_STRONG: Color = Color { a: 0.26, ..KOHAKU };
+/// 生成りの 18% ヘアライン。パネルの枠線。
+const HAIRLINE_STRONG: Color = Color { a: 0.18, ..KINARI };
+
+/// 幽玄テーマを組む。iced の標準ウィジェット（text_input 等）は
+/// この Palette から導出された extended palette で自動的に配色される。
+fn yugen_theme() -> iced::Theme {
+    iced::Theme::custom(
+        "幽玄",
+        iced::theme::Palette {
+            background: KOBOKU,
+            text: KINARI,
+            primary: KOHAKU,
+            success: KOHAKU_SOFT,
+            warning: KARACHA,
+            danger: KARACHA,
+        },
+    )
+}
+
+/// 選択中の行（フォルダ・ノート一覧）。`button::primary` の置き換え（ADR-0009）。
+///
+/// primary のベタ塗りは彩度で目を引きすぎる。琥珀の薄い wash を敷くだけにして、
+/// 文字は生成りのまま「選ばれている」ことだけを語らせる。ホバーでも変えない
+/// （選択済みの行にホバーの反応は要らない）。
+fn selected_row(_theme: &iced::Theme, _status: button::Status) -> button::Style {
+    button::Style {
+        background: Some(iced::Background::Color(KOHAKU_WASH)),
+        text_color: KINARI,
+        border: iced::border::rounded(3),
+        ..button::Style::default()
+    }
+}
+
+/// エディタ面。淡墨（一段浮いた面）に生成りの文字。枠は描かない
+/// （ペインの区切りは濃墨との明度差だけで見せる）。
+fn editor_style(_theme: &iced::Theme, _status: text_editor::Status) -> text_editor::Style {
+    text_editor::Style {
+        background: iced::Background::Color(TANBOKU),
+        border: iced::Border::default(),
+        placeholder: KASUMI,
+        value: KINARI,
+        selection: KOHAKU_WASH_STRONG,
+    }
+}
+
+/// オーバーレイ（パレット・リネーム）のパネル。淡墨のカード面 + ヘアラインの枠。
+fn panel_style(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(TANBOKU.into()),
+        border: iced::Border {
+            color: HAIRLINE_STRONG,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// [`highlight::Kind`] を色と書体に変換する。区分と意匠の対応はここに集約する。
+fn markdown_format(
+    kind: &highlight::Kind,
+    _theme: &iced::Theme,
+) -> iced::advanced::text::highlighter::Format<Font> {
+    let color = |c| iced::advanced::text::highlighter::Format {
+        color: Some(c),
+        font: None,
+    };
+    match kind {
+        // frontmatter はメタ情報。本文より一段引かせる。
+        highlight::Kind::Frontmatter => color(KASUMI),
+        // 見出しは明朝（名指し。ADR-0009 / ADR-0003 と同じ判断）。色は本文と同じ生成り。
+        highlight::Kind::Heading => iced::advanced::text::highlighter::Format {
+            color: None,
+            font: Some(HEADING_FONT),
+        },
+        // コードは琥珀の明るい側。地の色は変えられない（Format は色と書体だけ）。
+        highlight::Kind::Code => color(KOHAKU_SOFT),
+    }
+}
+
 // ── 自動保存の閾値。CLAUDE.md の Done の定義がそのまま数値になっている ──
 
 /// 打鍵が止まってから保存するまでの待ち時間。
@@ -198,6 +304,22 @@ fn should_save(now: Instant, last_edit: Instant, dirty_since: Instant) -> bool {
 /// 等幅は必ず**名指し**する。実データ 約 1200 件で漢字の欠落が無く、コードブロックの桁も
 /// 揃うことを目視で確認済み。
 const EDITOR_FONT: Font = Font::with_name("Osaka-Mono");
+
+/// 見出し用の明朝。ADR-0003 と同じく**名指しでバンドルしない**。
+///
+/// 総称ファミリではなく名指しなので、漢字が消える方向の事故は起きない。
+/// このフォントが無い環境では cosmic-text が既定フォントへ**静かに**落ちる
+/// （見出しがゴシックになるだけで、文字は欠けない）。
+///
+/// **weight は `Light`（300）を名指しする。** cosmic-text 0.15 は、名指しした
+/// ファミリに**要求と同じ weight の face があるときだけ**そのファミリを使う
+/// （`FontFallbackIter::default_font_match_key` が `font_weight_diff == 0` で絞る）。
+/// Hiragino Mincho ProN は W3（300）と W6（600）しか持たないので、既定の
+/// `Normal`（400）で要求すると**フォントが入っていても**静かにゴシックへ落ちる。
+const HEADING_FONT: Font = Font {
+    weight: iced::font::Weight::Light,
+    ..Font::with_name("Hiragino Mincho ProN")
+};
 
 /// フォルダごとの件数を数えて多い順に並べる。
 fn count_folders(notes: &[vault::Note]) -> Vec<(String, usize)> {
@@ -822,37 +944,37 @@ fn subscription(app: &App) -> Subscription<Message> {
 }
 
 fn folder_pane(app: &App) -> Element<'_, Message> {
+    // フォルダ名は副文字（霞）。選ばれている行だけ生成りに持ち上げ、件数は常に霞のまま。
+    let all_selected = app.selected_folder.is_none();
     let all = button(
         row![
-            text("すべて").size(12).width(Fill),
-            text(app.notes.len().to_string()).size(12),
+            text("すべて")
+                .size(12)
+                .color(if all_selected { KINARI } else { KASUMI })
+                .width(Fill),
+            text(app.notes.len().to_string()).size(12).color(KASUMI),
         ]
         .padding(2),
     )
     .on_press(Message::FolderSelected(None))
     .width(Fill)
-    .style(if app.selected_folder.is_none() {
-        button::primary
-    } else {
-        button::text
-    });
+    .style(if all_selected { selected_row } else { button::text });
 
     let items = app.folders.iter().map(|(name, count)| {
         let selected = app.selected_folder.as_deref() == Some(name.as_str());
         button(
             row![
-                text(name).size(12).width(Fill),
-                text(count.to_string()).size(12),
+                text(name)
+                    .size(12)
+                    .color(if selected { KINARI } else { KASUMI })
+                    .width(Fill),
+                text(count.to_string()).size(12).color(KASUMI),
             ]
             .padding(2),
         )
         .on_press(Message::FolderSelected(Some(name.clone())))
         .width(Fill)
-        .style(if selected {
-            button::primary
-        } else {
-            button::text
-        })
+        .style(if selected { selected_row } else { button::text })
         .into()
     });
 
@@ -866,20 +988,20 @@ fn note_pane(app: &App) -> Element<'_, Message> {
     // （打鍵時の `view()` 構築 0.13ms）。無い機能を先回りで作らない。
     let rows = app.visible.iter().map(|&index| {
         let note = &app.notes[index];
+        let selected = app.selected == Some(index);
+        // タイトルは生成り、選択中だけ琥珀の明るい側へ。プレビューは常に霞。
         let body = column![
-            text(&note.title).size(13),
-            text(&note.preview).size(10),
+            text(&note.title)
+                .size(13)
+                .color(if selected { KOHAKU_SOFT } else { KINARI }),
+            text(&note.preview).size(10).color(KASUMI),
         ]
         .spacing(2);
 
         button(body)
             .on_press(Message::NoteSelected(index))
             .width(Fill)
-            .style(if app.selected == Some(index) {
-                button::primary
-            } else {
-                button::text
-            })
+            .style(if selected { selected_row } else { button::text })
             .into()
     });
 
@@ -893,7 +1015,9 @@ fn editor_pane(app: &App) -> Element<'_, Message> {
         .font(EDITOR_FONT)
         // 日本語には単語境界がほぼ無く、既定の `Word` だと長い段落が 1 つの巨大な単語になる。
         .wrapping(iced::advanced::text::Wrapping::WordOrGlyph)
-        .highlight("md", iced::highlighter::Theme::Base16Ocean)
+        // syntect の既製テーマではなく自前の Markdown ハイライタ（`highlight.rs` の doc 参照）。
+        .highlight_with::<highlight::MarkdownHighlighter>((), markdown_format)
+        .style(editor_style)
         .height(Fill)
         .into()
 }
@@ -903,7 +1027,12 @@ fn editor_pane(app: &App) -> Element<'_, Message> {
 /// `fuzzy::Match::ranges` は**バイト範囲**なので `get()` で受ける。日本語タイトルで
 /// 文字境界を跨いだときに panic しないため（`&title[range]` だと落ちる）。
 fn highlighted_title(title: &str, ranges: &[std::ops::Range<usize>]) -> Element<'static, Message> {
-    let hit = Color::from_rgb(1.0, 0.78, 0.25);
+    // 一致文字は琥珀の明るい側 + セミボールド。色だけだと霞んだ地の上で見落とすことがある。
+    let hit = KOHAKU_SOFT;
+    let hit_font = Font {
+        weight: iced::font::Weight::Semibold,
+        ..Font::DEFAULT
+    };
     let mut spans: Vec<iced::advanced::text::Span<'static, ()>> = Vec::new();
     let mut last = 0;
 
@@ -914,7 +1043,7 @@ fn highlighted_title(title: &str, ranges: &[std::ops::Range<usize>]) -> Element<
             spans.push(span(plain.to_string()));
         }
         if let Some(matched) = title.get(range.clone()) {
-            spans.push(span(matched.to_string()).color(hit));
+            spans.push(span(matched.to_string()).color(hit).font(hit_font));
         }
         last = range.end;
     }
@@ -945,15 +1074,15 @@ fn palette_overlay(app: &App, palette: &Palette) -> Element<'static, Message> {
             container(
                 iced::widget::column![
                     highlighted_title(&note.title, &m.ranges),
-                    text(note.folder.clone()).size(10),
+                    text(note.folder.clone()).size(10).color(KASUMI),
                 ]
                 .spacing(1),
             )
             .padding(6)
             .width(Fill)
-            .style(move |theme: &iced::Theme| {
+            .style(move |_theme: &iced::Theme| {
                 if is_selected {
-                    container::background(theme.extended_palette().primary.weak.color)
+                    container::background(KOHAKU_WASH)
                 } else {
                     container::Style::default()
                 }
@@ -981,24 +1110,14 @@ fn palette_overlay(app: &App, palette: &Palette) -> Element<'static, Message> {
                 app.notes.len(),
                 palette.matches.len()
             ))
-            .size(10),
+            .size(10)
+            .color(KASUMI),
         ]
         .spacing(8),
     )
     .padding(12)
     .width(Length::Fixed(640.0))
-    .style(|theme: &iced::Theme| {
-        let palette = theme.extended_palette();
-        container::Style {
-            background: Some(palette.background.base.color.into()),
-            border: iced::Border {
-                color: palette.background.strong.color,
-                width: 1.0,
-                radius: 8.0.into(),
-            },
-            ..container::Style::default()
-        }
-    });
+    .style(panel_style);
 
     // スクリムは背景側だけを覆う層として敷き、その上にパネルを重ねる。
     // パネルごと `mouse_area` で包むと、パネル内のクリックまで「背景クリック」として拾う。
@@ -1007,7 +1126,8 @@ fn palette_overlay(app: &App, palette: &Palette) -> Element<'static, Message> {
             .width(Fill)
             .height(Fill)
             .style(|_theme: &iced::Theme| {
-                container::background(Color::from_rgba(0.0, 0.0, 0.0, 0.45))
+                // 濃墨よりさらに深い墨でぼかす。真っ黒ではなく地の色相を保つ。
+                container::background(Color::from_rgba8(0x0A, 0x09, 0x0B, 0.6))
             }),
     )
     .on_press(Message::PaletteClose);
@@ -1031,32 +1151,23 @@ fn rename_overlay(current: &str) -> Element<'static, Message> {
             // 「リネームしたのに一覧の見た目が変わらない」を先に説明しておく。
             // タイトルは frontmatter / 見出しが優先されるため、仕様どおりでも驚く。
             text("変えるのはファイル名だけ。一覧のタイトルは frontmatter の title: や本文の # 見出しが優先されます")
-                .size(10),
-            text("enter で確定、esc・✕・背景クリックで取り消し").size(10),
+                .size(10)
+                .color(KASUMI),
+            text("enter で確定、esc・✕・背景クリックで取り消し").size(10).color(KASUMI),
         ]
         .spacing(8),
     )
     .padding(12)
     .width(Length::Fixed(520.0))
-    .style(|theme: &iced::Theme| {
-        let palette = theme.extended_palette();
-        container::Style {
-            background: Some(palette.background.base.color.into()),
-            border: iced::Border {
-                color: palette.background.strong.color,
-                width: 1.0,
-                radius: 8.0.into(),
-            },
-            ..container::Style::default()
-        }
-    });
+    .style(panel_style);
 
     let scrim = mouse_area(
         container(iced::widget::Space::new().width(Fill).height(Fill))
             .width(Fill)
             .height(Fill)
             .style(|_theme: &iced::Theme| {
-                container::background(Color::from_rgba(0.0, 0.0, 0.0, 0.45))
+                // 濃墨よりさらに深い墨でぼかす。真っ黒ではなく地の色相を保つ。
+                container::background(Color::from_rgba8(0x0A, 0x09, 0x0B, 0.6))
             }),
     )
     .on_press(Message::RenameCancel);
@@ -1075,35 +1186,36 @@ fn view(app: &App) -> Element<'_, Message> {
     .spacing(8)
     .height(Fill);
 
+    // 保存状態は色でも語る。未保存・編集中は枯茶（警告の色）、保存済みは琥珀の明るい側。
+    let (state_label, state_color) = if app.show_marker {
+        ("● 未保存", KARACHA)
+    } else if app.dirty {
+        ("… 編集中", KARACHA)
+    } else if app.saved_flash_until.is_some() {
+        ("保存しました", KOHAKU_SOFT)
+    } else {
+        ("―", KASUMI)
+    };
+
     let status = row![
-        text(format!("{} notes", app.visible.len())).size(11),
-        text(format!("load {:.1}ms", app.load_ms)).size(11),
+        text(format!("{} notes", app.visible.len())).size(11).color(KASUMI),
+        text(format!("load {:.1}ms", app.load_ms)).size(11).color(KASUMI),
         // Done の定義は 1ms 未満。ここが太りだしたら `view()` に重い処理が入った合図。
         text(format!(
             "view {:.2}ms",
             app.last_view_us.get() as f64 / 1000.0
         ))
-        .size(11),
+        .size(11)
+        .color(KASUMI),
         // 編集していないのに増えるなら「無編集でも書いている」ということ。
-        text(format!("saves {}", app.saves)).size(11),
-        text(if app.show_marker {
-            "● 未保存"
-        } else if app.dirty {
-            "… 編集中"
-        } else if app.saved_flash_until.is_some() {
-            "保存しました"
-        } else {
-            "―"
-        })
-        .size(11),
+        text(format!("saves {}", app.saves)).size(11).color(KASUMI),
+        text(state_label).size(11).color(state_color),
     ]
     .spacing(16);
 
     let error: Element<'_, Message> = match &app.error {
-        Some(message) => text(format!("⚠ {message}"))
-            .size(11)
-            .color(iced::Color::from_rgb(1.0, 0.45, 0.4))
-            .into(),
+        // エラーも枯茶。赤を持ち込まない（ADR-0009）。
+        Some(message) => text(format!("⚠ {message}")).size(11).color(KARACHA).into(),
         None => text("").size(11).into(),
     };
 
@@ -1144,12 +1256,17 @@ fn main() -> ExitCode {
     let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
     eprintln!("vault: {} notes / {load_ms:.1}ms / {}", notes.len(), root.display());
 
+    // テーマは一度だけ組む。`theme()` は描画のたびに呼ばれるので、そこで
+    // `Theme::custom`（Arc 生成 + extended palette の導出）を回さない。
+    let theme = yugen_theme();
+
     let result = iced::application(
         move || boot(root.clone(), notes.clone(), load_ms),
         update,
         view,
     )
     .title("haboku")
+    .theme(move |_app: &App| theme.clone())
     .subscription(subscription)
     // **既定（true）だと、閉じる要求はアプリに届く前にプロセスを終わらせる。**
     // デバウンス（1 秒）の途中で閉じた分の編集が、ディスクにもメモリにも残らず消える。
