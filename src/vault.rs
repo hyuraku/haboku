@@ -67,7 +67,23 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Note>) {
         if name.starts_with('.') || name == "node_modules" || name == "target" {
             continue;
         }
-        if path.is_dir() {
+        // **symlink は辿らない。`path.is_dir()` ではなく `entry.file_type()` で見る。**
+        //
+        // `is_dir()` はリンクを解決するので、vault の外を指すディレクトリ symlink を
+        // 踏むと外のファイルを一覧に載せてしまう。載れば編集でき、**保存も削除も
+        // vault の外で起きる**（`vault_root` の「黙って別の場所を開かない」と同じ危険）。
+        // 加えて `a -> ..` のような循環でスタックを食い潰すまで再帰する。
+        // `file_type()` は readdir が返した種別なのでリンクを解決しない。
+        let Ok(kind) = entry.file_type() else {
+            eprintln!("vault: skip {} (種別が取れない)", path.display());
+            continue;
+        };
+        if kind.is_symlink() {
+            eprintln!("vault: skip symlink {}", path.display());
+            continue;
+        }
+
+        if kind.is_dir() {
             walk(root, &path, out);
         } else if path.extension().is_some_and(|e| e == "md") {
             match read_with_mtime(&path) {
@@ -389,6 +405,31 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "二件目");
         assert!(load_dir(&dir).is_empty(), "捨てたノートが一覧に残っている");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **symlink は辿らないこと。** 2 つの実害を同時に塞ぐ:
+    ///
+    /// - vault の外を指すリンクを辿ると、外のファイルが一覧に載る。載れば編集でき、
+    ///   保存も削除も vault の外で起きる
+    /// - 自分自身（や親）を指すリンクは、辿れば再帰が止まらない
+    #[test]
+    fn walk_does_not_follow_symlinks() {
+        let dir = tmp_dir("symlink");
+        let outside = tmp_dir("symlink-outside");
+        std::fs::write(outside.join("外.md"), "vault の外の秘密").unwrap();
+        std::fs::write(dir.join("中.md"), "vault の中").unwrap();
+
+        std::os::unix::fs::symlink(&outside, dir.join("外部フォルダ")).unwrap();
+        std::os::unix::fs::symlink(outside.join("外.md"), dir.join("外部ファイル.md")).unwrap();
+        // 自分自身を指す循環。辿れば再帰が止まらない。
+        std::os::unix::fs::symlink(&dir, dir.join("循環")).unwrap();
+
+        let notes = load_dir(&dir);
+
+        let titles: Vec<&str> = notes.iter().map(|n| n.title.as_str()).collect();
+        assert_eq!(titles, ["中"], "symlink の先を読んでいる");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// 拡張子なしの名前でも枝番が末尾に付くこと（.trash へ雑ファイルが来ても壊れない）。
