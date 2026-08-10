@@ -115,9 +115,31 @@ fn read_with_mtime(path: &Path) -> std::io::Result<(String, SystemTime)> {
 /// 半分だけ書かれたファイルが残る。メモアプリでそれは許されないので、
 /// 一時ファイルへ書いてから `rename` する。rename は同一ファイルシステム上では
 /// アトミックなので、成功か失敗のどちらかにしかならない。
+///
+/// **rename のアトミック性だけでは足りない。** 中身が実際にディスクへ届く前に
+/// rename が先に永続化されると、電源断のあとに「新しい名前で中身が空（またはゴミ）」の
+/// ファイルが残る。プロセスが落ちるだけなら OS のページキャッシュが救ってくれるが、
+/// 電源断は救ってくれない。だから rename の前に `sync_all` で中身を確定させる。
+///
+/// **親ディレクトリの fsync は意図的にやらない。** そこまでやると rename 自体の
+/// 永続化まで保証できるが、省いても最悪の結果は「古い内容のまま残る」であって
+/// 壊れたファイルではない。この関数が守ると宣言しているのは前者だけ。
 pub fn save(path: &Path, contents: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension("md.tmp");
-    std::fs::write(&tmp, contents)?;
+    use std::io::Write;
+
+    // **一時ファイル名にプロセス ID を混ぜる。** 固定名（`note.md.tmp`）だと、
+    // 同じ vault を 2 つの haboku で開いたときに互いの一時ファイルを踏み合い、
+    // 片方の本文がもう片方のノートへ rename され得る。
+    // `.md` 以外は `load_dir` が拾わないので、一覧には出ない。
+    let tmp = path.with_extension(format!("md.{}.tmp", std::process::id()));
+
+    // ブロックにして、rename より先に必ずファイルを閉じる。
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+    }
+
     std::fs::rename(&tmp, path)
 }
 
@@ -430,6 +452,26 @@ mod tests {
         assert_eq!(titles, ["中"], "symlink の先を読んでいる");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// 保存が一時ファイルを残さないこと。残ると vault にゴミが積もり、
+    /// 名前が `.md` で終われば一覧にも出る。
+    #[test]
+    fn save_leaves_no_temporary_file_behind() {
+        let dir = tmp_dir("save-tmp");
+        let path = dir.join("a.md");
+        std::fs::write(&path, "元の中身").unwrap();
+
+        save(&path, "新しい中身").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "新しい中身");
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, ["a.md"], "一時ファイルが残っている");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 拡張子なしの名前でも枝番が末尾に付くこと（.trash へ雑ファイルが来ても壊れない）。
