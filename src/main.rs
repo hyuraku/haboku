@@ -2284,6 +2284,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **新規ノートは `0600` で生まれ、保存を重ねても緩まないこと。**
+    ///
+    /// `save()` は元ファイルの権限を引き継ぐ（ADR-0011）ので、作成時に付いた権限が
+    /// そのノートの公開範囲を決め切る。予約を umask 任せにしていた頃は、既存ノートを
+    /// `0600` に保つ修正を入れてもなお、**新しく書いたメモだけが `0644`** で並んでいた。
+    #[test]
+    fn a_new_note_is_created_private_and_stays_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, mut app) = app_with_folders("new-note-perms", &[("notes", "走り書き")]);
+        send(&mut app, Message::NewNote);
+        let path = app.notes[0].path.clone();
+
+        let created = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(created, 0o600, "新規ノートが既定の umask で作られた");
+
+        send(&mut app, insert('秘'));
+        send(&mut app, Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
+        flush_saves(&mut app);
+        assert_eq!(app.saves, 1, "保存されていない");
+
+        let saved = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(saved, 0o600, "保存で新規ノートの権限が緩んだ");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **作成したらサイドバーのフォルダ件数も増えること。**
     ///
     /// `folders` は起動時に 1 回数えるだけだったので、作っても数字が動かなかった。

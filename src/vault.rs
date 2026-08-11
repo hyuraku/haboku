@@ -178,7 +178,24 @@ pub fn save(path: &Path, contents: &str) -> std::io::Result<()> {
 ///
 /// 衝突時は拡張子の前に `-2`, `-3`, … を挟んだ名前を順に試す。
 /// 呼び出し側は返ったパスへ書き込むか rename で上書きする（予約は空ファイル）。
+///
+/// **予約は必ず `0600` で作る。** 予約ファイルのその後は呼び出し側で二手に分かれる:
+///
+/// - `move_to` は直後の `rename` で inode ごと差し替えるので、ここの権限は消える
+/// - **新規ノートと `.rescue` は予約したその inode に書き続ける**ので、ここの権限が
+///   そのまま最終的な公開範囲になる
+///
+/// 後者を umask 任せにすると、よくある `0022` で `0644` になる。しかも `save()` は
+/// 元ファイルの権限を引き継ぐ設計（ADR-0011）なので、新規ノートは**初回の予約で付いた
+/// `0644` を以後ずっと引きずる**。`.rescue` に至っては、保存できなかった本文が
+/// 他ユーザーから読める場所へ落ちる。ADR-0011 が「保存という操作がファイルの公開範囲を
+/// 広げてはいけない」と言うなら、**作成という操作も広げてはいけない**。
+///
+/// 緩めたい場合は呼び出し側が後から `set_permissions` すればよい。厳しいほうから
+/// 始めるのは、逆向き（緩く作って後で締める）だと締めるまでの窓が開くため。
 pub fn reserve_unique(dir: &Path, file_name: &str) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let (stem, ext) = match file_name.rsplit_once('.') {
         Some((stem, ext)) if !stem.is_empty() => (stem, Some(ext)),
         _ => (file_name, None),
@@ -193,6 +210,7 @@ pub fn reserve_unique(dir: &Path, file_name: &str) -> std::io::Result<PathBuf> {
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&path)
         {
             Ok(_) => return Ok(path),
@@ -617,6 +635,34 @@ mod tests {
         assert_ne!(first, second, "同じパスへ 2 回書いている");
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "1 回目");
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "2 回目");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **予約は `0600` で作られること。** 新規ノートはこの inode に書き続け、`save()` は
+    /// 元ファイルの権限を引き継ぐので、ここが umask 任せだと `0644` を永久に引きずる。
+    #[test]
+    fn reserve_unique_creates_a_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp_dir("reserve-perms");
+        let path = reserve_unique(&dir, "新しいメモ.md").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "予約が既定の umask で作られた");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **退避先も `0600` であること。** `.rescue` へ落ちるのは通常経路で保存できなかった本文で、
+    /// 元ノートが非公開だった可能性がいちばん高い。最後の手段が公開範囲を広げてはいけない。
+    #[test]
+    fn write_rescue_creates_a_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp_dir("rescue-perms");
+        let path = write_rescue(std::slice::from_ref(&dir), "私的なメモ.md", "秘密の本文").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "退避で本文の公開範囲が広がった");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
