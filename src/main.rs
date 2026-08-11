@@ -148,6 +148,13 @@ const SAVED_FLASH: Duration = Duration::from_millis(1500);
 /// dirty を監視する間隔。dirty でない間は subscription ごと止まる。
 const TICK: Duration = Duration::from_millis(100);
 
+/// 保存が失敗したあと、自動保存が次に試すまでの最短の待ち時間。
+const SAVE_RETRY_MIN: Duration = Duration::from_millis(500);
+
+/// 同じく最長。失敗が続いても、これ以上は間隔を空けない
+/// （直ったことに気づくまでが長すぎると「保存されないアプリ」になる）。
+const SAVE_RETRY_MAX: Duration = Duration::from_secs(30);
+
 /// パレットの入力欄を名指しする ID。開いた瞬間にフォーカスを飛ばすのに要る。
 const PALETTE_INPUT_ID: &str = "palette-input";
 
@@ -234,6 +241,14 @@ struct App {
     /// 保存が通れば `clear_dirty` で畳む。問題が直ったあとの初回はまた警告から始めたい
     /// （立てっぱなしだと、次に別の失敗を踏んだとき警告なしで終了してしまう）。
     close_refused: bool,
+    /// 自動保存が続けて失敗している回数。バックオフの段数（`save_retry_delay`）。
+    /// **数えるのは自動保存だけ。** 切替・終了などユーザーの操作は明示的な再試行なので待たせない。
+    save_failures: u32,
+    /// 自動保存を次に試してよい時刻。失敗のたびに後ろへ倒す。
+    ///
+    /// これが無いと、保存が失敗し続ける間 `should_save` が永久に真になり、
+    /// 100ms ごとに同期 I/O を UI スレッドで回して画面が固まる。
+    retry_after: Option<Instant>,
     /// 「保存しました」を消す時刻。
     saved_flash_until: Option<Instant>,
     /// 実際にディスクへ書いた回数。**検証用の計器。**
@@ -304,9 +319,32 @@ enum Message {
 ///
 /// 上限が無いと「打鍵が止まらない限り永久に保存されない」穴が開く。そして上限が効くのは
 /// `dirty_since` が **false → true の遷移でだけ**記録されている場合に限る。
-fn should_save(now: Instant, last_edit: Instant, dirty_since: Instant) -> bool {
-    now.duration_since(last_edit) >= AUTOSAVE_DEBOUNCE
-        || now.duration_since(dirty_since) >= AUTOSAVE_MAX_WAIT
+///
+/// この 2 本に**バックオフの AND** を掛ける。保存が失敗すると `dirty_since` も `last_edit` も
+/// 動かないので、この 2 本は以後**永久に真**のままになる。`retry_after` で塞がないと、
+/// 100ms の tick ごとに UI スレッドで「一時ファイル作成 → 書き込み → `sync_all`」を
+/// 再試行し続け、**保存が遅い・できない環境ほど画面が固まる**（ADR-0012）。
+fn should_save(
+    now: Instant,
+    last_edit: Instant,
+    dirty_since: Instant,
+    retry_after: Option<Instant>,
+) -> bool {
+    let due = now.duration_since(last_edit) >= AUTOSAVE_DEBOUNCE
+        || now.duration_since(dirty_since) >= AUTOSAVE_MAX_WAIT;
+    due && retry_after.is_none_or(|at| now >= at)
+}
+
+/// 連続失敗回数から次の再試行までの待ち時間を出す。1 回目の失敗が `failures == 1`。
+///
+/// 500ms から倍々にして 30 秒で頭打ち。**この曲線は「どれだけ早く直ったことに気づくか」と
+/// 「壊れている間どれだけ UI を止めないか」の綱引き**で、速いほうへ倒せば失敗のたびに
+/// 同期 I/O が UI スレッドへ戻ってくる。
+fn save_retry_delay(failures: u32) -> Duration {
+    let steps = failures.saturating_sub(1).min(6);
+    SAVE_RETRY_MIN
+        .saturating_mul(1 << steps)
+        .min(SAVE_RETRY_MAX)
 }
 
 /// 等幅フォント。**`Font::MONOSPACE` は使わない**（漢字が消える。ADR-0003）。
@@ -390,6 +428,8 @@ fn boot(root: PathBuf, notes: Vec<vault::Note>, load_ms: f64) -> App {
         show_marker: false,
         error: None,
         close_refused: false,
+        save_failures: 0,
+        retry_after: None,
         saved_flash_until: None,
         saves: 0,
         load_ms,
@@ -405,6 +445,10 @@ fn clear_dirty(app: &mut App) {
     // 書けたなら、閉じるのを断った記憶も畳む。次に閉じられなくなったときは
     // また警告から始める（`close_refused` の doc 参照）。
     app.close_refused = false;
+    // バックオフも畳む。**ここが唯一の解除点**なので、ユーザー操作（切替・終了）で
+    // 保存が通ったときも自動保存の待ちが解ける。
+    app.save_failures = 0;
+    app.retry_after = None;
 }
 
 /// 選択中のノートをファイルへ書き戻す。
@@ -617,7 +661,8 @@ fn delete_note(app: &mut App) -> Result<(), String> {
 /// 判断が要るのは **false（書けなかった）** のときで、そこは 2 段階にしてある。
 ///
 /// - **1 回目**: 閉じない。理由をステータス行に出す（気づく機会を作り、手で退避もできる）
-/// - **2 回目**: 明確な意思表示とみなし、**本文を `.rescue` へ退避してから**閉じる
+/// - **2 回目**: 明確な意思表示とみなし、**本文を `.rescue` へ退避してから**閉じる。
+///   ただし**退避にも失敗したら閉じない**（`rescue_and_close`。ADR-0012）
 ///
 /// **「閉じない」だけで通さなかった理由。** メモ帳で保存が失敗する現実的な原因は
 /// 容量不足・ドライブが外れた・権限が変わった、のどれかで、**待っても直らない**。
@@ -641,11 +686,16 @@ fn close_window(app: &mut App, id: iced::window::Id) -> Task<Message> {
         return Task::none();
     }
 
-    // ── 2 回目。ここから先は必ず閉じる ──
-    //
-    // 退避先は**優先順で複数**渡す。保存が失敗した原因がノートのあるディレクトリに
-    // あるとは限らないし、逆にそこだけの問題なら vault ルートには書ける。
-    // 一時ディレクトリは最後の砦（見つけにくいので優先度は最低）。
+    // ── 2 回目。退避できたら閉じる ──
+    let (name, dirs) = rescue_target(app);
+    rescue_and_close(app, id, &name, &dirs)
+}
+
+/// 退避先の候補を**優先順**で組む。ファイル名も一緒に返す。
+///
+/// 保存が失敗した原因がノートのあるディレクトリにあるとは限らないし、逆にそこだけの
+/// 問題なら vault ルートには書ける。一時ディレクトリは最後の砦（見つけにくいので優先度は最低）。
+fn rescue_target(app: &App) -> (String, Vec<PathBuf>) {
     let note = app.selected.map(|i| &app.notes[i]);
     let name = note
         .and_then(|n| n.path.file_name())
@@ -656,15 +706,40 @@ fn close_window(app: &mut App, id: iced::window::Id) -> Task<Message> {
         .into_iter()
         .chain([app.root.clone(), std::env::temp_dir()])
         .collect();
+    (name, dirs)
+}
 
-    // 画面はもう無くなるので、伝える経路は stderr しかない。vault 直下に落ちれば
+/// 本文を `.rescue` へ退避して閉じる。**退避に失敗したら閉じない**（ADR-0012）。
+///
+/// ADR-0007 は「2 回目は必ず閉じる」と決めたが、これは**退避が成功する前提**の話だった。
+/// 通常保存も退避先も全滅（容量ゼロなど）したときに閉じると、唯一残っていたメモリ上の
+/// 本文を、行き先が 1 つも無いまま捨てることになる。**逃げ道を用意する決定が、
+/// 逃げ道ごと消える経路を作っていた。**
+///
+/// 退避できなかったときに残す状態は「本文がエディタに残り、理由が画面に出ている」。
+/// ユーザーは選択してコピーで自力退避でき、容量を空けてからもう一度閉じれば退避は通る。
+fn rescue_and_close(
+    app: &mut App,
+    id: iced::window::Id,
+    name: &str,
+    dirs: &[PathBuf],
+) -> Task<Message> {
+    // 閉じたあとに画面は無いので、成功を伝える経路は stderr しかない。vault 直下に落ちれば
     // Finder からは見えるし、`.rescue` は `load_dir` が拾わないので一覧は汚れない。
-    match vault::write_rescue(&dirs, &name, &app.content.text()) {
-        Ok(path) => eprintln!("haboku: 保存できなかったので退避しました: {}", path.display()),
-        Err(e) => eprintln!("haboku: 退避にも失敗しました（本文は失われます）: {e}"),
+    match vault::write_rescue(dirs, name, &app.content.text()) {
+        Ok(path) => {
+            eprintln!("haboku: 保存できなかったので退避しました: {}", path.display());
+            iced::window::close(id)
+        }
+        Err(e) => {
+            eprintln!("haboku: 退避にも失敗しました（閉じません）: {e}");
+            app.error = Some(format!(
+                "保存も退避も失敗: {e}／本文を選択してコピーしてください。空き容量を作れば終了できます"
+            ));
+            app.show_marker = true;
+            Task::none()
+        }
     }
-
-    iced::window::close(id)
 }
 
 /// クエリで全ノートを絞り込む。**パレットが開いている間ずっとではなく、クエリが変わった時だけ。**
@@ -780,9 +855,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
 
             if let Some(dirty_since) = app.dirty_since
-                && should_save(now, app.last_edit, dirty_since)
+                && should_save(now, app.last_edit, dirty_since, app.retry_after)
             {
-                save_now(app);
+                // 失敗したら次の試行を後ろへ倒す。成功時は `clear_dirty` が畳む。
+                // **`Instant::now()` ではなく tick が持ってきた `now` を基準にする**
+                // （境界をテストから組み立てられなくなる）。
+                if !save_now(app) {
+                    app.save_failures = app.save_failures.saturating_add(1);
+                    app.retry_after = Some(now + save_retry_delay(app.save_failures));
+                }
             }
 
             // **保存を試みた「あと」に、独立して判定する。**
@@ -1616,6 +1697,145 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **退避にも失敗したら閉じないこと。** ADR-0007 の「2 回目は必ず閉じる」は
+    /// 退避が成功する前提の話で、通常保存も退避先も全滅したときに閉じると、
+    /// 唯一残っていたメモリ上の本文を行き先が無いまま捨てることになる。
+    ///
+    /// Task は中身を覗けないので、「閉じなかった」ことは踏みとどまった痕跡
+    /// （本文がエディタに残る・自力退避の手段が画面に出る）で確かめる。
+    #[test]
+    fn a_failed_rescue_keeps_the_window_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, mut app) = app_with_folders("rescue-fail", &[("topics", "消えては困る")]);
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, insert('X'));
+
+        // 退避先を**全部**書けなくする（容量ゼロで全滅した状況の代役）。
+        let locked = dir.join("退避先");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let id = iced::window::Id::unique();
+        let _ = rescue_and_close(&mut app, id, "メモ.md", std::slice::from_ref(&locked));
+
+        assert!(
+            app.content.text().contains('X'),
+            "退避できていないのにエディタから本文が消えた"
+        );
+        assert!(app.show_marker, "閉じられない理由が画面に出ていない");
+        let error = app.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("コピー"),
+            "自力で退避する手段が伝わっていない: {error}"
+        );
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **保存が失敗している間、tick のたびに再試行しないこと。**
+    ///
+    /// 失敗しても `dirty_since` も `last_edit` も動かないので、バックオフが無いと
+    /// `should_save` は以後永久に真になる。100ms ごとに UI スレッドで
+    /// 「一時ファイル作成 → 書き込み → `sync_all`」を回すことになり、
+    /// **保存できない環境ほど画面が固まって、本文をコピーして逃がすことすらできなくなる。**
+    #[test]
+    fn a_failing_autosave_backs_off_instead_of_retrying_every_tick() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, mut app) = app_with_folders("retry-backoff", &[("topics", "あ")]);
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, insert('X'));
+
+        let sub = dir.join("topics");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let edited = Instant::now();
+        let first_try = edited + AUTOSAVE_DEBOUNCE;
+        send(&mut app, Message::Tick(first_try));
+        assert_eq!(app.save_failures, 1, "失敗が数えられていない");
+        let retry_at = app.retry_after.expect("次の再試行時刻が決まっていない");
+
+        // 待ち時間の内側では、tick が何回来ても試さない。
+        for i in 1..=4 {
+            send(&mut app, Message::Tick(first_try + TICK * i));
+        }
+        assert_eq!(app.save_failures, 1, "バックオフ中に再試行している");
+
+        // 待ち時間を過ぎたら 1 回だけ試し、次の待ちはさらに伸びる。
+        send(&mut app, Message::Tick(retry_at));
+        assert_eq!(app.save_failures, 2, "待ち時間を過ぎても再試行していない");
+        assert!(
+            app.retry_after.is_some_and(|next| next > retry_at),
+            "失敗が続いているのに待ち時間が伸びていない"
+        );
+
+        // 本文はどこにも消えていない。
+        assert!(app.dirty, "保存できていないのに dirty が畳まれている");
+        assert!(app.content.text().contains('X'));
+
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **権限が直ったら、バックオフも一緒に畳まれること。**
+    /// 待ちが残ったままだと、直ったあとも最大 30 秒書かれない。
+    #[test]
+    fn a_successful_save_clears_the_backoff() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, mut app) = app_with_folders("retry-clear", &[("topics", "あ")]);
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, insert('X'));
+
+        let sub = dir.join("topics");
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let edited = Instant::now();
+        send(&mut app, Message::Tick(edited + AUTOSAVE_DEBOUNCE));
+        let retry_at = app.retry_after.expect("失敗したのに待ちが設定されていない");
+
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        send(&mut app, Message::Tick(retry_at));
+
+        assert_eq!(app.saves, 1, "権限を戻したのに保存されていない");
+        assert_eq!(app.save_failures, 0, "失敗の数が畳まれていない");
+        assert!(app.retry_after.is_none(), "待ちが残ったままになっている");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 待ち時間は倍々に伸び、上限で頭打ちになること。
+    /// 伸び続けると「直ったのに何分も書かれない」になり、伸びないと UI が固まる。
+    #[test]
+    fn the_retry_delay_grows_and_then_stops_growing() {
+        assert_eq!(save_retry_delay(1), SAVE_RETRY_MIN);
+        assert_eq!(save_retry_delay(2), SAVE_RETRY_MIN * 2);
+        assert_eq!(save_retry_delay(3), SAVE_RETRY_MIN * 4);
+        assert_eq!(save_retry_delay(30), SAVE_RETRY_MAX, "上限で止まっていない");
+        // 呼ばれない値でも 0 待ち（＝毎 tick 再試行）にはしない。
+        assert_eq!(save_retry_delay(0), SAVE_RETRY_MIN);
+    }
+
+    /// バックオフ中は、デバウンスも上限も満たしていても書かないこと（境界の両側）。
+    #[test]
+    fn a_pending_backoff_holds_the_save_off() {
+        let start = Instant::now();
+        let now = start + AUTOSAVE_DEBOUNCE;
+
+        assert!(
+            should_save(now, start, start, None),
+            "前提: バックオフが無ければ書く"
+        );
+        assert!(
+            !should_save(now, start, start, Some(now + Duration::from_millis(1))),
+            "待ち時間の内側なのに書こうとしている"
+        );
+        assert!(
+            should_save(now, start, start, Some(now)),
+            "待ち時間ちょうどで再開していない"
+        );
+    }
+
     /// **未保存マーカーが実際に点灯すること。**
     ///
     /// 以前は `should_save` の `else if` に置かれていて、`DIRTY_MARKER_DELAY` >
@@ -1686,7 +1906,7 @@ mod tests {
     #[test]
     fn does_not_save_right_after_a_keystroke() {
         let now = Instant::now();
-        assert!(!should_save(now, now, now));
+        assert!(!should_save(now, now, now, None));
     }
 
     /// 手を止めて 1 秒で書く（デバウンス）。
@@ -1694,7 +1914,7 @@ mod tests {
     fn saves_after_debounce() {
         let start = Instant::now();
         let now = start + AUTOSAVE_DEBOUNCE;
-        assert!(should_save(now, start, start));
+        assert!(should_save(now, start, start, None));
     }
 
     /// **打ち続けていても上限で書く。** ここが無いと、打鍵が止まらない限り永久に保存されない。
@@ -1704,7 +1924,7 @@ mod tests {
         let dirty_since = Instant::now();
         let now = dirty_since + AUTOSAVE_MAX_WAIT;
         let last_edit = now - Duration::from_millis(1);
-        assert!(should_save(now, last_edit, dirty_since));
+        assert!(should_save(now, last_edit, dirty_since, None));
     }
 
     /// 上限に達する寸前・打鍵直後なら、まだ書かない（境界の下側）。
@@ -1713,7 +1933,7 @@ mod tests {
         let dirty_since = Instant::now();
         let now = dirty_since + AUTOSAVE_MAX_WAIT - Duration::from_millis(1);
         let last_edit = now - Duration::from_millis(1);
-        assert!(!should_save(now, last_edit, dirty_since));
+        assert!(!should_save(now, last_edit, dirty_since, None));
     }
 
     /// 新規ノートは**開いているノートと同じフォルダ**に作られ、一覧の先頭に出ること。
@@ -2384,6 +2604,6 @@ mod tests {
         let now = start + Duration::from_secs(10);
         let last_edit = now - Duration::from_millis(50);
         let dirty_since_wrongly_reset = last_edit;
-        assert!(!should_save(now, last_edit, dirty_since_wrongly_reset));
+        assert!(!should_save(now, last_edit, dirty_since_wrongly_reset, None));
     }
 }
