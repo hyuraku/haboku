@@ -456,6 +456,11 @@ fn open_note(app: &mut App, index: usize) {
         // 表示のために本文を加工しない。
         app.content = text_editor::Content::with_text(&note.raw);
         app.selected = Some(index);
+        // 開きかけのリネーム欄は、選択が動いた時点で対象を失うので畳む。
+        // ここは `selected` を書き換える全経路（一覧クリック・パレット・新規作成）の
+        // 合流点。畳み忘れると、残った入力欄の Enter が**新しい選択先を前のノートの
+        // 名前でリネームする**（`RenameCommit` の対象は `app.selected`）。
+        app.rename = None;
     }
 }
 
@@ -906,6 +911,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 && matches!(&key, keyboard::Key::Character(c) if c == "p")
                 && app.palette.is_none()
             {
+                // リネーム欄が開いていたら畳む（`RenameStarted` がパレットを畳むのと対称）。
+                // 両方開いたままだと、下の `app.rename.is_some()` の分岐が Enter を先に拾い、
+                // パレットで選んだつもりの Enter が `RenameCommit` として走る。
+                app.rename = None;
                 app.palette = Some(Palette {
                     query: String::new(),
                     matches: refilter(&app.notes, ""),
@@ -1934,6 +1943,83 @@ mod tests {
         assert!(app.rename.is_some(), "打ち直せない");
         assert!(app.error.is_some(), "理由が表に出ていない");
         assert_eq!(app.notes[0].path, before, "拒否したのにリネームされた");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// subscription が拾う打鍵を組み立てる（`Message::Key` の実経路を通すため）。
+    fn pressed(k: keyboard::Key, modifiers: keyboard::Modifiers) -> Message {
+        Message::Key(keyboard::Event::KeyPressed {
+            key: k.clone(),
+            modified_key: k,
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        })
+    }
+
+    /// **リネーム欄を開いたまま `Cmd+N` しても、新規ノートが前の名前でリネームされないこと。**
+    ///
+    /// `NewNote` はパレットしか畳んでいなかった。入力欄が開いたまま残ると、そこで押した
+    /// Enter は `RenameCommit` として届き、対象は `app.selected` = 作られたばかりの
+    /// 新規ノートなので、**前のノートのファイル名で誤リネームされる**実害があった。
+    #[test]
+    fn creating_a_note_closes_an_open_rename() {
+        let (dir, mut app) = app_with_folders("rename-vs-new", &[("topics", "設計メモ")]);
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, Message::RenameStarted);
+
+        send(&mut app, Message::NewNote);
+        assert!(app.rename.is_none(), "リネーム欄が開いたまま残っている");
+
+        // 万一 Enter がすり抜けても、対象を失った確定は何もしないこと。
+        let before = app.notes[0].path.clone();
+        send(&mut app, Message::RenameCommit);
+        assert_eq!(app.notes[0].path, before, "新規ノートが前の名前でリネームされた");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **リネーム欄を開いたまま一覧の別ノートを選んでも、そのノートがリネームされないこと。**
+    #[test]
+    fn selecting_a_note_closes_an_open_rename() {
+        let (dir, mut app) =
+            app_with_folders("rename-vs-select", &[("topics", "先客"), ("topics", "動くほう")]);
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, Message::RenameStarted);
+
+        send(&mut app, Message::NoteSelected(1));
+        assert!(app.rename.is_none(), "リネーム欄が開いたまま残っている");
+
+        let before = app.notes[1].path.clone();
+        send(&mut app, Message::RenameCommit);
+        assert_eq!(app.notes[1].path, before, "選択先が前の名前でリネームされた");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **リネーム欄を開いたまま `Cmd+P` すると入力欄が畳まれ、パレットの Enter が
+    /// 選択として届くこと。**
+    ///
+    /// 両方開いたままだと `Message::Key` の分岐がリネームの Enter を先に拾い、
+    /// パレットで選んだつもりの Enter が `RenameCommit` として走る。
+    #[test]
+    fn opening_the_palette_closes_an_open_rename() {
+        let (dir, mut app) =
+            app_with_folders("rename-vs-palette", &[("topics", "先客"), ("topics", "動くほう")]);
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, Message::RenameStarted);
+
+        send(&mut app, pressed(key("p"), keyboard::Modifiers::COMMAND));
+        assert!(app.rename.is_none(), "パレットとリネーム欄が同時に開いている");
+        assert!(app.palette.is_some(), "パレットが開いていない");
+
+        let before: Vec<_> = app.notes.iter().map(|n| n.path.clone()).collect();
+        send(&mut app, pressed(named(keyboard::key::Named::Enter), keyboard::Modifiers::empty()));
+        assert!(app.palette.is_none(), "Enter でパレットから開けていない");
+        let after: Vec<_> = app.notes.iter().map(|n| n.path.clone()).collect();
+        assert_eq!(after, before, "パレットからの選択でリネームが走った");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
