@@ -32,6 +32,16 @@ ADR-0010 の実機確認でリネーム欄を開いたまま `Cmd+N` を押し�
 直すなら 1 箇所ずつ潰すのではなく、「エディタを上書き／破棄する経路を全部数える」
 （ADR-0007 の学び）と同じ数え方で、**`app.selected` を動かす操作**を先に列挙すること。
 
+**解決（2026-08-11）**: 申し送りどおり `app.selected` を動かす操作を列挙した
+（一覧クリック・パレット Enter・`Cmd+N`。`DeleteNote` は畳み済み）。経路ごとに畳むのではなく、
+3 経路の合流点である `open_note()` で `app.rename` を畳む — 次に `selected` を動かす経路を
+足しても同じ穴が開かない。あわせて `Cmd+P` でパレットを開くときも畳む（`RenameStarted` が
+パレットを畳むのと対称。両方開くと `Message::Key` の分岐がリネームの Enter を先に拾い、
+パレットの Enter が選択として届かない）。回帰テスト 3 本
+（`creating_a_note_closes_an_open_rename` / `selecting_a_note_closes_an_open_rename` /
+`opening_the_palette_closes_an_open_rename`）は、**修正を外して 3 本とも落ちることを
+確認してから**固定した。実機での 3 経路の目視確認は公開前チェックリストに残っている。
+
 ### 幽玄配色の実装中に、エディタ等幅が効いていない事実を発見（2026-08-10）
 
 見出し明朝（Hiragino Mincho ProN）がフォントありの環境でゴシックに落ちる現象を追ううちに、
