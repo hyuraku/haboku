@@ -22,3 +22,9 @@ tokio = { version = "1", default-features = false, features = ["rt"] }
 # `local-offset` がマルチスレッドで IndeterminateOffset を返すため使えない。
 # clock だけあれば足りるので default-features は切る。
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# 初回セットアップの「別の場所を選ぶ…」で NSOpenPanel を出すためだけ。ADR-0015。
+# **macOS の許可（TCC）を取る手段でもある**ので、UI の都合ではなく権限設計上必要。
+# default-features は Linux 向け backend（wayland / xdg-portal）と blocking API 用の
+# pollster なので全部切る。切った結果 Cargo.lock の増分は rfd 1 crate だけ
+# （objc2 系・block2・dispatch2 は既に依存ツリーにいた）。
+rfd = { version = "0.17.2", default-features = false }

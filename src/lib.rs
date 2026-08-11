@@ -7,5 +7,6 @@
 //! バイナリ（`main.rs`）と分けているのは、UI 層から見て「まだ呼んでいない公開 API」が
 //! `dead_code` 扱いにならないようにするため。
 
+pub mod config;
 pub mod fuzzy;
 pub mod vault;

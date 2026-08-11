@@ -7,7 +7,7 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,7 @@ use iced::widget::{
 };
 use iced::{Color, Element, Fill, Font, Length, Subscription, Task};
 
-use haboku::{fuzzy, vault};
+use haboku::{config, fuzzy, vault};
 
 mod highlight;
 
@@ -192,6 +192,14 @@ struct Palette {
 struct App {
     /// vault のルート。保存後に `parse_note` へ渡すのに要る。
     root: PathBuf,
+    /// 保存先が決まっていない間の初回セットアップ。決まっていれば `None`（ADR-0015）。
+    ///
+    /// **`Some` の間はディスクに触らない。** `update()` の入口で他のメッセージを全部落として
+    /// いるのは、まだ `root` が「候補」でしかないため（そこへ書くと意図しない場所に書く）。
+    setup: Option<Setup>,
+    /// 選んだ保存先を覚えておくファイル。**フィールドに持つのはテストのため**
+    /// （`$HOME` を書き換えずに使い捨てのパスへ差し替えられる）。
+    config_file: PathBuf,
     /// 全ノート。**読み込み時の順序（更新日時の新しい順）から動かさない。**
     ///
     /// 保存のたびに並べ替えると、編集中のノートが毎回先頭へ飛んで `selected` の指す先がズレる。
@@ -283,6 +291,28 @@ struct App {
     pending: Option<PendingAction>,
 }
 
+/// 初回セットアップの状態（ADR-0015）。**保存先が決まるまでの画面**。
+struct Setup {
+    /// 提示する候補（`~/Documents/haboku`）。「別の場所を選ぶ…」の初期位置にも使う。
+    suggested: PathBuf,
+    /// 採用に失敗した理由。**ここに出す**（`eprintln!` は `.app` では誰にも見えない）。
+    ///
+    /// 保存先を作れない・読めないのは大抵 macOS の許可を拒否したときで、
+    /// 黙って空の vault を開くとノートが消えたようにしか見えない（ADR-0002 と同じ穴）。
+    error: Option<String>,
+}
+
+/// 起動時に保存先をどう決めたか（ADR-0015）。
+#[derive(Debug, PartialEq)]
+enum VaultChoice {
+    /// そのまま開ける。
+    Ready(PathBuf),
+    /// 初回セットアップ画面を出す。
+    NeedsSetup { suggested: PathBuf },
+    /// 起動せず終わる。**明示的に指定されたものが外れているとき**だけここへ来る。
+    Refuse(String),
+}
+
 /// 進行中の保存が書いている中身。完了メッセージには結果しか載せず、突き合わせはここでやる。
 struct InFlight {
     /// 書き戻す先の `notes` インデックス。
@@ -346,6 +376,15 @@ enum Message {
     /// `app.saving` を見れば一意に決まる（`InFlight` の doc 参照）。
     /// `std::io::Error` は `Clone` でないので、ここへ載せる前に文字列にする。
     Saved(Result<(), String>),
+    /// 初回セットアップ: 提示された候補をそのまま採用する（ADR-0015）。
+    SetupUseSuggested,
+    /// 初回セットアップ: OS のフォルダ選択を開く。
+    ///
+    /// **これは UI の都合ではなく許可を取る手続き**でもある。ユーザーが選んだ場所は
+    /// macOS が暗黙に許可する（ADR-0015）。
+    SetupBrowse,
+    /// 初回セットアップ: フォルダ選択の結果。`None` は取り消し（何もしない）。
+    SetupPicked(Option<PathBuf>),
     /// ウィンドウを閉じる要求（`Cmd+W`・✕・`Cmd+Q`）。
     ///
     /// **既定の `exit_on_close_request = true` のままだと、これを受け取る前にプロセスが
@@ -463,20 +502,29 @@ fn visible_indices(notes: &[vault::Note], folder: Option<&str>) -> Vec<usize> {
         .collect()
 }
 
+/// ノートを開いていないときのエディタの中身。
+const WELCOME: &str = "左の一覧からノートを選ぶか、Cmd+P で検索すると、ここに本文が出ます。";
+
+/// `$HOME`。**`.app` から起動しても launchd が渡すので、ここは環境変数で足りる**
+/// （シェルの設定に依存する `VAULT` とは事情が違う）。
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
+}
+
 fn boot(root: PathBuf, notes: Vec<vault::Note>, load_ms: f64) -> App {
     let folders = count_folders(&notes);
     let visible = visible_indices(&notes, None);
 
     App {
         root,
+        setup: None,
+        config_file: config::config_file(&home_dir()),
         notes,
         folders,
         selected_folder: None,
         visible,
         selected: None,
-        content: text_editor::Content::with_text(
-            "左の一覧からノートを選ぶか、Cmd+P で検索すると、ここに本文が出ます。",
-        ),
+        content: text_editor::Content::with_text(WELCOME),
         palette: None,
         rename: None,
         modifiers: keyboard::Modifiers::empty(),
@@ -494,6 +542,89 @@ fn boot(root: PathBuf, notes: Vec<vault::Note>, load_ms: f64) -> App {
         last_view_us: Cell::new(0),
         saving: None,
         pending: None,
+    }
+}
+
+/// 保存先が決まっていないときの起動（ADR-0015）。
+///
+/// `root` には候補を入れておくが、**`setup` が `Some` の間は誰もそこへ書かない**
+/// （`update()` の入口で他のメッセージを落とす）。
+fn boot_setup(suggested: PathBuf) -> App {
+    let mut app = boot(suggested.clone(), Vec::new(), 0.0);
+    app.setup = Some(Setup {
+        suggested,
+        error: None,
+    });
+    app
+}
+
+/// 起動時に保存先を決める（ADR-0015）。**順番そのものが仕様**なので、ここだけ見れば分かる形にする。
+///
+/// 1. `VAULT` 環境変数 — 開発用。**指定が外れていたら代わりを探さずに終わる**
+///    （借り物 vault を指したつもりで別の場所を開き、そこへ書き始めるのを防ぐ。ADR-0002）
+/// 2. 記憶した場所 — 前回選んだ場所。**消えていたらセットアップへ戻す**
+///    （既定パスへ黙って倒すと、同期の失敗などで vault が見えないときに「空になった」と誤解する）
+/// 3. どちらも無ければ初回セットアップ
+///
+/// `remembered` を引数で受け取るのは、設定ファイルの読み方をここに混ぜないため
+/// （読むのは `config::read_vault`、判断するのはここ）。
+fn resolve_vault(
+    env_vault: Option<String>,
+    remembered: Option<PathBuf>,
+    suggested: PathBuf,
+) -> VaultChoice {
+    if let Some(raw) = env_vault {
+        let root = PathBuf::from(raw);
+        return if root.is_dir() {
+            VaultChoice::Ready(root)
+        } else {
+            VaultChoice::Refuse(format!("VAULT が指す vault が見つかりません: {}", root.display()))
+        };
+    }
+
+    match remembered {
+        Some(root) if root.is_dir() => VaultChoice::Ready(root),
+        // 記憶はあるが指す先が無い。**エラーで終わらせない**（アプリから選び直せる）。
+        _ => VaultChoice::NeedsSetup { suggested },
+    }
+}
+
+/// セットアップで決まった場所を採用する。**ここで初めてディスクに触る**（ADR-0015）。
+///
+/// 失敗したらセットアップ画面に留まって理由を出す。**空の vault を開いて先へ進まない。**
+fn adopt_vault(app: &mut App, root: PathBuf) {
+    if let Err(e) = std::fs::create_dir_all(&root) {
+        set_setup_error(
+            app,
+            format!("保存先を用意できませんでした（{}）: {e}", root.display()),
+        );
+        return;
+    }
+
+    // 記憶できなくても開くのは続ける（次回またこの画面が出るだけで、書いたものは失わない）。
+    // ただし黙らない — 下で常駐エラーに出す。
+    let remembered = config::write_vault(&app.config_file, &root);
+
+    let t0 = Instant::now();
+    let notes = vault::load_dir(&root);
+    app.load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    app.folders = count_folders(&notes);
+    app.visible = visible_indices(&notes, None);
+    app.notes = notes;
+    app.root = root;
+    app.selected = None;
+    app.selected_folder = None;
+    app.content = text_editor::Content::with_text(WELCOME);
+    app.setup = None;
+    app.error = remembered
+        .err()
+        .map(|e| format!("保存先を覚えられませんでした（次回もこの画面が出ます）: {e}"));
+}
+
+fn set_setup_error(app: &mut App, message: String) {
+    if let Some(setup) = &mut app.setup {
+        setup.error = Some(message);
     }
 }
 
@@ -1045,7 +1176,59 @@ fn handle_palette_key(
     }
 }
 
+/// 初回セットアップ中の `update()`（ADR-0015）。**扱うのは 3 つだけで、残りは捨てる。**
+fn update_setup(app: &mut App, message: Message) -> Task<Message> {
+    match message {
+        Message::SetupUseSuggested => {
+            if let Some(setup) = &app.setup {
+                adopt_vault(app, setup.suggested.clone());
+            }
+        }
+        Message::SetupBrowse => {
+            // 候補そのものはまだ存在しないことがあるので、**親フォルダから開く**。
+            let start = app.setup.as_ref().and_then(|setup| {
+                setup
+                    .suggested
+                    .parent()
+                    .filter(|parent| parent.is_dir())
+                    .map(Path::to_path_buf)
+            });
+
+            // **blocking 版を使わない。** UI スレッドでモーダルを回すとイベントループが
+            // 止まる（iced 公式の editor 例と同じく `AsyncFileDialog` + `Task`）。
+            return Task::future(async move {
+                let mut dialog = rfd::AsyncFileDialog::new().set_title("メモの保存先フォルダを選ぶ");
+                if let Some(start) = start {
+                    dialog = dialog.set_directory(start);
+                }
+                dialog
+                    .pick_folder()
+                    .await
+                    .map(|handle| handle.path().to_path_buf())
+            })
+            .map(Message::SetupPicked);
+        }
+        // `None` は取り消し。**画面を変えない**（勝手に候補を採用しない）。
+        Message::SetupPicked(Some(root)) => adopt_vault(app, root),
+        Message::SetupPicked(None) => {}
+        // **閉じる要求だけは通す。** `exit_on_close_request` を false にしてあるので、
+        // ここで落とすと ✕ も `Cmd+Q` も効かない窓になる。保存するものはまだ無いので
+        // `close_window`（保存を挟む経路）ではなく素直に閉じる。
+        Message::CloseRequested(id) => return iced::window::close(id),
+        // 打鍵・tick など。**保存先が決まる前に何も起こさせない。**
+        _ => {}
+    }
+
+    Task::none()
+}
+
 fn update(app: &mut App, message: Message) -> Task<Message> {
+    // **保存先が決まるまでは他を一切通さない**（ADR-0015）。`root` はまだ候補で、
+    // 自動保存の tick や打鍵がここを抜けると「まだ選んでいない場所」へ書きに行く。
+    if app.setup.is_some() {
+        return update_setup(app, message);
+    }
+
     match message {
         Message::FolderSelected(folder) => {
             app.visible = visible_indices(&app.notes, folder.as_deref());
@@ -1168,6 +1351,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             // 失敗したら中断（切替・作成・リネームと同じガード）。
             return begin_save(app, Some(PendingAction::Delete), None);
         }
+        // セットアップ中しか意味を持たない（入口の分岐で `update_setup` が処理する）。
+        // 保存先が決まったあとに来ても、ここで vault を差し替えたりはしない。
+        Message::SetupUseSuggested | Message::SetupBrowse | Message::SetupPicked(_) => {}
         Message::CloseRequested(id) => return close_window(app, id),
         Message::WindowUnfocused => app.modifiers = keyboard::Modifiers::empty(),
         Message::Key(event) => {
@@ -1519,8 +1705,62 @@ fn rename_overlay(current: &str) -> Element<'static, Message> {
     stack![scrim, container(panel).center_x(Fill).padding(120)].into()
 }
 
+/// 初回セットアップの画面（ADR-0015）。Boostnote に倣い、**候補を見せてから選ばせる**。
+///
+/// OS のフォルダ選択をいきなり開かないのは、「何を選ばされているのか」が分からないまま
+/// Finder の窓が出る形を避けるため。
+fn setup_view(setup: &Setup) -> Element<'_, Message> {
+    let error: Element<'_, Message> = match &setup.error {
+        // エラーも枯茶。赤を持ち込まない（ADR-0009）。
+        Some(message) => text(format!("⚠ {message}")).size(11).color(KARACHA).into(),
+        None => text("").size(11).into(),
+    };
+
+    let panel = container(
+        column![
+            text("メモの保存先を決める").size(20).font(HEADING_FONT),
+            text("haboku は、選んだフォルダの中の Markdown ファイルをそのまま読み書きします。既にメモが入っているフォルダを選べば、そのまま開きます。")
+                .size(12)
+                .color(KASUMI),
+            container(text(setup.suggested.display().to_string()).size(13).color(KINARI))
+                .padding(10)
+                .width(Fill)
+                .style(|_theme: &iced::Theme| container::background(TANBOKU)),
+            row![
+                button(text("この場所で始める").size(13))
+                    .on_press(Message::SetupUseSuggested)
+                    .padding([8, 14])
+                    .style(button::primary),
+                button(text("別の場所を選ぶ…").size(13))
+                    .on_press(Message::SetupBrowse)
+                    .padding([8, 14])
+                    .style(button::text),
+            ]
+            .spacing(8),
+            // **あとで変えられることを先に言う。** 決めきれずに止まるのを防ぐ。
+            text("この選択は覚えます。変えたいときは選び直せます")
+                .size(10)
+                .color(KASUMI),
+            error,
+        ]
+        .spacing(12),
+    )
+    .padding(20)
+    .width(Length::Fixed(560.0))
+    .style(panel_style);
+
+    container(panel).center_x(Fill).center_y(Fill).padding(40).into()
+}
+
 fn view(app: &App) -> Element<'_, Message> {
     let t0 = Instant::now();
+
+    // 保存先が決まるまでは 3 ペインを組まない（そもそも見せるノートが無い）。
+    if let Some(setup) = &app.setup {
+        let element = setup_view(setup);
+        app.last_view_us.set(t0.elapsed().as_micros());
+        return element;
+    }
 
     let panes = row![
         container(folder_pane(app)).width(Length::Fixed(SIDEBAR_WIDTH)),
@@ -1586,29 +1826,41 @@ fn view(app: &App) -> Element<'_, Message> {
 }
 
 fn main() -> ExitCode {
-    let root = match vault_root() {
-        Ok(root) => root,
-        Err(msg) => {
+    let home = home_dir();
+    let config_file = config::config_file(&home);
+
+    let choice = resolve_vault(
+        std::env::var("VAULT").ok(),
+        config::read_vault(&config_file),
+        config::default_vault(&home),
+    );
+
+    // 保存先が決まっているときだけ、iced を起動する前に読み込む。
+    // **時間を測るのに UI の初期化を混ぜたくない**（初回セットアップ経由の分は
+    // `adopt_vault` が測る。Done の定義の 50ms は 2 回目以降の起動で見る）。
+    let boot_app: Box<dyn Fn() -> App> = match choice {
+        VaultChoice::Refuse(msg) => {
             eprintln!("haboku: {msg}");
             return ExitCode::from(2);
         }
+        VaultChoice::Ready(root) => {
+            let t0 = Instant::now();
+            let notes = vault::load_dir(&root);
+            let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("vault: {} notes / {load_ms:.1}ms / {}", notes.len(), root.display());
+            Box::new(move || boot(root.clone(), notes.clone(), load_ms))
+        }
+        VaultChoice::NeedsSetup { suggested } => {
+            eprintln!("vault: 未設定（初回セットアップを表示します）");
+            Box::new(move || boot_setup(suggested.clone()))
+        }
     };
-
-    // 読み込みは iced を起動する前に済ませる。時間を測るのに UI の初期化を混ぜたくない。
-    let t0 = Instant::now();
-    let notes = vault::load_dir(&root);
-    let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    eprintln!("vault: {} notes / {load_ms:.1}ms / {}", notes.len(), root.display());
 
     // テーマは一度だけ組む。`theme()` は描画のたびに呼ばれるので、そこで
     // `Theme::custom`（Arc 生成 + extended palette の導出）を回さない。
     let theme = yugen_theme();
 
-    let result = iced::application(
-        move || boot(root.clone(), notes.clone(), load_ms),
-        update,
-        view,
-    )
+    let result = iced::application(boot_app, update, view)
     .title("haboku")
     .theme(move |_app: &App| theme.clone())
     .subscription(subscription)
@@ -1625,22 +1877,6 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// 開く vault のルートを決める。
-///
-/// **見つからないときは黙って別の場所を開かない。** 借り物の vault を指したつもりで
-/// 空の既定ディレクトリが開くと「ノートが消えた」ようにしか見えず、
-/// そのまま書き始めると本当に別の場所へ書き込む。ADR-0002（読み込み専用モードの廃止）と
-/// 同じ判断で、危ういフォールバックより即座に失敗するほうを採る。
-fn vault_root() -> Result<PathBuf, String> {
-    let raw = std::env::var("VAULT")
-        .map_err(|_| "環境変数 VAULT に vault のパスを指定してください".to_string())?;
-    let root = PathBuf::from(raw);
-    if !root.is_dir() {
-        return Err(format!("vault が見つかりません: {}", root.display()));
-    }
-    Ok(root)
 }
 
 #[cfg(test)]
@@ -2629,7 +2865,11 @@ mod tests {
     #[test]
     #[ignore = "実データの vault が要る。VAULT を指定して --ignored で走らせる"]
     fn measure_view_construction_with_real_vault() {
-        let root = vault_root().expect("VAULT に実データの vault を指定して実行する");
+        // このテストは実データ専用なので、記憶した保存先ではなく `VAULT` だけを見る。
+        let root = match resolve_vault(std::env::var("VAULT").ok(), None, PathBuf::new()) {
+            VaultChoice::Ready(root) => root,
+            other => panic!("VAULT に実データの vault を指定して実行する: {other:?}"),
+        };
         let notes = vault::load_dir(&root);
         let count = notes.len();
         let mut app = boot(root, notes, 0.0);
@@ -2958,5 +3198,212 @@ mod tests {
         let last_edit = now - Duration::from_millis(50);
         let dirty_since_wrongly_reset = last_edit;
         assert!(!should_save(now, last_edit, dirty_since_wrongly_reset, None));
+    }
+
+    // ── 初回セットアップ（ADR-0015）─────────────────────────────
+    //
+    // 固定したいのは**起動経路の優先順位**と、**保存先が決まる前に何も書かないこと**。
+    // 「ノートが消えたように見える」経路を作らないための安全装置がここに集まっている。
+
+    /// 使い捨ての作業ディレクトリ。`$HOME` の代わりに使う。
+    fn temp_dir_for(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("haboku-setup-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// セットアップ画面から始まる `App`。**設定ファイルを使い捨てのパスへ向ける**
+    /// （本物の `~/Library/Application Support` を汚さない）。
+    fn app_in_setup(home: &Path, suggested: PathBuf) -> App {
+        let mut app = boot_setup(suggested);
+        app.config_file = config::config_file(home);
+        app
+    }
+
+    #[test]
+    fn vault_env_wins_over_the_remembered_path() {
+        let home = temp_dir_for("env-wins");
+        let env_root = home.join("env-vault");
+        let remembered = home.join("remembered-vault");
+        std::fs::create_dir_all(&env_root).unwrap();
+        std::fs::create_dir_all(&remembered).unwrap();
+
+        let choice = resolve_vault(
+            Some(env_root.display().to_string()),
+            Some(remembered),
+            config::default_vault(&home),
+        );
+
+        assert_eq!(choice, VaultChoice::Ready(env_root));
+    }
+
+    /// **明示的に指定されたものが外れているなら、代わりを探さない**（ADR-0002 / ADR-0015）。
+    /// ここでセットアップへ倒すと、借り物 vault を指したつもりで別の場所へ書き始める。
+    #[test]
+    fn an_invalid_vault_env_refuses_to_start() {
+        let home = temp_dir_for("env-invalid");
+        let missing = home.join("not-there");
+
+        let choice = resolve_vault(
+            Some(missing.display().to_string()),
+            // 記憶があっても、そちらへ倒さないことが要点。
+            Some(home.clone()),
+            config::default_vault(&home),
+        );
+
+        assert!(matches!(choice, VaultChoice::Refuse(_)), "{choice:?}");
+    }
+
+    #[test]
+    fn the_remembered_path_opens_without_setup() {
+        let home = temp_dir_for("remembered");
+        let remembered = home.join("Documents/somewhere else");
+        std::fs::create_dir_all(&remembered).unwrap();
+
+        let choice = resolve_vault(None, Some(remembered.clone()), config::default_vault(&home));
+
+        assert_eq!(choice, VaultChoice::Ready(remembered));
+    }
+
+    /// 記憶が指す先が消えていたら**セットアップへ戻す**。既定パスへ黙って倒すと、
+    /// 同期の失敗などで vault が見えないときに「空になった」と誤解する。
+    #[test]
+    fn a_remembered_path_that_vanished_falls_back_to_setup() {
+        let home = temp_dir_for("vanished");
+        let suggested = config::default_vault(&home);
+
+        let choice = resolve_vault(None, Some(home.join("gone")), suggested.clone());
+
+        assert_eq!(choice, VaultChoice::NeedsSetup { suggested });
+    }
+
+    #[test]
+    fn no_memory_at_all_starts_setup() {
+        let home = temp_dir_for("first-run");
+        let suggested = config::default_vault(&home);
+
+        let choice = resolve_vault(None, None, suggested.clone());
+
+        assert_eq!(choice, VaultChoice::NeedsSetup { suggested });
+    }
+
+    /// **保存先が決まる前に 1 バイトも書かない。** 打鍵と tick を通してしまうと、
+    /// まだ候補でしかないパスへ自動保存が走る。
+    #[test]
+    fn nothing_reaches_the_disk_while_the_setup_screen_is_up() {
+        let home = temp_dir_for("no-writes");
+        let suggested = config::default_vault(&home);
+        let mut app = app_in_setup(&home, suggested.clone());
+        let before = app.content.text();
+
+        send(&mut app, insert('あ'));
+        send(&mut app, Message::Tick(Instant::now() + Duration::from_secs(5)));
+        send(&mut app, Message::NewNote);
+
+        assert!(app.setup.is_some(), "セットアップ画面から出てしまった");
+        assert_eq!(app.content.text(), before, "エディタが編集を受け付けた");
+        assert_eq!(app.saves, 0);
+        assert!(!suggested.exists(), "候補のフォルダが作られている");
+        assert!(!app.config_file.exists(), "選ぶ前に記憶が書かれている");
+    }
+
+    #[test]
+    fn adopting_the_suggested_folder_creates_remembers_and_loads_it() {
+        let home = temp_dir_for("adopt");
+        let suggested = config::default_vault(&home);
+        // 既にメモが入っているフォルダを選んだ場合も、そのまま開けること。
+        std::fs::create_dir_all(&suggested).unwrap();
+        std::fs::write(suggested.join("既存.md"), "# 既存のメモ\n").unwrap();
+        let mut app = app_in_setup(&home, suggested.clone());
+
+        send(&mut app, Message::SetupUseSuggested);
+
+        assert!(app.setup.is_none(), "セットアップが閉じていない");
+        assert_eq!(app.root, suggested);
+        assert_eq!(app.notes.len(), 1);
+        assert_eq!(app.visible.len(), 1);
+        assert_eq!(app.error, None);
+        assert_eq!(config::read_vault(&app.config_file), Some(suggested));
+    }
+
+    /// フォルダが無い場合は作って始める（Boostnote と同じ。ADR-0015）。
+    #[test]
+    fn adopting_a_folder_that_does_not_exist_yet_creates_it() {
+        let home = temp_dir_for("adopt-new");
+        let suggested = config::default_vault(&home);
+        let mut app = app_in_setup(&home, suggested.clone());
+
+        send(&mut app, Message::SetupUseSuggested);
+
+        assert!(suggested.is_dir(), "保存先が作られていない");
+        assert!(app.setup.is_none());
+        assert!(app.notes.is_empty());
+    }
+
+    /// **失敗したらセットアップ画面に留まる。** 空の vault を開いて先へ進むと、
+    /// そこへ書いたものが「消えた」ように見える（ADR-0002 と同じ穴）。
+    #[test]
+    fn a_folder_that_cannot_be_created_keeps_the_setup_screen_with_a_reason() {
+        let home = temp_dir_for("adopt-fails");
+        // ファイルの下にディレクトリは作れない。許可を拒否されたときと同じ形の失敗。
+        let blocker = home.join("これはファイル");
+        std::fs::write(&blocker, "").unwrap();
+        let doomed = blocker.join("haboku");
+        let mut app = app_in_setup(&home, doomed.clone());
+
+        send(&mut app, Message::SetupUseSuggested);
+
+        let setup = app.setup.as_ref().expect("セットアップ画面から出てしまった");
+        let reason = setup.error.as_ref().expect("理由が表示されていない");
+        assert!(reason.contains("保存先を用意できませんでした"), "{reason}");
+        assert!(app.notes.is_empty());
+    }
+
+    /// 記憶に失敗しても**開くのは続ける**（書いたものは失われない）。ただし黙らない。
+    #[test]
+    fn a_vault_that_cannot_be_remembered_still_opens_but_says_so() {
+        let home = temp_dir_for("cannot-remember");
+        let suggested = config::default_vault(&home);
+        let mut app = app_in_setup(&home, suggested.clone());
+        // 設定ファイルの親を作れない場所へ向ける。
+        let blocker = home.join("これもファイル");
+        std::fs::write(&blocker, "").unwrap();
+        app.config_file = blocker.join("haboku/vault");
+
+        send(&mut app, Message::SetupUseSuggested);
+
+        assert!(app.setup.is_none(), "開けていない");
+        assert_eq!(app.root, suggested);
+        let error = app.error.as_ref().expect("黙って失敗している");
+        assert!(error.contains("覚えられませんでした"), "{error}");
+    }
+
+    /// 取り消し（フォルダ選択を閉じた）で**勝手に候補を採用しない**。
+    #[test]
+    fn cancelling_the_folder_dialog_changes_nothing() {
+        let home = temp_dir_for("cancel");
+        let suggested = config::default_vault(&home);
+        let mut app = app_in_setup(&home, suggested.clone());
+
+        send(&mut app, Message::SetupPicked(None));
+
+        assert!(app.setup.is_some());
+        assert!(!suggested.exists());
+    }
+
+    /// **セットアップ中でも窓は閉じられること。** `exit_on_close_request` を false に
+    /// してあるので、ここを落とすと ✕ も `Cmd+Q` も効かない窓になる。
+    #[test]
+    fn the_window_can_still_be_closed_during_setup() {
+        let home = temp_dir_for("close");
+        let mut app = app_in_setup(&home, config::default_vault(&home));
+
+        // `Task` の中身は iced ランタイムのものなので、ここでは「空の Task を返して
+        // 黙殺していない」ことだけ見る。
+        let task = update(&mut app, Message::CloseRequested(iced::window::Id::unique()));
+
+        assert_ne!(task.units(), 0, "閉じる要求が無視されている");
     }
 }
