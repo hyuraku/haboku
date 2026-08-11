@@ -1008,10 +1008,28 @@ fn note_pane(app: &App) -> Element<'_, Message> {
     scrollable(column(rows).spacing(1)).height(Fill).into()
 }
 
+/// `Cmd` 付きの打鍵を本文に入れない。
+///
+/// subscription はイベントを**観測できても消費できない**（ADR-0004）。`Cmd+P` は
+/// パレットを開くと同時にこのエディタにも届き、iced の既定の `from_key_press` は
+/// `text` があれば `Insert` を返す（`command()` のガードは `c/x/v/a` にしか無い）。
+/// 放っておくと "p" が本文に入り、**自動保存でディスクまで届く**。
+///
+/// **`command()` で一律に落とさない。** `from_key_press` は `Insert` より先に
+/// `Copy` / `Cut` / `Paste` / `SelectAll` を返すので、そこは通す。
+fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
+    let command = kp.modifiers.command();
+    match text_editor::Binding::from_key_press(kp) {
+        Some(text_editor::Binding::Insert(_)) if command => None,
+        other => other,
+    }
+}
+
 fn editor_pane(app: &App) -> Element<'_, Message> {
     text_editor(&app.content)
         .id(iced::widget::Id::new(EDITOR_ID))
         .on_action(Message::Edit)
+        .key_binding(editor_key_binding)
         .font(EDITOR_FONT)
         // 日本語には単語境界がほぼ無く、既定の `Word` だと長い段落が 1 つの巨大な単語になる。
         .wrapping(iced::advanced::text::Wrapping::WordOrGlyph)
@@ -2082,6 +2100,63 @@ mod tests {
         handle_palette_key(&mut app, &named(keyboard::key::Named::Escape), <_>::default());
         assert!(app.palette.is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `text_editor` に届く打鍵を組み立てる。
+    ///
+    /// **`text` は `Cmd` を押していても付いてくる。** iced はこれを見て `Insert` を作るので、
+    /// ここが混入の入口になる。だから `Cmd+P` の再現には `text: Some("p")` が要る。
+    fn key_press(c: &str, modifiers: keyboard::Modifiers) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key: key(c),
+            modified_key: key(c),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers,
+            text: Some(c.into()),
+            status: text_editor::Status::Focused { is_hovered: false },
+        }
+    }
+
+    /// **`Cmd+P` の "p" が本文に入らないこと。** 実 vault のノートに "p" が入って
+    /// 自動保存されるところまで実際に踏んだ回帰。ショートカットは subscription で拾うが、
+    /// subscription はイベントを消費できないので、同じ打鍵がここにも届く（ADR-0010）。
+    #[test]
+    fn command_shortcuts_do_not_reach_the_body() {
+        for c in ["p", "n", "r"] {
+            assert!(
+                editor_key_binding(key_press(c, keyboard::Modifiers::COMMAND)).is_none(),
+                "Cmd+{c} が本文に入る",
+            );
+        }
+    }
+
+    /// 修飾なしの打鍵はそのまま入ること（塞ぎすぎていないことの裏取り）。
+    #[test]
+    fn plain_keys_still_insert() {
+        assert!(matches!(
+            editor_key_binding(key_press("p", <_>::default())),
+            Some(text_editor::Binding::Insert('p')),
+        ));
+    }
+
+    /// **`Cmd+C` が死んでいないこと。** `command()` で一律に落とす実装だと、
+    /// 混入は止まる代わりにコピー・貼り付け・全選択がまとめて使えなくなる。
+    #[test]
+    fn command_shortcuts_of_the_editor_itself_survive() {
+        assert!(matches!(
+            editor_key_binding(key_press("c", keyboard::Modifiers::COMMAND)),
+            Some(text_editor::Binding::Copy),
+        ));
+        assert!(matches!(
+            editor_key_binding(key_press("v", keyboard::Modifiers::COMMAND)),
+            Some(text_editor::Binding::Paste),
+        ));
+        assert!(matches!(
+            editor_key_binding(key_press("a", keyboard::Modifiers::COMMAND)),
+            Some(text_editor::Binding::SelectAll),
+        ));
     }
 
     /// **エディタに入れて出しただけの本文が、元ファイルと 1 バイトも違わないこと。**
