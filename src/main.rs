@@ -268,6 +268,47 @@ struct App {
     /// `view()` は `&App` しか取れないので `Cell` で内部可変にする。表示されるのは
     /// 1 フレーム前の値（構築中の時間は構築が終わるまで確定しない）。
     last_view_us: Cell<u128>,
+
+    // ── 非同期保存 ──────────────────────────────────────────
+    /// 進行中の保存。**同時に 1 本しか走らせない**（ADR-0014）。
+    ///
+    /// 直列にしているおかげで「古い保存の完了が新しい保存を上書きする」順序事故が
+    /// **起こり得ない形**になっている。世代番号を持たないのはそのため。
+    /// `notes` を触る操作（作成・削除・リネーム）は全部この後ろに並ぶので、
+    /// ここに控えた `index` が完了時にズレることもない。
+    saving: Option<InFlight>,
+    /// 保存が通ったらやること。**保存に失敗したら捨てる**（それが従来のガードの中身）。
+    ///
+    /// 後から来た操作で上書きする。ノート A を選んですぐ B を選んだら、行き先は B でよい。
+    pending: Option<PendingAction>,
+}
+
+/// 進行中の保存が書いている中身。完了メッセージには結果しか載せず、突き合わせはここでやる。
+struct InFlight {
+    /// 書き戻す先の `notes` インデックス。
+    index: usize,
+    path: PathBuf,
+    /// **書き出した瞬間のスナップショット。** 完了時にエディタの現在値と比べて、
+    /// 保存中に打たれた分があるかを判定する（あれば dirty を畳まない）。
+    contents: String,
+    /// 自動保存として始まったなら、その tick の時刻。ユーザー操作なら `None`。
+    ///
+    /// バックオフを数えるのは自動保存だけ（ADR-0012）。完了時に `Instant::now()` を
+    /// 読まずに済むよう、**判定の基準時刻を持ち回す**（境界をテストから組み立てるため）。
+    autosave_at: Option<Instant>,
+}
+
+/// 保存の完了を待ってから実行する操作。**どれもエディタの内容を捨てる操作**なので、
+/// 保存が通るまで走らせてはいけない（従来 `if !save_now()` で塞いでいたもの）。
+#[derive(Debug, Clone)]
+enum PendingAction {
+    /// ノートを開く。`from_palette` は `Cmd+P` 経由かどうか（パレットを畳み、
+    /// 開く先が絞り込みで隠れるなら絞り込みも解く）。
+    OpenNote { index: usize, from_palette: bool },
+    NewNote,
+    Rename(String),
+    Delete,
+    Close(iced::window::Id),
 }
 
 #[derive(Debug, Clone)]
@@ -299,6 +340,12 @@ enum Message {
     RenameCommit,
     /// 開いているノートを `.trash` へ退避する（`Cmd+Delete`）。
     DeleteNote,
+    /// 保存が終わった（`app.saving` の 1 本に対応する）。
+    ///
+    /// 中身が結果だけなのは、**同時に 1 本しか走らせない**から。どの保存の完了かは
+    /// `app.saving` を見れば一意に決まる（`InFlight` の doc 参照）。
+    /// `std::io::Error` は `Clone` でないので、ここへ載せる前に文字列にする。
+    Saved(Result<(), String>),
     /// ウィンドウを閉じる要求（`Cmd+W`・✕・`Cmd+Q`）。
     ///
     /// **既定の `exit_on_close_request = true` のままだと、これを受け取る前にプロセスが
@@ -445,6 +492,8 @@ fn boot(root: PathBuf, notes: Vec<vault::Note>, load_ms: f64) -> App {
         saves: 0,
         load_ms,
         last_view_us: Cell::new(0),
+        saving: None,
+        pending: None,
     }
 }
 
@@ -453,6 +502,15 @@ fn clear_dirty(app: &mut App) {
     app.dirty = false;
     app.dirty_since = None;
     app.show_marker = false;
+    clear_save_backoff(app);
+}
+
+/// **ディスクが健康だと分かったとき**に畳むもの。dirty とは分けてある。
+///
+/// 保存中にも打鍵は続けられるので、「書けたが、書いた時点より新しい本文がある」状態が起きる。
+/// そのとき dirty は立てたままにしないと打った分が宙に浮くが、**書けた事実は事実**なので
+/// バックオフと「閉じるのを断った記憶」は解いてよい。
+fn clear_save_backoff(app: &mut App) {
     // 書けたなら、閉じるのを断った記憶も畳む。次に閉じられなくなったときは
     // また警告から始める（`close_refused` の doc 参照）。
     app.close_refused = false;
@@ -462,14 +520,39 @@ fn clear_dirty(app: &mut App) {
     app.retry_after = None;
 }
 
-/// 選択中のノートをファイルへ書き戻す。
+/// 選択中のノートの書き戻しを**投げる**。`next` は保存が通ったあとにやること。
 ///
-/// **戻り値は「エディタの内容を破棄してよいか」。** false は未保存の内容がディスクに
-/// 書けていないことを意味するので、呼び出し元はエディタを上書きする操作（ノート切替）を
-/// **中断すること**。進んでしまうと、失われた本文はディスクにもメモリにも残らない。
-fn save_now(app: &mut App) -> bool {
+/// **旧 `save_now()` の置き換え**（ADR-0014）。あれは `bool` を返す同期関数で、
+/// 呼び出し元は `if !save_now(app) { return; }` でエディタを潰す操作を止めていた。
+/// 書き込み（`write` → `sync_all` → `rename`）を UI スレッドで待つので、
+/// 遅い vault では `sync_all` が返るまで**画面全体が止まる**。
+///
+/// ガードの意味論は変えていない。**判定の場所だけが `Message::Saved` へ移った**:
+///
+/// - 書くものが無い（未選択・差分なし）→ `next` を**その場で**実行する。ここは以前と同じ
+/// - 書くものがある → `next` を `app.pending` に預け、書き込みだけワーカーへ出す
+/// - 既に 1 本走っている → 走らせない。`next` だけ預けて完了時に引き継ぐ
+///
+/// `autosave_at` は自動保存の tick から来た時刻。ユーザー操作なら `None`
+/// （バックオフを数えるのは自動保存だけ。ADR-0012）。
+fn begin_save(
+    app: &mut App,
+    next: Option<PendingAction>,
+    autosave_at: Option<Instant>,
+) -> Task<Message> {
+    // **預けるのは `Some` のときだけ。** 自動保存の tick（`next` が `None`）が
+    // 先に預けてある操作を消してはいけない。
+    if let Some(next) = next {
+        app.pending = Some(next);
+    }
+
+    // 走っている最中に重ねない。完了時に `app.pending` ごと引き継がれる。
+    if app.saving.is_some() {
+        return Task::none();
+    }
+
     let Some(index) = app.selected else {
-        return true;
+        return take_pending(app);
     };
 
     let contents = app.content.text();
@@ -478,11 +561,111 @@ fn save_now(app: &mut App) -> bool {
     // 外部ツール（git・エディタ・同期）から「更新された」と誤認される。
     if contents == app.notes[index].raw {
         clear_dirty(app);
-        return true;
+        return take_pending(app);
     }
 
     let path = app.notes[index].path.clone();
-    match vault::save(&path, &contents) {
+    app.saving = Some(InFlight {
+        index,
+        path: path.clone(),
+        contents: contents.clone(),
+        autosave_at,
+    });
+
+    // **`spawn_blocking` で回す。** `vault::save` は `sync_all` でディスクを待つ本物の
+    // ブロッキング I/O なので、そのまま async へ置くと tokio のワーカーを 1 本占有する。
+    Task::perform(
+        async move {
+            tokio::task::spawn_blocking(move || {
+                vault::save(&path, &contents).map_err(|e| e.to_string())
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("保存タスクが落ちました: {e}")))
+        },
+        Message::Saved,
+    )
+}
+
+/// 預けてある操作があれば実行する。無ければ何もしない。
+fn take_pending(app: &mut App) -> Task<Message> {
+    match app.pending.take() {
+        Some(action) => run_action(app, action),
+        None => Task::none(),
+    }
+}
+
+/// 保存が通ったので、待たせていた操作を実行する。
+///
+/// **ここへ来る時点で本文はディスクに乗っている。** どれもエディタの内容を捨てるが、
+/// 捨ててよいことが保証された後だけ呼ばれる。
+fn run_action(app: &mut App, action: PendingAction) -> Task<Message> {
+    match action {
+        PendingAction::OpenNote { index, from_palette } => {
+            if from_palette {
+                app.palette = None;
+                // 検索は全ノートが対象なので、別フォルダのノートが当たる。そのまま開くと
+                // 「選択中のノートが左の一覧に無い」状態になるため、そのときだけ絞り込みを解除する。
+                //
+                // **絞り込みの中のノートなら何もしない。** 以前はここで無条件に解除していて、
+                // 「topics で絞り込んで topics のノートを開いたのに、すべてに戻る」動きになっていた。
+                // 守りたいのは「開いたノートが一覧に見える」ことであって、解除そのものではない。
+                let hidden_by_filter = app
+                    .selected_folder
+                    .as_deref()
+                    .is_some_and(|folder| folder != app.notes[index].folder);
+                if hidden_by_filter {
+                    app.selected_folder = None;
+                    app.visible = visible_indices(&app.notes, None);
+                }
+            }
+            open_note(app, index);
+            Task::none()
+        }
+        PendingAction::NewNote => {
+            // インデックスがずれるので、古い `matches` を持ったパレットは畳む。
+            app.palette = None;
+            match create_note(app) {
+                Ok(index) => {
+                    open_note(app, index);
+                    // 作った直後に打ち始められるようにフォーカスを移す。
+                    iced::widget::operation::focus(iced::widget::Id::new(EDITOR_ID))
+                }
+                Err(e) => {
+                    app.error = Some(e);
+                    Task::none()
+                }
+            }
+        }
+        PendingAction::Rename(input) => {
+            match commit_rename(app, &input) {
+                Ok(()) => {
+                    app.rename = None;
+                    app.error = None;
+                }
+                // **入力欄は開いたままにする。** 閉じてしまうと打ち直せない。
+                Err(e) => app.error = Some(e),
+            }
+            Task::none()
+        }
+        PendingAction::Delete => {
+            if let Err(e) = delete_note(app) {
+                app.error = Some(e);
+            }
+            Task::none()
+        }
+        PendingAction::Close(id) => iced::window::close(id),
+    }
+}
+
+/// 保存の完了を受け取る。**ガードの判定はここでやる**（旧 `save_now()` の戻り値の役目）。
+fn finish_save(app: &mut App, result: Result<(), String>) -> Task<Message> {
+    // 対応する保存が無い完了は捨てる。直列なので通常は起きないが、
+    // 起きたときに黙って `notes` を書き換えるほうが危ない。
+    let Some(in_flight) = app.saving.take() else {
+        return Task::none();
+    };
+
+    match result {
         Ok(()) => {
             // ファイルが正になったので、メモリ側のメタ情報も取り直す。タイトル行を編集したら
             // 一覧にすぐ反映されてほしい。**ここで並べ替えはしない**（`notes` の doc 参照）。
@@ -490,17 +673,45 @@ fn save_now(app: &mut App) -> bool {
             // mtime は書いた直後の now でよい。次回起動時にディスクから読み直される値であって、
             // ここで 1 回 stat を打ち直すほどの精度は要らない。
             let modified = std::time::SystemTime::now();
-            app.notes[index] = vault::parse_note(&app.root, path, contents, modified);
-            clear_dirty(app);
+            let up_to_date = app.content.text() == in_flight.contents;
+            app.notes[in_flight.index] = vault::parse_note(
+                &app.root,
+                in_flight.path,
+                in_flight.contents,
+                modified,
+            );
             app.error = None;
             app.saves += 1;
             app.saved_flash_until = Some(Instant::now() + SAVED_FLASH);
-            true
+
+            // **保存中に打たれた分があれば dirty を畳まない。** 畳むと、書き出した
+            // スナップショットより新しい本文が「保存済み」に見えて、次の切替で消える。
+            if up_to_date {
+                clear_dirty(app);
+            } else {
+                clear_save_backoff(app);
+            }
+
+            // 預けてある操作は `begin_save` へ返す。まだ書けていない分があれば
+            // もう一度書いてから実行され、無ければその場で実行される。
+            if app.pending.is_some() {
+                return begin_save(app, None, None);
+            }
+            Task::none()
         }
         Err(e) => {
             // dirty は立てたままにする。表示が消えないことが異常の合図。
             app.error = Some(format!("保存に失敗: {e}"));
-            false
+            if let Some(at) = in_flight.autosave_at {
+                app.save_failures = app.save_failures.saturating_add(1);
+                app.retry_after = Some(at + save_retry_delay(app.save_failures));
+            }
+            // **待たせていた操作は捨てる。これが旧 `if !save_now()` の中身。**
+            // 進めてしまうと、書けなかった本文はディスクにもメモリにも残らない。
+            match app.pending.take() {
+                Some(PendingAction::Close(id)) => refuse_or_rescue(app, id),
+                _ => Task::none(),
+            }
         }
     }
 }
@@ -668,8 +879,9 @@ fn delete_note(app: &mut App) -> Result<(), String> {
 /// すべて `save_now` のガードが入っていたのに、「閉じる」だけが素通りしていた。
 /// デバウンス（1 秒）の途中で `Cmd+W` を打てば、その 1 秒分は消える。
 ///
-/// `save_now` が true を返したなら本文は全部ディスクに乗っているので、迷わず閉じてよい。
-/// 判断が要るのは **false（書けなかった）** のときで、そこは 2 段階にしてある。
+/// 保存が通ったなら本文は全部ディスクに乗っているので、迷わず閉じてよい
+/// （`PendingAction::Close` がそのまま `window::close` になる）。
+/// 判断が要るのは**書けなかった**ときで、そこは 2 段階にしてある（`refuse_or_rescue`）。
 ///
 /// - **1 回目**: 閉じない。理由をステータス行に出す（気づく機会を作り、手で退避もできる）
 /// - **2 回目**: 明確な意思表示とみなし、**本文を `.rescue` へ退避してから**閉じる。
@@ -683,10 +895,11 @@ fn delete_note(app: &mut App) -> Result<(), String> {
 /// 逆に 1 回目で退避して閉じると、ユーザーは**何が起きたか知らないまま**終了する。
 /// だから警告を 1 回挟む。
 fn close_window(app: &mut App, id: iced::window::Id) -> Task<Message> {
-    if save_now(app) {
-        return iced::window::close(id);
-    }
+    begin_save(app, Some(PendingAction::Close(id)), None)
+}
 
+/// 保存に失敗した状態で閉じる要求を受けたときの 2 段階（`close_window` の doc 参照）。
+fn refuse_or_rescue(app: &mut App, id: iced::window::Id) -> Task<Message> {
     if !app.close_refused {
         app.close_refused = true;
         app.show_marker = true;
@@ -774,48 +987,45 @@ fn refilter(notes: &[vault::Note], query: &str) -> Vec<(usize, fuzzy::Match)> {
     hits
 }
 
-/// パレットが開いている間のキー操作。処理したら `true`。
-fn handle_palette_key(app: &mut App, key: &keyboard::Key, modifiers: keyboard::Modifiers) -> bool {
+/// パレットが開いている間のキー操作。
+///
+/// **戻り値は「処理したか」ではなく Task。** Enter がノートを開く前に保存を挟むようになり
+/// （ADR-0014）、この関数からも `Task` を返す必要が出た。呼び出し元は元々
+/// 「処理したか」を見ていない（パレットが閉じていれば何も起きないだけ）。
+fn handle_palette_key(
+    app: &mut App,
+    key: &keyboard::Key,
+    modifiers: keyboard::Modifiers,
+) -> Task<Message> {
     use keyboard::key::Named;
 
     let Some(palette) = &mut app.palette else {
-        return false;
+        return Task::none();
     };
     let len = palette.matches.len();
 
     match key {
         keyboard::Key::Named(Named::Escape) => {
             app.palette = None;
-            true
+            Task::none()
         }
         keyboard::Key::Named(Named::Enter) => {
             let Some(index) = palette.matches.get(palette.selected).map(|(i, _)| *i) else {
                 app.palette = None;
-                return true;
+                return Task::none();
             };
             // ここにも保存ガードが要る。パレットからの選択もエディタを上書きする操作。
             // **パレットは閉じない**。閉じてから中断すると、なぜ切り替わらないのかが
-            // 分からなくなる（エラーはステータス行に常駐する）。
-            if !save_now(app) {
-                return true;
-            }
-            app.palette = None;
-            // 検索は全ノートが対象なので、別フォルダのノートが当たる。そのまま開くと
-            // 「選択中のノートが左の一覧に無い」状態になるため、そのときだけ絞り込みを解除する。
-            //
-            // **絞り込みの中のノートなら何もしない。** 以前はここで無条件に解除していて、
-            // 「topics で絞り込んで topics のノートを開いたのに、すべてに戻る」動きになっていた。
-            // 守りたいのは「開いたノートが一覧に見える」ことであって、解除そのものではない。
-            let hidden_by_filter = app
-                .selected_folder
-                .as_deref()
-                .is_some_and(|folder| folder != app.notes[index].folder);
-            if hidden_by_filter {
-                app.selected_folder = None;
-                app.visible = visible_indices(&app.notes, None);
-            }
-            open_note(app, index);
-            true
+            // 分からなくなる（エラーはステータス行に常駐する）。畳むのは
+            // `PendingAction::OpenNote` が実際に走るとき。
+            begin_save(
+                app,
+                Some(PendingAction::OpenNote {
+                    index,
+                    from_palette: true,
+                }),
+                None,
+            )
         }
         // **矢印キーではなく ctrl-n / ctrl-p。** `text_input` が矢印を消費して親に届かない
         // （gpui 版でも同じ回避策が要った）。
@@ -823,15 +1033,15 @@ fn handle_palette_key(app: &mut App, key: &keyboard::Key, modifiers: keyboard::M
             if len > 0 {
                 palette.selected = (palette.selected + 1) % len;
             }
-            true
+            Task::none()
         }
         keyboard::Key::Character(c) if c == "p" && modifiers.control() => {
             if len > 0 {
                 palette.selected = (palette.selected + len - 1) % len;
             }
-            true
+            Task::none()
         }
-        _ => false,
+        _ => Task::none(),
     }
 }
 
@@ -844,10 +1054,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::NoteSelected(index) => {
             // **保存に失敗したら遷移しない。** ここで進むと未保存の本文が
             // ディスクにもメモリにも残らず消える。前身でデータ喪失を招いた欠陥がこれ。
-            if !save_now(app) {
-                return Task::none();
-            }
-            open_note(app, index);
+            // 判定は `finish_save` がやる（ADR-0014）。
+            return begin_save(
+                app,
+                Some(PendingAction::OpenNote {
+                    index,
+                    from_palette: false,
+                }),
+                None,
+            );
         }
         Message::Edit(action) => {
             // カーソル移動やクリックで dirty を立てない。編集だけを拾う。
@@ -865,16 +1080,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.saved_flash_until = None;
             }
 
+            let mut task = Task::none();
             if let Some(dirty_since) = app.dirty_since
                 && should_save(now, app.last_edit, dirty_since, app.retry_after)
             {
                 // 失敗したら次の試行を後ろへ倒す。成功時は `clear_dirty` が畳む。
-                // **`Instant::now()` ではなく tick が持ってきた `now` を基準にする**
+                // どちらも `finish_save` の仕事。**`Instant::now()` ではなく tick が
+                // 持ってきた `now` を基準にする**ため、`InFlight` へ持ち回す
                 // （境界をテストから組み立てられなくなる）。
-                if !save_now(app) {
-                    app.save_failures = app.save_failures.saturating_add(1);
-                    app.retry_after = Some(now + save_retry_delay(app.save_failures));
-                }
+                task = begin_save(app, None, Some(now));
             }
 
             // **保存を試みた「あと」に、独立して判定する。**
@@ -892,7 +1106,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             {
                 app.show_marker = true;
             }
+            return task;
         }
+        Message::Saved(result) => return finish_save(app, result),
         Message::PaletteQueryChanged(query) => {
             // ⌘ 付きの打鍵はショートカット。`text_input` には `key_binding` が無いので
             // ここで受け取らない（ADR-0010）。入力欄の値は App が持っているので、
@@ -909,19 +1125,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::PaletteClose => app.palette = None,
         Message::NewNote => {
             // 作成もエディタを上書きする操作なので、切替と同じ保存ガードを通す。
-            if !save_now(app) {
-                return Task::none();
-            }
-            // インデックスがずれるので、古い `matches` を持ったパレットは畳む。
-            app.palette = None;
-            match create_note(app) {
-                Ok(index) => {
-                    open_note(app, index);
-                    // 作った直後に打ち始められるようにフォーカスを移す。
-                    return iced::widget::operation::focus(iced::widget::Id::new(EDITOR_ID));
-                }
-                Err(e) => app.error = Some(e),
-            }
+            return begin_save(app, Some(PendingAction::NewNote), None);
         }
         Message::RenameStarted => {
             let Some(index) = app.selected else {
@@ -954,17 +1158,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             };
             // 名前を変える前に本文を書き戻す。ここを飛ばすと、未保存分が
             // 古いパス宛のまま宙に浮く。失敗したら中断（切替と同じガード）。
-            if !save_now(app) {
-                return Task::none();
-            }
-            match commit_rename(app, &input) {
-                Ok(()) => {
-                    app.rename = None;
-                    app.error = None;
-                }
-                // **入力欄は開いたままにする。** 閉じてしまうと打ち直せない。
-                Err(e) => app.error = Some(e),
-            }
+            return begin_save(app, Some(PendingAction::Rename(input)), None);
         }
         Message::DeleteNote => {
             app.palette = None;
@@ -972,12 +1166,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             // 捨てる前に書き戻す。`.trash` に残るのが「最後に自動保存された内容」ではなく
             // 「消す直前の内容」になり、誤って消しても打った分まで戻せる。
             // 失敗したら中断（切替・作成・リネームと同じガード）。
-            if !save_now(app) {
-                return Task::none();
-            }
-            if let Err(e) = delete_note(app) {
-                app.error = Some(e);
-            }
+            return begin_save(app, Some(PendingAction::Delete), None);
         }
         Message::CloseRequested(id) => return close_window(app, id),
         Message::WindowUnfocused => app.modifiers = keyboard::Modifiers::empty(),
@@ -1044,7 +1233,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 }
             }
 
-            handle_palette_key(app, &key, modifiers);
+            return handle_palette_key(app, &key, modifiers);
         }
     }
     Task::none()
@@ -1480,8 +1669,33 @@ mod tests {
 
     /// テストからメッセージを流す。`update` が返す `Task` は iced ランタイムへ返すためのもので、
     /// ここでは実行するものが無いので捨てる。
+    ///
+    /// **保存だけは捨てると走らない**（ADR-0014 で `Task` へ出したため）。書き込みを伴う
+    /// テストは `send` のあとに `flush_saves` を呼ぶこと。
     fn send(app: &mut App, message: Message) {
         let _ = update(app, message);
+    }
+
+    /// iced のランタイムの代わりに、積まれた保存を**同期で**実行して `Saved` を流す。
+    ///
+    /// 差し替えているのは「`vault::save` をどのスレッドで走らせるか」だけで、
+    /// 何を書くか（`InFlight`）も完了後の分岐（`finish_save`）も本番と同じ経路を通る。
+    /// テストが確かめたいのは状態機械であって tokio ではない。
+    ///
+    /// **成功した保存は次の保存を積み得る**（保存中の打鍵分・待たせていた操作）ので、
+    /// 積まれなくなるまで回す。
+    fn flush_saves(app: &mut App) {
+        // 保存が保存を呼び続けることはない（`begin_save` は差分が無ければ書かない）が、
+        // 万一そうなったときにテストが無限に回るより落ちたほうがよい。
+        for _ in 0..8 {
+            let Some(in_flight) = app.saving.as_ref() else {
+                return;
+            };
+            let result =
+                vault::save(&in_flight.path, &in_flight.contents).map_err(|e| e.to_string());
+            send(app, Message::Saved(result));
+        }
+        panic!("保存が終わらない（`begin_save` が書くべき差分を畳めていない）");
     }
 
     /// フォルダ違いのノートを持つ vault を作る。`(フォルダ, タイトル)` の順で置き、
@@ -1536,11 +1750,97 @@ mod tests {
         assert!(app.dirty, "編集したのに dirty が立っていない");
 
         send(&mut app,Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
+        flush_saves(&mut app);
 
         assert_eq!(app.saves, 1, "デバウンス経過後に保存されていない");
         assert!(!app.dirty, "保存後も dirty が残っている");
         let on_disk = std::fs::read_to_string(&app.notes[0].path).unwrap();
         assert!(on_disk.contains('X'), "編集がディスクに届いていない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **書き込みが `update()` の中で終わっていないこと。** これが ADR-0014 の要求そのもの。
+    ///
+    /// `vault::save` は `sync_all` でディスクを待つ。`update()` は UI スレッドで走るので、
+    /// ここで書き終えているなら **`sync_all` の間ずっと画面が止まっている**。遅い vault
+    /// （iCloud Drive・外付け・ネットワーク共有）では数秒単位になる。
+    ///
+    /// 「固まらないこと」は単体テストから直接は測れないので、**書き込みが `update()` の
+    /// 外にいること**を固定する。同期保存へ戻したらここが落ちる。
+    #[test]
+    fn the_disk_write_does_not_happen_inside_update() {
+        let (dir, mut app) = app_with_vault("write-outside-update");
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, insert('X'));
+
+        send(&mut app, Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
+
+        assert!(app.saving.is_some(), "保存が投げられていない");
+        assert_eq!(app.saves, 0, "update の中で保存を完了している");
+        let on_disk = std::fs::read_to_string(&app.notes[0].path).unwrap();
+        assert!(
+            !on_disk.contains('X'),
+            "update の中でディスクへ書いている（UI スレッドで sync_all を待っている）"
+        );
+
+        flush_saves(&mut app);
+        assert_eq!(app.saves, 1, "投げた保存が完了していない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **保存が飛んでいる最中の打鍵を、保存済み扱いにしないこと。**
+    ///
+    /// 非同期にした代償がここに出る。書き出すのは投げた瞬間のスナップショットなので、
+    /// 完了時にエディタの中身がそれより新しければ **dirty を畳んではいけない**。
+    /// 畳むと、次の切替で「保存済み」と判断されて打った分が消える。
+    #[test]
+    fn edits_made_while_saving_are_kept_dirty() {
+        let (dir, mut app) = app_with_vault("edit-while-saving");
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, insert('X'));
+        send(&mut app, Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
+        assert!(app.saving.is_some(), "保存が投げられていない");
+
+        // **保存中でも打てること自体が要求。** 同期保存ならここには到達しない。
+        send(&mut app, insert('Y'));
+        flush_saves(&mut app);
+
+        assert_eq!(app.saves, 1, "投げた保存が完了していない");
+        assert!(app.dirty, "保存中に打った分まで保存済み扱いになっている");
+        assert!(app.content.text().contains('Y'), "保存中の打鍵が消えた");
+
+        // 次のデバウンスで、遅れた分もちゃんと届く。
+        send(&mut app, Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
+        flush_saves(&mut app);
+        assert!(!app.dirty, "追いつきの保存が走っていない");
+        let on_disk = std::fs::read_to_string(&app.notes[0].path).unwrap();
+        assert!(on_disk.contains('Y'), "保存中に打った分がディスクに届いていない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **保存中に来た切替は、保存が通ってから実行されること。**
+    ///
+    /// ガードの意味論（保存できるまでエディタを潰さない）は非同期でも変わらない。
+    /// 変わったのは判定の場所だけで、待っている間も UI は生きている。
+    #[test]
+    fn a_switch_requested_while_saving_waits_for_it() {
+        let (dir, mut app) = app_with_vault("switch-while-saving");
+        send(&mut app, Message::NoteSelected(0));
+        send(&mut app, insert('X'));
+        send(&mut app, Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
+        let saving_path = app.saving.as_ref().expect("保存が投げられていない").path.clone();
+
+        send(&mut app, Message::NoteSelected(1));
+
+        assert_eq!(app.selected, Some(0), "保存の完了を待たずに切り替わった");
+        assert!(app.pending.is_some(), "切替が保留されていない");
+        assert_eq!(app.saves, 0, "保存が二重に走っている");
+
+        flush_saves(&mut app);
+
+        assert_eq!(app.selected, Some(1), "保存が通ったのに切り替わらない");
+        let on_disk = std::fs::read_to_string(&saving_path).unwrap();
+        assert!(on_disk.contains('X'), "切替前の編集がディスクに届いていない");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1578,6 +1878,7 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         send(&mut app,Message::NoteSelected(1));
+        flush_saves(&mut app);
 
         assert_eq!(app.selected, Some(0), "保存に失敗したのに切り替わった");
         assert!(app.error.is_some(), "保存失敗が表に出ていない");
@@ -1605,6 +1906,7 @@ mod tests {
 
         // デバウンス（1 秒）を待たずに閉じる。ここが実際の操作と同じ条件。
         let _ = close_window(&mut app, iced::window::Id::unique());
+        flush_saves(&mut app);
 
         assert_eq!(app.saves, 1, "閉じるときに保存されていない");
         assert!(!app.dirty, "保存したのに dirty が残っている");
@@ -1628,6 +1930,7 @@ mod tests {
 
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         let _ = close_window(&mut app, iced::window::Id::unique());
+        flush_saves(&mut app);
 
         assert!(app.dirty, "保存できていないのに dirty が畳まれている");
         assert!(app.show_marker, "閉じられない理由が画面に出ていない");
@@ -1659,7 +1962,9 @@ mod tests {
 
         let id = iced::window::Id::unique();
         let _ = close_window(&mut app, id); // 1 回目: 断る
+        flush_saves(&mut app);
         let _ = close_window(&mut app, id); // 2 回目: 退避して閉じる
+        flush_saves(&mut app);
 
         // topics は書けないので、vault ルートへ落ちているはず。
         let rescued: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -1697,11 +2002,13 @@ mod tests {
         let sub = dir.join("topics");
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
         let _ = close_window(&mut app, iced::window::Id::unique());
+        flush_saves(&mut app);
         assert!(app.close_refused, "1 回目を断った記録が残っていない");
 
         // 権限を直して保存が通れば、記憶は畳まれる。
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
         send(&mut app, Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
+        flush_saves(&mut app);
 
         assert_eq!(app.saves, 1, "権限を戻したのに保存されていない");
         assert!(!app.close_refused, "保存が通ったのに断った記憶が残っている");
@@ -1765,17 +2072,20 @@ mod tests {
         let edited = Instant::now();
         let first_try = edited + AUTOSAVE_DEBOUNCE;
         send(&mut app, Message::Tick(first_try));
+        flush_saves(&mut app);
         assert_eq!(app.save_failures, 1, "失敗が数えられていない");
         let retry_at = app.retry_after.expect("次の再試行時刻が決まっていない");
 
         // 待ち時間の内側では、tick が何回来ても試さない。
         for i in 1..=4 {
             send(&mut app, Message::Tick(first_try + TICK * i));
+            assert!(app.saving.is_none(), "バックオフ中に保存を投げている");
         }
         assert_eq!(app.save_failures, 1, "バックオフ中に再試行している");
 
         // 待ち時間を過ぎたら 1 回だけ試し、次の待ちはさらに伸びる。
         send(&mut app, Message::Tick(retry_at));
+        flush_saves(&mut app);
         assert_eq!(app.save_failures, 2, "待ち時間を過ぎても再試行していない");
         assert!(
             app.retry_after.is_some_and(|next| next > retry_at),
@@ -1804,10 +2114,12 @@ mod tests {
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
         let edited = Instant::now();
         send(&mut app, Message::Tick(edited + AUTOSAVE_DEBOUNCE));
+        flush_saves(&mut app);
         let retry_at = app.retry_after.expect("失敗したのに待ちが設定されていない");
 
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
         send(&mut app, Message::Tick(retry_at));
+        flush_saves(&mut app);
 
         assert_eq!(app.saves, 1, "権限を戻したのに保存されていない");
         assert_eq!(app.save_failures, 0, "失敗の数が畳まれていない");
@@ -1886,6 +2198,7 @@ mod tests {
         let edited = Instant::now();
 
         send(&mut app, Message::Tick(edited + DIRTY_MARKER_DELAY));
+        flush_saves(&mut app);
 
         assert_eq!(app.saves, 1);
         assert!(!app.show_marker, "保存できているのに「未保存」が出た");
@@ -1901,6 +2214,7 @@ mod tests {
         send(&mut app, insert('X'));
 
         send(&mut app, Message::DeleteNote);
+        flush_saves(&mut app);
 
         assert_eq!(app.notes.len(), 0, "一覧から消えていない");
         let trashed: Vec<_> = std::fs::read_dir(dir.join(".trash"))
@@ -2056,6 +2370,7 @@ mod tests {
         let sub = dir.join("topics");
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).unwrap();
         send(&mut app, Message::NewNote);
+        flush_saves(&mut app);
 
         assert_eq!(app.notes.len(), 1, "保存に失敗したのにノートが増えた");
         assert!(app.content.text().contains('X'), "編集内容が消えた");
@@ -2361,7 +2676,7 @@ mod tests {
         // 絞り込み対象外（topics）のノートを検索して開く。
         open_palette(&mut app, "設計");
         assert_eq!(app.palette.as_ref().unwrap().matches.len(), 1);
-        handle_palette_key(&mut app, &named(keyboard::key::Named::Enter), <_>::default());
+        let _ = handle_palette_key(&mut app, &named(keyboard::key::Named::Enter), <_>::default());
 
         let opened = app.selected.expect("ノートが開かれていない");
         assert_eq!(app.notes[opened].title, "設計メモ");
@@ -2387,7 +2702,7 @@ mod tests {
         send(&mut app, Message::FolderSelected(Some("topics".to_string())));
 
         open_palette(&mut app, "設計メモ");
-        handle_palette_key(&mut app, &named(keyboard::key::Named::Enter), <_>::default());
+        let _ = handle_palette_key(&mut app, &named(keyboard::key::Named::Enter), <_>::default());
 
         assert_eq!(app.notes[app.selected.unwrap()].title, "設計メモ");
         assert_eq!(
@@ -2415,7 +2730,8 @@ mod tests {
         open_palette(&mut app, "");
         // 先頭以外を選んでから Enter（自分自身を開き直すのでは検証にならない）。
         app.palette.as_mut().unwrap().selected = 1;
-        handle_palette_key(&mut app, &named(keyboard::key::Named::Enter), <_>::default());
+        let _ = handle_palette_key(&mut app, &named(keyboard::key::Named::Enter), <_>::default());
+        flush_saves(&mut app);
 
         assert_eq!(app.selected, Some(0), "保存に失敗したのに切り替わった");
         assert!(app.palette.is_some(), "中断したのにパレットが閉じた");
@@ -2435,12 +2751,12 @@ mod tests {
         assert_eq!(app.palette.as_ref().unwrap().matches.len(), 3);
 
         let ctrl = keyboard::Modifiers::CTRL;
-        handle_palette_key(&mut app, &key("n"), ctrl);
+        let _ = handle_palette_key(&mut app, &key("n"), ctrl);
         assert_eq!(app.palette.as_ref().unwrap().selected, 1);
-        handle_palette_key(&mut app, &key("p"), ctrl);
+        let _ = handle_palette_key(&mut app, &key("p"), ctrl);
         assert_eq!(app.palette.as_ref().unwrap().selected, 0);
         // 先頭で戻ると末尾へ回り込む。
-        handle_palette_key(&mut app, &key("p"), ctrl);
+        let _ = handle_palette_key(&mut app, &key("p"), ctrl);
         assert_eq!(app.palette.as_ref().unwrap().selected, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2450,7 +2766,7 @@ mod tests {
     fn palette_closes_on_escape() {
         let (dir, mut app) = app_with_folders("escape", &[("topics", "あ")]);
         open_palette(&mut app, "");
-        handle_palette_key(&mut app, &named(keyboard::key::Named::Escape), <_>::default());
+        let _ = handle_palette_key(&mut app, &named(keyboard::key::Named::Escape), <_>::default());
         assert!(app.palette.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }

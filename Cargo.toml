@@ -12,6 +12,11 @@ publish = false
 [dependencies]
 iced = { version = "0.14", features = ["highlighter", "advanced", "tokio"] }
 
+# 保存の `sync_all` を UI スレッドから追い出すためだけ。ADR-0014。
+# **新しい依存ではない**（iced の tokio feature で既に依存ツリーにいる）。直接宣言するのは
+# `spawn_blocking` を名指しで呼ぶため。`rt` だけあれば足りるので default-features は切る。
+tokio = { version = "1", default-features = false, features = ["rt"] }
+
 # 新規ノートのファイル名（2026-08-09-153301.md）を作るためだけ。ADR-0005。
 # std にローカル時刻を得る手段が無く、依存ツリーに既にある time 0.3 は
 # `local-offset` がマルチスレッドで IndeterminateOffset を返すため使えない。
