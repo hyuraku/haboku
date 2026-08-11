@@ -209,6 +209,12 @@ struct App {
     /// リネーム入力中の名前（`Cmd+R`）。開いていないときは `None`。
     /// パレットとは同時に開かない（開くときに互いを畳む）。
     rename: Option<String>,
+    /// いま押されている修飾キー。**`text_input` への混入を弾くためだけに持つ**（ADR-0010）。
+    ///
+    /// `text_editor` は `key_binding` で塞げるが、`text_input` に同じ差し込み口は無い。
+    /// そこで「⌘ を押している間に来た入力は受け取らない」で塞ぐ。⌘ の keydown は
+    /// 文字キーより必ず先に届くので、**同一イベント内の処理順に依存しない**。
+    modifiers: keyboard::Modifiers,
 
     // ── 自動保存 ────────────────────────────────────────────
     dirty: bool,
@@ -260,6 +266,12 @@ enum Message {
     Tick(Instant),
     /// キー入力。フォーカスの位置に関係なく全部流れてくる。
     Key(keyboard::Event),
+    /// ウィンドウがフォーカスを失った。**修飾キーの押しっぱなしを解くためだけに要る。**
+    ///
+    /// `ModifiersChanged` はフォーカスを持っている間しか来ない。⌘ を押したまま
+    /// `Cmd+Tab` で抜けて向こうで離すと、離した通知が来ずに `modifiers` が
+    /// 立ちっぱなしになり、戻ってきたとき入力欄が無反応になる（ADR-0010）。
+    WindowUnfocused,
     PaletteQueryChanged(String),
     /// パレットを閉じる。✕ ボタンと背景クリックから飛ぶ。
     PaletteClose,
@@ -371,6 +383,7 @@ fn boot(root: PathBuf, notes: Vec<vault::Note>, load_ms: f64) -> App {
         ),
         palette: None,
         rename: None,
+        modifiers: keyboard::Modifiers::empty(),
         dirty: false,
         dirty_since: None,
         last_edit: Instant::now(),
@@ -784,6 +797,12 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::PaletteQueryChanged(query) => {
+            // ⌘ 付きの打鍵はショートカット。`text_input` には `key_binding` が無いので
+            // ここで受け取らない（ADR-0010）。入力欄の値は App が持っているので、
+            // 捨てれば次の描画で元に戻る。**後から消すのではなく、そもそも反映しない。**
+            if app.modifiers.command() {
+                return Task::none();
+            }
             if let Some(palette) = &mut app.palette {
                 palette.matches = refilter(&app.notes, &query);
                 palette.selected = 0;
@@ -822,6 +841,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             return iced::widget::operation::focus(iced::widget::Id::new(RENAME_INPUT_ID));
         }
         Message::RenameChanged(name) => {
+            // パレットと同じ理由で ⌘ 付きの打鍵は受け取らない（ADR-0010）。
+            // ここは Enter でファイル名としてディスクに届くので、混入すると実害が残る。
+            if app.modifiers.command() {
+                return Task::none();
+            }
             if let Some(current) = &mut app.rename {
                 *current = name;
             }
@@ -859,7 +883,14 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::CloseRequested(id) => return close_window(app, id),
+        Message::WindowUnfocused => app.modifiers = keyboard::Modifiers::empty(),
         Message::Key(event) => {
+            // 修飾キーの状態を控える。**⌘ の keydown は文字キーより必ず先に届く**ので、
+            // これで `text_input` 側の混入を順序に依存せず弾ける（ADR-0010）。
+            if let keyboard::Event::ModifiersChanged(m) = event {
+                app.modifiers = m;
+                return Task::none();
+            }
             let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
                 return Task::none();
             };
@@ -929,6 +960,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 fn subscription(app: &App) -> Subscription<Message> {
     let keys = iced::event::listen_with(|event, _status, _window| match event {
         iced::event::Event::Keyboard(key_event) => Some(Message::Key(key_event)),
+        // ⌘ を押したまま抜けると「離した」通知が来ない。押しっぱなしのまま戻ると
+        // 入力欄が黙って無反応になるので、フォーカスを失った時点で解く（ADR-0010）。
+        iced::event::Event::Window(iced::window::Event::Unfocused) => {
+            Some(Message::WindowUnfocused)
+        }
         _ => None,
     });
 
@@ -2157,6 +2193,64 @@ mod tests {
             editor_key_binding(key_press("a", keyboard::Modifiers::COMMAND)),
             Some(text_editor::Binding::SelectAll),
         ));
+    }
+
+    /// **⌘ 押下中の打鍵がパレットの検索欄に入らないこと。**
+    ///
+    /// パレットを開いたまま `Cmd+P` を押し直したときの経路。`text_input` には
+    /// `key_binding` が無いので、混入はここ（メッセージを受け取る側）でしか止められない。
+    #[test]
+    fn command_shortcuts_do_not_reach_the_palette_query() {
+        let (dir, mut app) = app_with_folders("cmd-palette", &[("topics", "あ")]);
+        open_palette(&mut app, "graphql");
+
+        app.modifiers = keyboard::Modifiers::COMMAND;
+        let _ = update(&mut app, Message::PaletteQueryChanged("graphqlp".to_string()));
+        assert_eq!(app.palette.as_ref().unwrap().query, "graphql", "検索欄に p が入った");
+
+        // ⌘ を離せば普通に打てる（塞ぎすぎていないこと）。
+        app.modifiers = keyboard::Modifiers::empty();
+        let _ = update(&mut app, Message::PaletteQueryChanged("graphqls".to_string()));
+        assert_eq!(app.palette.as_ref().unwrap().query, "graphqls");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **⌘ 押下中の打鍵がリネーム欄に入らないこと。**
+    ///
+    /// ここは Enter で**ファイル名としてディスクに届く**ので、混入が実害になる。
+    #[test]
+    fn command_shortcuts_do_not_reach_the_rename_input() {
+        let (dir, mut app) = app_with_folders("cmd-rename", &[("topics", "設計メモ")]);
+        app.rename = Some("設計メモ.md".to_string());
+
+        app.modifiers = keyboard::Modifiers::COMMAND;
+        let _ = update(&mut app, Message::RenameChanged("設計メモ.mdn".to_string()));
+        assert_eq!(app.rename.as_deref(), Some("設計メモ.md"), "ファイル名に n が入った");
+
+        app.modifiers = keyboard::Modifiers::empty();
+        let _ = update(&mut app, Message::RenameChanged("新しい名前.md".to_string()));
+        assert_eq!(app.rename.as_deref(), Some("新しい名前.md"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **⌘ の押しっぱなしが、フォーカスを失った時点で解けること。**
+    ///
+    /// `ModifiersChanged` はフォーカスを持っている間しか来ない。`Cmd+Tab` で抜けて
+    /// 向こうで ⌘ を離すと通知が来ず、戻ってきたときに入力欄が黙って無反応になる。
+    /// **安全装置が壊れたときに何が起きるか**まで含めての対処（ADR-0010）。
+    #[test]
+    fn losing_focus_releases_a_stuck_command_key() {
+        let (dir, mut app) = app_with_folders("stuck-cmd", &[("topics", "あ")]);
+        app.rename = Some("あ.md".to_string());
+        app.modifiers = keyboard::Modifiers::COMMAND;
+
+        let _ = update(&mut app, Message::WindowUnfocused);
+        assert!(app.modifiers.is_empty(), "⌘ が押しっぱなしのまま残っている");
+
+        // 解けているので、戻ってきたあとは普通に打てる。
+        let _ = update(&mut app, Message::RenameChanged("い.md".to_string()));
+        assert_eq!(app.rename.as_deref(), Some("い.md"), "戻ってきても打てない");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **エディタに入れて出しただけの本文が、元ファイルと 1 バイトも違わないこと。**
