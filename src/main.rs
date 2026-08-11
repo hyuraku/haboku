@@ -351,9 +351,20 @@ fn save_retry_delay(failures: u32) -> Duration {
 ///
 /// 「等幅なら何でもいい」を意味する `Font::MONOSPACE` を渡すと、cosmic-text が漢字に
 /// macOS の `GB18030 Bitmap` を選び、Swash がラスタライズに失敗してグリフごと捨てる。
-/// 等幅は必ず**名指し**する。実データ 約 1200 件で漢字の欠落が無く、コードブロックの桁も
-/// 揃うことを目視で確認済み。
-const EDITOR_FONT: Font = Font::with_name("Osaka-Mono");
+/// 等幅は必ず**名指し**する。
+///
+/// **`"Osaka-Mono"` から乗り換えた**（ADR-0003 追記 2）。あれは PostScript 名で、fontdb が
+/// 照合するファミリ名ではない。しかもファミリ名 `"Osaka"` には比例の `Osaka.ttf` と等幅の
+/// `OsakaMono.ttf` が**同じ weight・同じ幅で同居している**ので、`"Osaka"` に直しても
+/// 等幅 face を選べる保証がない。**名前で face を選び分けられないフォントは名指しの対象外**。
+///
+/// `BIZ UDGothic` を選んだ理由は 3 つとも実測できる:
+///
+/// - ファミリ名が一意（比例版は `BIZ UDPGothic` という**別ファミリ**）
+/// - Regular が `usWeightClass = 400` ちょうど。cosmic-text は weight 完全一致でしか
+///   名指しファミリを採らない（`font_weight_diff == 0`。ADR-0009 の帰結）
+/// - ASCII が 1024、漢字・かな・約物が 2048（upem 2048）。**ちょうど 1:2**
+const EDITOR_FONT: Font = Font::with_name("BIZ UDGothic");
 
 /// 見出し用の明朝。ADR-0003 と同じく**名指しでバンドルしない**。
 ///
