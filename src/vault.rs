@@ -125,8 +125,14 @@ fn read_with_mtime(path: &Path) -> std::io::Result<(String, SystemTime)> {
 /// **親ディレクトリの fsync は意図的にやらない。** そこまでやると rename 自体の
 /// 永続化まで保証できるが、省いても最悪の結果は「古い内容のまま残る」であって
 /// 壊れたファイルではない。この関数が守ると宣言しているのは前者だけ。
+///
+/// **rename は inode ごと差し替えるので、権限は明示的に引き継ぐ**（ADR-0011）。
+/// 引き継がないと `0600` で置いた非公開のノートが、保存しただけで umask 由来の
+/// `0644` に緩む。**保存という操作がファイルの公開範囲を広げてはいけない。**
+/// ACL と xattr は引き継がない（同 ADR の帰結）。
 pub fn save(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     // **一時ファイル名にプロセス ID を混ぜる。** 固定名（`note.md.tmp`）だと、
     // 同じ vault を 2 つの haboku で開いたときに互いの一時ファイルを踏み合い、
@@ -134,10 +140,28 @@ pub fn save(path: &Path, contents: &str) -> std::io::Result<()> {
     // `.md` 以外は `load_dir` が拾わないので、一覧には出ない。
     let tmp = path.with_extension(format!("md.{}.tmp", std::process::id()));
 
+    // 元ファイルの権限。**取れなかったら緩いほうではなく厳しいほう（0600）へ倒す。**
+    // ここへ来るのは元ファイルが消えている場合で、既定の umask に任せると
+    // 「外部で消えたノートを書き戻したら公開範囲が広がった」が起きる。
+    let mode = std::fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o7777)
+        .unwrap_or(0o600);
+
     // ブロックにして、rename より先に必ずファイルを閉じる。
     {
-        let mut file = std::fs::File::create(&tmp)?;
+        // **作るときは 0600、中身を書き終えてから元の権限へ広げる。**
+        // 先に緩い権限で作ると、書き込んでいる最中の一時ファイルが他ユーザーから
+        // 読める窓が開く（元が 0600 なら、その窓は元ファイルには存在しなかったもの）。
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
         file.write_all(contents.as_bytes())?;
+        // sync_all より前に権限を戻す。fsync はメタデータも一緒に確定させるので、
+        // 「中身は届いたが権限だけ古い」中途半端な状態を残さない。
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
         file.sync_all()?;
     }
 
@@ -508,6 +532,42 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, ["a.md"], "一時ファイルが残っている");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **保存が元ファイルの権限を引き継ぐこと。** tmp → rename は inode ごと差し替えるので、
+    /// 引き継がないと `0600` の非公開ノートが**保存しただけで** `0644` に緩む。
+    /// 「打っただけでファイルの公開範囲が変わる」は、保存層が起こしてよい副作用ではない。
+    #[test]
+    fn save_keeps_the_original_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp_dir("save-perms");
+        let path = dir.join("私的なメモ.md");
+        std::fs::write(&path, "元の中身").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        save(&path, "新しい中身").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "保存でファイルの権限が緩んだ");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "新しい中身");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **元ファイルが無いときは緩いほうではなく厳しいほう（0600）へ倒すこと。**
+    /// 外部で消えたノートを書き戻す場面で umask に任せると、公開範囲が勝手に広がる。
+    #[test]
+    fn save_creates_a_private_file_when_the_original_is_gone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp_dir("save-perms-missing");
+        let path = dir.join("消えたメモ.md");
+
+        save(&path, "書き戻した本文").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "元が無いのに既定の umask で作られた");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
