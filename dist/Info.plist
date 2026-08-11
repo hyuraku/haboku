@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- haboku.app の Info.plist の雛形。`dist/build-app.sh` が __VERSION__ を差し替える。
+     ADR-0015 の帰結: `.app` は環境変数を継承しないので、vault の場所はここに書かない
+     （LSEnvironment で渡す案は却下済み）。 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>haboku</string>
+	<key>CFBundleDisplayName</key>
+	<string>haboku</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.github.hyuraku.haboku</string>
+	<key>CFBundleExecutable</key>
+	<string>haboku</string>
+	<!-- 拡張子を書かない。macOS が Resources/haboku.icns を探す。 -->
+	<key>CFBundleIconFile</key>
+	<string>haboku</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
+	<!-- **未検証の下限。** 開発機は macOS 26.2 で、それより下では一度も動かしていない。
+	     公開（Phase 2）までに実機か CI で決め直す。 -->
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>
