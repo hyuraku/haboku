@@ -25,15 +25,43 @@ pub struct Note {
     pub modified: SystemTime,
 }
 
+/// 読み込みの結果。**読めたノートと、読めなかった件数の両方を返す。**
+///
+/// ノートだけを返していると、呼び出し元は「読めなかった」を知る手段が無い。
+/// stderr へ書くだけでは `.app` の利用者には届かず、**権限や I/O エラーで
+/// 欠けた一覧が「そういう vault」に見える**（ADR-0002 が避けたかった状態と同型）。
+#[derive(Debug, Clone, Default)]
+pub struct Load {
+    pub notes: Vec<Note>,
+    /// 読めなかった件数。**意図的に飛ばしたものは数えない**
+    /// （dot 始まり・`node_modules`・symlink は仕様どおりの除外で、失敗ではない）。
+    /// 数えると「毎回 1 件読めていない」と言い続ける狼少年になる。
+    pub failed: usize,
+    /// 最初の失敗の理由だけ持つ。全部持つと病的な vault で膨らむ上、
+    /// 画面に出せるのは 1 行なので、原因の見当が付く例示に足りればよい。
+    pub first_failure: Option<String>,
+}
+
+impl Load {
+    fn failed(&mut self, what: String) {
+        // 端末から起動していれば全件の詳細はここに出る。画面には件数と 1 件目だけ。
+        eprintln!("vault: {what}");
+        self.failed += 1;
+        if self.first_failure.is_none() {
+            self.first_failure = Some(what);
+        }
+    }
+}
+
 /// `root` 以下の `.md` を再帰的に読む。
 ///
 /// 依存を増やさないため walkdir は使わず std だけで歩く。検証段階では
 /// これで十分で、ファイル監視が要るようになった時点で notify に載せ替える。
-pub fn load_dir(root: &Path) -> Vec<Note> {
-    let mut out = Vec::new();
-    walk(root, root, &mut out);
-    sort_notes(&mut out);
-    out
+pub fn load_dir(root: &Path) -> Load {
+    let mut load = Load::default();
+    walk(root, root, &mut load);
+    sort_notes(&mut load.notes);
+    load
 }
 
 /// 一覧の既定順: **最近いじった順**（Boostnote の体感に近い）。
@@ -48,18 +76,27 @@ fn sort_notes(notes: &mut [Note]) {
     notes.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.title.cmp(&b.title)));
 }
 
-fn walk(root: &Path, dir: &Path, out: &mut Vec<Note>) {
+fn walk(root: &Path, dir: &Path, load: &mut Load) {
     // 読めないものは黙って飛ばさない。無言だと「空 vault」と「権限などで
     // 読めていない」の区別が付かず、原因調査ができなくなる。
-    // 通知先は起動時ログ（main の vault 統計と同じ経路）に合わせる。
+    // **件数は `Load` で呼び出し元へ返す**（画面に出すのは main の仕事）。
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
-            eprintln!("vault: skip dir {} ({e})", dir.display());
+            load.failed(format!("{} を開けません（{e}）", dir.display()));
             return;
         }
     };
-    for entry in entries.flatten() {
+    // **`flatten()` は使わない。** エントリ単位の失敗（readdir の途中エラー）を
+    // 完全に捨ててしまい、何件消えたのかが誰にも分からなくなる。
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                load.failed(format!("{} の一覧を取れません（{e}）", dir.display()));
+                continue;
+            }
+        };
         let path = entry.path();
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -75,21 +112,25 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Note>) {
         // vault の外で起きる**（`vault_root` の「黙って別の場所を開かない」と同じ危険）。
         // 加えて `a -> ..` のような循環でスタックを食い潰すまで再帰する。
         // `file_type()` は readdir が返した種別なのでリンクを解決しない。
-        let Ok(kind) = entry.file_type() else {
-            eprintln!("vault: skip {} (種別が取れない)", path.display());
-            continue;
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(e) => {
+                load.failed(format!("{} の種別が取れません（{e}）", path.display()));
+                continue;
+            }
         };
         if kind.is_symlink() {
+            // 仕様どおりの除外なので**失敗には数えない**（`Load::failed` の doc 参照）。
             eprintln!("vault: skip symlink {}", path.display());
             continue;
         }
 
         if kind.is_dir() {
-            walk(root, &path, out);
+            walk(root, &path, load);
         } else if path.extension().is_some_and(|e| e == "md") {
             match read_with_mtime(&path) {
-                Ok((raw, modified)) => out.push(parse(root, path, raw, modified)),
-                Err(e) => eprintln!("vault: skip {} ({e})", path.display()),
+                Ok((raw, modified)) => load.notes.push(parse(root, path, raw, modified)),
+                Err(e) => load.failed(format!("{} を読めません（{e}）", path.display())),
             }
         }
     }
@@ -504,7 +545,10 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "一件目");
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "二件目");
-        assert!(load_dir(&dir).is_empty(), "捨てたノートが一覧に残っている");
+        assert!(
+            load_dir(&dir).notes.is_empty(),
+            "捨てたノートが一覧に残っている"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -525,12 +569,51 @@ mod tests {
         // 自分自身を指す循環。辿れば再帰が止まらない。
         std::os::unix::fs::symlink(&dir, dir.join("循環")).unwrap();
 
-        let notes = load_dir(&dir);
+        let load = load_dir(&dir);
 
-        let titles: Vec<&str> = notes.iter().map(|n| n.title.as_str()).collect();
+        let titles: Vec<&str> = load.notes.iter().map(|n| n.title.as_str()).collect();
         assert_eq!(titles, ["中"], "symlink の先を読んでいる");
+        assert_eq!(
+            load.failed, 0,
+            "仕様どおりの除外を失敗に数えている（毎回警告が出てしまう）"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// **読めなかったものが件数と理由で返ること。** 呼び出し元がこれを持たないと、
+    /// 権限で欠けた一覧と「もともとその件数しかない vault」を区別できない。
+    ///
+    /// 読めないファイルは `0000` のディレクトリの中に作って再現する（root で走らせると
+    /// 権限を無視して読めてしまうため、**ファイル単体の `0000` では足りない**）。
+    #[test]
+    fn load_dir_counts_what_it_could_not_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp_dir("load-failures");
+        std::fs::write(dir.join("読める.md"), "# 読める").unwrap();
+        let locked = dir.join("鍵付き");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("読めない.md"), "# 読めない").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let load = load_dir(&dir);
+
+        assert_eq!(
+            load.notes.len(),
+            1,
+            "読めるノートまで落としている: {:?}",
+            load.notes.iter().map(|n| &n.title).collect::<Vec<_>>()
+        );
+        assert_eq!(load.failed, 1, "読めなかったのに件数が 0 のまま");
+        let reason = load.first_failure.expect("理由が残っていない");
+        assert!(
+            reason.contains("鍵付き"),
+            "どこで失敗したのか分からない: {reason}"
+        );
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 保存が一時ファイルを残さないこと。残ると vault にゴミが積もり、

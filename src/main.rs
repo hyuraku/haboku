@@ -511,9 +511,32 @@ fn home_dir() -> PathBuf {
     std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
 }
 
-fn boot(root: PathBuf, notes: Vec<vault::Note>, load_ms: f64) -> App {
-    let folders = count_folders(&notes);
-    let visible = visible_indices(&notes, None);
+/// 読み込みで欠けたものを 1 行にする。欠けていなければ `None`。
+///
+/// **件数だけでは打つ手が分からない**ので、1 件目の理由まで出す（`vault::Load` の doc 参照）。
+/// `.app` の利用者に stderr は見えないので、ここが唯一の通知経路になる。
+fn load_warning(load: &vault::Load) -> Option<String> {
+    let first = load.first_failure.as_deref()?;
+    Some(match load.failed {
+        1 => format!("1 件読めませんでした（{first}）"),
+        n => format!("{n} 件読めませんでした（例: {first}）"),
+    })
+}
+
+/// 常駐エラーは 1 行しか出せないので、同時に出る用があれば繋げる。
+/// （`refuse_or_rescue` が「／」で足すのと同じ形にしてある）
+fn join_errors(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(format!("{a}／{b}")),
+        (a, b) => a.or(b),
+    }
+}
+
+fn boot(root: PathBuf, load: vault::Load, load_ms: f64) -> App {
+    let folders = count_folders(&load.notes);
+    let visible = visible_indices(&load.notes, None);
+    let error = load_warning(&load);
+    let notes = load.notes;
 
     App {
         root,
@@ -532,7 +555,7 @@ fn boot(root: PathBuf, notes: Vec<vault::Note>, load_ms: f64) -> App {
         dirty_since: None,
         last_edit: Instant::now(),
         show_marker: false,
-        error: None,
+        error,
         close_refused: false,
         save_failures: 0,
         retry_after: None,
@@ -550,7 +573,7 @@ fn boot(root: PathBuf, notes: Vec<vault::Note>, load_ms: f64) -> App {
 /// `root` には候補を入れておくが、**`setup` が `Some` の間は誰もそこへ書かない**
 /// （`update()` の入口で他のメッセージを落とす）。
 fn boot_setup(suggested: PathBuf) -> App {
-    let mut app = boot(suggested.clone(), Vec::new(), 0.0);
+    let mut app = boot(suggested.clone(), vault::Load::default(), 0.0);
     app.setup = Some(Setup {
         suggested,
         error: None,
@@ -606,20 +629,25 @@ fn adopt_vault(app: &mut App, root: PathBuf) {
     let remembered = config::write_vault(&app.config_file, &root);
 
     let t0 = Instant::now();
-    let notes = vault::load_dir(&root);
+    let load = vault::load_dir(&root);
     app.load_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    app.folders = count_folders(&notes);
-    app.visible = visible_indices(&notes, None);
-    app.notes = notes;
+    app.folders = count_folders(&load.notes);
+    app.visible = visible_indices(&load.notes, None);
     app.root = root;
     app.selected = None;
     app.selected_folder = None;
     app.content = text_editor::Content::with_text(WELCOME);
     app.setup = None;
-    app.error = remembered
-        .err()
-        .map(|e| format!("保存先を覚えられませんでした（次回もこの画面が出ます）: {e}"));
+    // **読めなかった件数も、記憶できなかった件も、どちらも黙らない。**
+    // 常駐エラーは 1 行なので繋げて出す（片方だけ出すと、もう片方が消える）。
+    app.error = join_errors(
+        remembered
+            .err()
+            .map(|e| format!("保存先を覚えられませんでした（次回もこの画面が出ます）: {e}")),
+        load_warning(&load),
+    );
+    app.notes = load.notes;
 }
 
 fn set_setup_error(app: &mut App, message: String) {
@@ -1845,10 +1873,15 @@ fn main() -> ExitCode {
         }
         VaultChoice::Ready(root) => {
             let t0 = Instant::now();
-            let notes = vault::load_dir(&root);
+            let load = vault::load_dir(&root);
             let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            eprintln!("vault: {} notes / {load_ms:.1}ms / {}", notes.len(), root.display());
-            Box::new(move || boot(root.clone(), notes.clone(), load_ms))
+            eprintln!(
+                "vault: {} notes / {} 件読めず / {load_ms:.1}ms / {}",
+                load.notes.len(),
+                load.failed,
+                root.display()
+            );
+            Box::new(move || boot(root.clone(), load.clone(), load_ms))
         }
         VaultChoice::NeedsSetup { suggested } => {
             eprintln!("vault: 未設定（初回セットアップを表示します）");
@@ -1897,9 +1930,9 @@ mod tests {
             std::fs::write(dir.join(format!("note-{i}.md")), body).unwrap();
         }
 
-        let notes = vault::load_dir(&dir);
-        assert_eq!(notes.len(), 2);
-        let app = boot(dir.clone(), notes, 0.0);
+        let load = vault::load_dir(&dir);
+        assert_eq!(load.notes.len(), 2);
+        let app = boot(dir.clone(), load, 0.0);
         (dir, app)
     }
 
@@ -1947,9 +1980,40 @@ mod tests {
             std::fs::write(sub.join(format!("n-{i}.md")), body).unwrap();
         }
 
-        let notes = vault::load_dir(&dir);
-        let app = boot(dir.clone(), notes, 0.0);
+        let app = boot(dir.clone(), vault::load_dir(&dir), 0.0);
         (dir, app)
+    }
+
+    /// **読めなかったノートが画面に出ること。**
+    ///
+    /// `.app` の利用者に stderr は見えないので、常駐エラーが唯一の通知経路になる。
+    /// 出さないと「権限で欠けた一覧」と「もともとその件数しかない vault」を区別できない
+    /// （`docs/spec.md` の「読めないファイルは黙って捨てず件数に出す」）。
+    #[test]
+    fn unreadable_notes_surface_on_screen() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("haboku-app-test-{}-unreadable", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("読める.md"), "# 読める").unwrap();
+        let locked = dir.join("鍵付き");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("読めない.md"), "# 読めない").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let app = boot(dir.clone(), vault::load_dir(&dir), 0.0);
+
+        assert_eq!(app.notes.len(), 1, "読めるノートまで落としている");
+        let error = app.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("1 件") && error.contains("鍵付き"),
+            "読めなかったことが画面に出ていない: {error:?}"
+        );
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn insert(c: char) -> Message {
@@ -2215,7 +2279,10 @@ mod tests {
 
         // `.rescue` は `.md` ではないので、一覧には出てこない（vault を汚さない）。
         assert!(
-            vault::load_dir(&dir).iter().all(|n| n.path != rescued[0]),
+            vault::load_dir(&dir)
+                .notes
+                .iter()
+                .all(|n| n.path != rescued[0]),
             "退避ファイルが一覧に出ている"
         );
 
@@ -2870,9 +2937,9 @@ mod tests {
             VaultChoice::Ready(root) => root,
             other => panic!("VAULT に実データの vault を指定して実行する: {other:?}"),
         };
-        let notes = vault::load_dir(&root);
-        let count = notes.len();
-        let mut app = boot(root, notes, 0.0);
+        let load = vault::load_dir(&root);
+        let count = load.notes.len();
+        let mut app = boot(root, load, 0.0);
 
         // 一番大きいノートを開く。エディタの負荷が最大になる条件で測る。
         let biggest = app
