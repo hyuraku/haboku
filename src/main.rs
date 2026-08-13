@@ -244,6 +244,21 @@ struct App {
     show_marker: bool,
     /// 保存に失敗した等の常駐エラー。消えないこと自体がシグナル。
     error: Option<String>,
+
+    // ── undo / redo（ADR-0017）──────────────────────────────
+    //
+    // iced 0.14 の `text_editor` は undo を持たない（下層の cosmic-text は `Change` を
+    // 持つが、iced が入口を塞いでいる）。だから本文とカーソルの**全文スナップショット**を
+    // 自前で積む。1 ノートは数 KB で、vault 全体を常時メモリに載せているこのアプリなら誤差。
+    /// 元に戻せる状態。**ノート単位**で、本文を差し替えるときに畳む（`replace_content`）。
+    undo: Vec<Snapshot>,
+    /// やり直せる状態。**新しい編集で捨てる**（分岐した歴史は持たない）。
+    redo: Vec<Snapshot>,
+    /// いま continuing 中の編集の種類。**これが変わった瞬間が undo の区切り**。
+    ///
+    /// `None` は「次の編集から新しいまとまりを始める」印。カーソルが動いたときと
+    /// undo / redo の直後に倒す（離れた場所の編集が 1 ステップに混ざらないように）。
+    edit_group: Option<EditKind>,
     /// 保存できずに閉じるのを一度断ったか。**2 回目の要求で退避して閉じる**ための記憶。
     ///
     /// 保存が通れば `clear_dirty` で畳む。問題が直ったあとの初回はまた警告から始めたい
@@ -352,6 +367,9 @@ enum Message {
     ///
     /// **`Binding::Sequence` では書けないのでメッセージにしてある。** 理由は `update()` 側の doc。
     CutToLineEnd,
+    /// `Cmd+Z` / `Cmd+Shift+Z`（ADR-0017）。
+    Undo,
+    Redo,
     /// 自動保存の監視。dirty の間だけ流れてくる。
     Tick(Instant),
     /// キー入力。フォーカスの位置に関係なく全部流れてくる。
@@ -560,6 +578,9 @@ fn boot(root: PathBuf, load: vault::Load, load_ms: f64) -> App {
         last_edit: Instant::now(),
         show_marker: false,
         error,
+        undo: Vec::new(),
+        redo: Vec::new(),
+        edit_group: None,
         close_refused: false,
         save_failures: 0,
         retry_after: None,
@@ -641,7 +662,7 @@ fn adopt_vault(app: &mut App, root: PathBuf) {
     app.root = root;
     app.selected = None;
     app.selected_folder = None;
-    app.content = text_editor::Content::with_text(WELCOME);
+    replace_content(app, WELCOME);
     app.setup = None;
     // **読めなかった件数も、記憶できなかった件も、どちらも黙らない。**
     // 常駐エラーは 1 行なので繋げて出す（片方だけ出すと、もう片方が消える）。
@@ -879,18 +900,133 @@ fn finish_save(app: &mut App, result: Result<(), String>) -> Task<Message> {
     }
 }
 
-fn open_note(app: &mut App, index: usize) {
-    if let Some(note) = app.notes.get(index) {
-        // frontmatter 込みの全文をエディタへ渡す。`.md` が唯一の真実なので、
-        // 表示のために本文を加工しない。
-        app.content = text_editor::Content::with_text(&note.raw);
-        app.selected = Some(index);
-        // 開きかけのリネーム欄は、選択が動いた時点で対象を失うので畳む。
-        // ここは `selected` を書き換える全経路（一覧クリック・パレット・新規作成）の
-        // 合流点。畳み忘れると、残った入力欄の Enter が**新しい選択先を前のノートの
-        // 名前でリネームする**（`RenameCommit` の対象は `app.selected`）。
-        app.rename = None;
+/// 元に戻せる状態（ADR-0017）。**カーソルまで戻す**ので位置は `Cursor` で持つ。
+///
+/// `Cursor` は行・列の論理位置（描画上の座標ではない）なので、本文を作り直したあとでも
+/// `Content::move_to` でそのまま復元できる。
+#[derive(Debug, Clone)]
+struct Snapshot {
+    text: String,
+    cursor: iced::advanced::text::editor::Cursor,
+}
+
+/// 編集の種類。**同じ種類が続く間は 1 つの undo ステップにまとめる**（ADR-0017）。
+///
+/// 1 打鍵 1 ステップだと「あいう」を消すのに 3 回押すことになり、実用にならない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditKind {
+    Insert,
+    /// 改行は入力と分けて数える。段落ごとに戻せるほうが目的の状態へ着きやすい。
+    Enter,
+    Backspace,
+    Delete,
+    /// 貼り付けは 1 回で 1 ステップ。連続しても混ぜない意味はないのでまとめる。
+    Paste,
+    /// インデント操作（このアプリからは出ないが、`Edit` の網羅性のために持つ）。
+    Indent,
+}
+
+/// undo に積める段数の上限。
+///
+/// 全文スナップショットなので、無制限だと大きなノートを長時間編集したときに
+/// 「本文の長さ × 打鍵の区切り数」だけ積み上がる。100 段あれば実用上は足り、
+/// 100KB のノートでも 10MB で頭打ちになる。
+const UNDO_LIMIT: usize = 100;
+
+/// いまのエディタの状態を写し取る。
+fn snapshot(app: &App) -> Snapshot {
+    Snapshot {
+        text: app.content.text(),
+        cursor: app.content.cursor(),
     }
+}
+
+/// 写し取った状態へ戻す。
+fn restore(app: &mut App, snapshot: Snapshot) {
+    app.content = text_editor::Content::with_text(&snapshot.text);
+    app.content.move_to(snapshot.cursor);
+    // 戻した直後の編集は、必ず新しいまとまりから始める。
+    app.edit_group = None;
+}
+
+/// エディタの中身を丸ごと差し替える。**undo の履歴もここで畳む。**
+///
+/// **履歴はノート単位のもの**なので、本文の差し替えと同時に捨てないと、
+/// **開いていないノートの本文が今のノートへ書き込まれる**。差し替えの入口を
+/// この関数 1 つに絞ってあるのは、その漏れを構造で防ぐため（ADR-0017）。
+fn replace_content(app: &mut App, text: &str) {
+    app.content = text_editor::Content::with_text(text);
+    app.undo.clear();
+    app.redo.clear();
+    app.edit_group = None;
+}
+
+/// 編集が起きたことを dirty へ記録する。**`Message::Edit` と undo / redo で共有する。**
+fn mark_edited(app: &mut App) {
+    if app.selected.is_some() {
+        app.dirty = true;
+        app.last_edit = Instant::now();
+        // **false → true の遷移でだけ**記録する。
+        app.dirty_since.get_or_insert_with(Instant::now);
+    }
+}
+
+/// undo の区切りを判定し、必要なら**編集が起きる前**の状態を積む（ADR-0017）。
+fn remember_for_undo(app: &mut App, action: &text_editor::Action) {
+    use iced::advanced::text::editor::{Action, Edit};
+
+    let kind = match action {
+        Action::Edit(edit) => match edit {
+            Edit::Insert(_) => EditKind::Insert,
+            Edit::Enter => EditKind::Enter,
+            Edit::Backspace => EditKind::Backspace,
+            Edit::Delete => EditKind::Delete,
+            Edit::Paste(_) => EditKind::Paste,
+            Edit::Indent | Edit::Unindent => EditKind::Indent,
+        },
+        // スクロールは本文にもカーソルにも触らないので、まとまりを切らない。
+        Action::Scroll { .. } => return,
+        // **カーソルが動いたら次の編集は別のまとまり。** ここを切らないと、
+        // 行頭で打った文字と行末で打った文字が 1 回の undo でまとめて消える。
+        _ => {
+            app.edit_group = None;
+            return;
+        }
+    };
+
+    if app.edit_group == Some(kind) {
+        return;
+    }
+    app.edit_group = Some(kind);
+
+    // **新しい編集は redo の先を捨てる。** 戻したあとに別の編集をしたら、
+    // やり直せるはずだった歴史はもう繋がらない。
+    app.redo.clear();
+    app.undo.push(snapshot(app));
+    if app.undo.len() > UNDO_LIMIT {
+        app.undo.remove(0);
+    }
+}
+
+fn open_note(app: &mut App, index: usize) {
+    // frontmatter 込みの全文をエディタへ渡す。`.md` が唯一の真実なので、
+    // 表示のために本文を加工しない。
+    //
+    // **一度クローンしてから渡す。** `replace_content` は `&mut App` を取るので
+    // `app.notes` を借りたままでは呼べない。切替のたびに数 KB 余分に写すが、
+    // これはユーザー操作のたびに 1 回で、打鍵ごとに走る経路ではない。
+    let Some(raw) = app.notes.get(index).map(|note| note.raw.clone()) else {
+        return;
+    };
+    // **`replace_content` を通す。** undo の履歴を畳まないと、切り替えたあとの
+    // `Cmd+Z` が**前のノートの本文**をこのノートへ書き込む（ADR-0017）。
+    replace_content(app, &raw);
+    app.selected = Some(index);
+    // 開きかけのリネーム欄は、選択が動いた時点で対象を失うので畳む。
+    // ここは `selected` を書き換える全経路（一覧クリック・パレット・新規作成）の
+    // 合流点。畳み忘れると、残った入力欄の Enter が**新しい選択先を前のノートの
+    // 名前でリネームする**（`RenameCommit` の対象は `app.selected`）。
+    app.rename = None;
 }
 
 /// 新規ノートを作って `notes` の先頭に差し込む。返り値は挿入した位置（常に 0）。
@@ -1030,7 +1166,8 @@ fn delete_note(app: &mut App) -> Result<(), String> {
     // 選択を外し、エディタを空にする（繰り上げの計算そのものを不要にする）。
     app.notes.remove(index);
     app.selected = None;
-    app.content = text_editor::Content::with_text("");
+    // 消したノートの履歴を残すと、次に開いたノートで `Cmd+Z` が消したはずの本文を蘇らせる。
+    replace_content(app, "");
     clear_dirty(app);
     refresh_derived(app);
     Ok(())
@@ -1282,13 +1419,31 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::Edit(action) => {
             // カーソル移動やクリックで dirty を立てない。編集だけを拾う。
             let is_edit = matches!(action, iced::advanced::text::editor::Action::Edit(_));
+            // **編集が起きる前に**区切りを判定して積む（ADR-0017）。
+            remember_for_undo(app, &action);
             app.content.perform(action);
-            if is_edit && app.selected.is_some() {
-                app.dirty = true;
-                app.last_edit = Instant::now();
-                // **false → true の遷移でだけ**記録する。
-                app.dirty_since.get_or_insert_with(Instant::now);
+            if is_edit {
+                mark_edited(app);
             }
+        }
+        // 元に戻す / やり直す（ADR-0017）。**戻した状態は反対側のスタックへ積む。**
+        Message::Undo => {
+            let Some(previous) = app.undo.pop() else {
+                return Task::none();
+            };
+            app.redo.push(snapshot(app));
+            restore(app, previous);
+            // 戻した本文もディスクへ書く。**画面とファイルを一致させる**のが自動保存の役目で、
+            // 元の内容にちょうど戻ったときは「差分なし」の判定が書き込みを省く。
+            mark_edited(app);
+        }
+        Message::Redo => {
+            let Some(next) = app.redo.pop() else {
+                return Task::none();
+            };
+            app.undo.push(snapshot(app));
+            restore(app, next);
+            mark_edited(app);
         }
         // `Ctrl+K`。**行末まで選択して、選択が空でないときだけ消す**（ADR-0016）。
         //
@@ -1447,6 +1602,24 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             // `Cmd+N` で新規作成。パレットが開いていても効く（中で畳む）。
             if modifiers.command() && matches!(&key, keyboard::Key::Character(c) if c == "n") {
                 return update(app, Message::NewNote);
+            }
+
+            // `Cmd+Z` で元に戻す、`Cmd+Shift+Z` でやり直す（ADR-0017）。
+            //
+            // **パレット・リネーム欄が開いている間は効かせない。** そこへ打っているときの
+            // ⌘Z は「見ていない本文を書き換える」操作になる（Control 系をフォーカスで
+            // 塞いだのと同じ理由。ADR-0016）。
+            if modifiers.command()
+                && matches!(&key, keyboard::Key::Character(c) if c == "z")
+                && app.palette.is_none()
+                && app.rename.is_none()
+            {
+                let message = if modifiers.shift() {
+                    Message::Redo
+                } else {
+                    Message::Undo
+                };
+                return update(app, message);
             }
 
             // `Cmd+R` でリネーム、`Cmd+Delete` で `.trash` へ退避。
@@ -3266,6 +3439,181 @@ mod tests {
             editor_key_binding(ctrl_press("h", Some("\u{8}"))),
             Some(text_editor::Binding::Backspace),
         ));
+    }
+
+    /// 打鍵を 1 文字ずつ流す（`Edit::Insert` の連続 = 実際の入力と同じ経路）。
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            send(app, insert(c));
+        }
+    }
+
+    /// **`Cmd+Z` で直前の編集が戻り、カーソルもその位置へ戻ること。**
+    #[test]
+    fn undo_restores_the_previous_text_and_cursor() {
+        let (dir, mut app) = app_with_vault("undo-basic");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "元の本文");
+        let before = app.content.cursor();
+
+        type_text(&mut app, "XY");
+        assert_eq!(app.content.text(), "XY元の本文");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "元の本文", "元に戻っていない");
+        assert_eq!(app.content.cursor(), before, "カーソルが戻っていない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **連続した同じ種類の編集は 1 ステップ、種類が変わったら区切ること**（ADR-0017）。
+    ///
+    /// 1 打鍵 1 ステップだと「あいう」を消すのに 3 回押すことになる。逆に全部を 1 つに
+    /// まとめると、消したつもりの無いところまで巻き戻る。**その境目をここで固定する。**
+    #[test]
+    fn undo_groups_the_same_kind_of_edit_and_breaks_on_a_different_one() {
+        use iced::advanced::text::editor::{Action, Edit};
+
+        let (dir, mut app) = app_with_vault("undo-grouping");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "");
+
+        type_text(&mut app, "今日の予定"); // 入力（1 ステップ）
+        send(&mut app, Message::Edit(Action::Edit(Edit::Backspace)));
+        send(&mut app, Message::Edit(Action::Edit(Edit::Backspace))); // 削除（1 ステップ）
+        type_text(&mut app, "表"); // また入力（1 ステップ）
+        assert_eq!(app.content.text(), "今日の表");
+
+        let undo = |app: &mut App| send(app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        undo(&mut app);
+        assert_eq!(app.content.text(), "今日の", "最後の入力だけが戻っていない");
+        undo(&mut app);
+        assert_eq!(app.content.text(), "今日の予定", "削除がまとめて戻っていない");
+        undo(&mut app);
+        assert_eq!(app.content.text(), "", "入力がまとめて戻っていない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **カーソルを動かしたら、そこで区切ること。**
+    ///
+    /// 切らないと、行頭で打った文字と別の場所で打った文字が 1 回の undo でまとめて消える。
+    #[test]
+    fn moving_the_cursor_starts_a_new_undo_step() {
+        use iced::advanced::text::editor::{Action, Motion};
+
+        let (dir, mut app) = app_with_vault("undo-cursor-break");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "");
+
+        type_text(&mut app, "あ");
+        send(&mut app, Message::Edit(Action::Move(Motion::Home)));
+        type_text(&mut app, "い");
+        assert_eq!(app.content.text(), "いあ");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "あ", "移動をまたいで 1 ステップにまとめている");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **`Cmd+Shift+Z` でやり直せること。やり直したあとに編集したら、その先は捨てること。**
+    #[test]
+    fn redo_puts_the_edit_back_and_a_new_edit_drops_the_rest() {
+        let (dir, mut app) = app_with_vault("undo-redo");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "");
+        type_text(&mut app, "あ");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+        assert_eq!(app.content.text(), "");
+
+        send(
+            &mut app,
+            pressed(
+                key("z"),
+                keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+            ),
+        );
+        assert_eq!(app.content.text(), "あ", "やり直せていない");
+
+        // 戻してから別の編集をしたら、やり直せるはずだった歴史はもう繋がらない。
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+        type_text(&mut app, "い");
+        assert!(app.redo.is_empty(), "新しい編集で redo が捨てられていない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **ノートを切り替えたら履歴を捨てること。これは事故防止の核心。**
+    ///
+    /// 残っていると、切り替えた先で `Cmd+Z` を押した瞬間に**開いていないノートの本文**が
+    /// 今のノートへ書き込まれ、自動保存がそれをディスクまで届ける。
+    #[test]
+    fn switching_notes_drops_the_undo_history() {
+        let (dir, mut app) = app_with_vault("undo-switch");
+        send(&mut app, Message::NoteSelected(0));
+        type_text(&mut app, "X");
+        // 先に保存を済ませる。dirty のまま切り替えると**保存の完了まで切替が待たされる**
+        // （ADR-0014）ので、切り替わっていない状態でこのテストが通ってしまう。
+        send(&mut app, Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
+        flush_saves(&mut app);
+
+        send(&mut app, Message::NoteSelected(1));
+        assert_eq!(app.selected, Some(1), "前提: 切替が起きていない");
+        let after_switch = app.content.text();
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert!(app.undo.is_empty(), "切替で履歴が残っている");
+        assert_eq!(
+            app.content.text(),
+            after_switch,
+            "別のノートの本文が今のノートへ入った"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **パレットを開いている間の `Cmd+Z` は本文に効かないこと。**
+    ///
+    /// 検索欄へ打っているときの ⌘Z が「見ていない本文を書き換える」操作になってはいけない
+    /// （Control 系をフォーカスで塞いだのと同じ理由。ADR-0016）。
+    #[test]
+    fn undo_does_not_fire_while_the_palette_is_open() {
+        let (dir, mut app) = app_with_vault("undo-palette");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "");
+        type_text(&mut app, "あ");
+
+        open_palette(&mut app, "");
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "あ", "パレット表示中に本文が戻った");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **戻した本文もディスクへ書くこと。** 画面とファイルが食い違ったままになると、
+    /// 次に開いたときに戻したはずの編集が復活する。
+    #[test]
+    fn undo_marks_the_note_for_saving() {
+        let (dir, mut app) = app_with_vault("undo-saves");
+        send(&mut app, Message::NoteSelected(0));
+        let path = app.notes[0].path.clone();
+        type_text(&mut app, "X");
+        send(&mut app, Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
+        flush_saves(&mut app);
+        // **前提の確認。** ここで書けていないと、このテストは何も検証しないまま緑になる。
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains('X'),
+            "前提: 編集がディスクへ届いていない"
+        );
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+        assert!(app.dirty, "戻したのに保存対象になっていない");
+        send(&mut app, Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
+        flush_saves(&mut app);
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains('X'), "戻した編集がディスクに残っている");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `Ctrl+K` は `update()` へ回すこと（`Binding::Sequence` では組めない。ADR-0016）。
