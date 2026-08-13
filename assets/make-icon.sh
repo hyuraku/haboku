@@ -18,21 +18,21 @@ swiftc -O \
   "$SCRIPT_DIR/make-icon.swift" \
   -o "$BUILD_DIR/make-icon"
 
-"$BUILD_DIR/make-icon" "$SCRIPT_DIR/icon-1024.png"
+"$BUILD_DIR/make-icon" "$SCRIPT_DIR/icon-1024.png" 1024 detailed
 
 ICONSET_DIR="$BUILD_DIR/haboku.iconset"
 mkdir -p "$ICONSET_DIR"
 
-sips -z 16 16 "$SCRIPT_DIR/icon-1024.png" --out "$ICONSET_DIR/icon_16x16.png" >/dev/null
-sips -z 32 32 "$SCRIPT_DIR/icon-1024.png" --out "$ICONSET_DIR/icon_16x16@2x.png" >/dev/null
-sips -z 32 32 "$SCRIPT_DIR/icon-1024.png" --out "$ICONSET_DIR/icon_32x32.png" >/dev/null
-sips -z 64 64 "$SCRIPT_DIR/icon-1024.png" --out "$ICONSET_DIR/icon_32x32@2x.png" >/dev/null
-sips -z 128 128 "$SCRIPT_DIR/icon-1024.png" --out "$ICONSET_DIR/icon_128x128.png" >/dev/null
-sips -z 256 256 "$SCRIPT_DIR/icon-1024.png" --out "$ICONSET_DIR/icon_128x128@2x.png" >/dev/null
-sips -z 256 256 "$SCRIPT_DIR/icon-1024.png" --out "$ICONSET_DIR/icon_256x256.png" >/dev/null
-sips -z 512 512 "$SCRIPT_DIR/icon-1024.png" --out "$ICONSET_DIR/icon_256x256@2x.png" >/dev/null
-sips -z 512 512 "$SCRIPT_DIR/icon-1024.png" --out "$ICONSET_DIR/icon_512x512.png" >/dev/null
-cp "$SCRIPT_DIR/icon-1024.png" "$ICONSET_DIR/icon_512x512@2x.png"
+"$BUILD_DIR/make-icon" "$ICONSET_DIR/icon_16x16.png" 16 simple
+"$BUILD_DIR/make-icon" "$ICONSET_DIR/icon_16x16@2x.png" 32 simple
+"$BUILD_DIR/make-icon" "$ICONSET_DIR/icon_32x32.png" 32 simple
+"$BUILD_DIR/make-icon" "$ICONSET_DIR/icon_32x32@2x.png" 64 simple
+"$BUILD_DIR/make-icon" "$ICONSET_DIR/icon_128x128.png" 128 detailed
+"$BUILD_DIR/make-icon" "$ICONSET_DIR/icon_128x128@2x.png" 256 detailed
+"$BUILD_DIR/make-icon" "$ICONSET_DIR/icon_256x256.png" 256 detailed
+"$BUILD_DIR/make-icon" "$ICONSET_DIR/icon_256x256@2x.png" 512 detailed
+"$BUILD_DIR/make-icon" "$ICONSET_DIR/icon_512x512.png" 512 detailed
+"$BUILD_DIR/make-icon" "$ICONSET_DIR/icon_512x512@2x.png" 1024 detailed
 
 rm -f "$SCRIPT_DIR/haboku.icns"
 iconutil -c icns "$ICONSET_DIR" -o "$SCRIPT_DIR/haboku.icns"
