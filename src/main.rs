@@ -348,6 +348,10 @@ enum Message {
     /// ノートを開く（`notes` のインデックス）。
     NoteSelected(usize),
     Edit(text_editor::Action),
+    /// `Ctrl+K`。カーソルから行末までを切り取る（ADR-0016）。
+    ///
+    /// **`Binding::Sequence` では書けないのでメッセージにしてある。** 理由は `update()` 側の doc。
+    CutToLineEnd,
     /// 自動保存の監視。dirty の間だけ流れてくる。
     Tick(Instant),
     /// キー入力。フォーカスの位置に関係なく全部流れてくる。
@@ -1286,6 +1290,27 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.dirty_since.get_or_insert_with(Instant::now);
             }
         }
+        // `Ctrl+K`。**行末まで選択して、選択が空でないときだけ消す**（ADR-0016）。
+        //
+        // **`Binding::Sequence(vec![Select(End), Cut])` では成立しない。** `Select` は
+        // アクションを publish するだけで `Content` はその場で変わらないのに、`Cut` は
+        // **その場で `content.selection()` を読む**（`text_editor.rs:831`）。同じ
+        // Sequence の中では Cut が見るのは選択前の状態で、いつも空。**選択だけが残って
+        // 何も消えない**（実機で踏んだ）。だから選択と判定を同じ場所で順に行う。
+        Message::CutToLineEnd => {
+            use iced::advanced::text::editor::{Action, Edit, Motion};
+
+            app.content.perform(Action::Select(Motion::End));
+            // 行末・空行では選択が空になる。**ここで何もしないのが `Ctrl+K` の約束**
+            // （`Backspace` で組むと、ここで手前の 1 文字が消える）。
+            let Some(cut) = app.content.selection().filter(|s| !s.is_empty()) else {
+                return Task::none();
+            };
+            // 削除は `Message::Edit` に通す。dirty の記録をここに二重に持たないため。
+            let edited = update(app, Message::Edit(Action::Edit(Edit::Delete)));
+            // Undo が無いので、切り取った分の戻し道はクリップボードだけ（ADR-0016）。
+            return Task::batch([iced::clipboard::write(cut), edited]);
+        }
         Message::Tick(now) => {
             if app.saved_flash_until.is_some_and(|until| now >= until) {
                 app.saved_flash_until = None;
@@ -1557,12 +1582,59 @@ fn note_pane(app: &App) -> Element<'_, Message> {
 ///
 /// **`command()` で一律に落とさない。** `from_key_press` は `Insert` より先に
 /// `Copy` / `Cut` / `Paste` / `SelectAll` を返すので、そこは通す。
+///
+/// あわせて **macOS の Control 系編集操作（`Ctrl+A` / `Ctrl+E` など）を補う**（ADR-0016）。
+/// iced 0.14.2 の既定はこれを取りこぼす。**既定が答えを出せなかったときだけ**補うので、
+/// 既定が正しく処理している組み合わせ（`Ctrl+H` = Backspace、Linux の `Ctrl+A` = 全選択）は触らない。
 fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
     let command = kp.modifiers.command();
+    // **フォーカスが無いときは補わない。** `key_binding` はフォーカスの有無に関わらず
+    // 呼ばれる（`Status::Active` で来る）。パレット・リネーム欄を開いている間に
+    // `Ctrl+N` で裏のカーソルが動いたり、`Ctrl+D` で**見ていない本文が消える**のを防ぐ。
+    // これでパレットの `ctrl-n` / `ctrl-p`（一覧移動）とも衝突しない。
+    let focused = matches!(kp.status, text_editor::Status::Focused { .. });
+    // **`Modifiers::CTRL` との完全一致で見る。** `control()` だと `Cmd+Ctrl+A` や
+    // `Ctrl+Shift+A` まで拾ってしまう（iced の `convert_macos_shortcut` も完全一致）。
+    let control_only = kp.modifiers == keyboard::Modifiers::CTRL;
+    let key = kp.key.clone();
+
     match text_editor::Binding::from_key_press(kp) {
         Some(text_editor::Binding::Insert(_)) if command => None,
-        other => other,
+        Some(other) => Some(other),
+        None if focused && control_only => macos_control_binding(&key),
+        None => None,
     }
+}
+
+/// macOS の Control 系編集操作。**アプリ側で定義しないと使えない**（ADR-0016）。
+///
+/// `text_editor` は Cocoa のネイティブテキスト部品ではないので、macOS の
+/// システム設定やユーザー辞書（`DefaultKeyBinding.dict`）では直らない。
+/// iced 0.14.2 の既定は `Ctrl+A` を `Home` へ変換しておきながら、その後の分岐で
+/// **変換前のキーと `text`（macOS では制御文字が入る）を見てしまい `None` を返す**。
+///
+/// `Ctrl+K`（行末まで切り取り）だけは `Binding` を組み合わせず**メッセージにして
+/// `update()` で処理する**（ADR-0016）。`Sequence` の中では `Select` の結果を
+/// `Cut` が見られないため（`Message::CutToLineEnd` の分岐に理由を書いた）。
+fn macos_control_binding(key: &keyboard::Key) -> Option<text_editor::Binding<Message>> {
+    use iced::advanced::text::editor::Motion;
+
+    let motion = match key.as_ref() {
+        keyboard::Key::Character("a") => Motion::Home,
+        keyboard::Key::Character("e") => Motion::End,
+        keyboard::Key::Character("b") => Motion::Left,
+        keyboard::Key::Character("f") => Motion::Right,
+        keyboard::Key::Character("n") => Motion::Down,
+        keyboard::Key::Character("p") => Motion::Up,
+        // 後ろを 1 文字消す。`Ctrl+H`（前を 1 文字）は既定が処理できているので触らない。
+        keyboard::Key::Character("d") => return Some(text_editor::Binding::Delete),
+        // 行末まで切り取る。行を繋げたいときは続けて `Ctrl+D` を押す（doc 参照）。
+        keyboard::Key::Character("k") => {
+            return Some(text_editor::Binding::Custom(Message::CutToLineEnd));
+        }
+        _ => return None,
+    };
+    Some(text_editor::Binding::Move(motion))
 }
 
 fn editor_pane(app: &App) -> Element<'_, Message> {
@@ -3130,6 +3202,157 @@ mod tests {
             assert!(
                 editor_key_binding(key_press(c, keyboard::Modifiers::COMMAND)).is_none(),
                 "Cmd+{c} が本文に入る",
+            );
+        }
+    }
+
+    /// `Ctrl` 単独の打鍵を組み立てる。
+    ///
+    /// **`text` には制御文字が入る。** macOS の winit は `text_with_all_modifiers()` を返すので、
+    /// `Ctrl+A` は `Some("\u{1}")` になる。iced 0.14.2 の既定はこれを見て `None` を返し、
+    /// せっかく `Home` へ変換した結果を捨てる（ADR-0016）。**その入力を再現しないと回帰にならない。**
+    fn ctrl_press(c: &str, text: Option<&str>) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key: key(c),
+            modified_key: key(c),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers: keyboard::Modifiers::CTRL,
+            text: text.map(Into::into),
+            status: text_editor::Status::Focused { is_hovered: false },
+        }
+    }
+
+    /// **macOS の Control 系編集操作が本文で効くこと。**
+    ///
+    /// `text` が制御文字のとき（macOS の実機）と `None` のとき（他の経路）の両方で固定する。
+    /// 片方だけ通しても、実機で効かない実装が通ってしまう。
+    #[test]
+    fn macos_control_keys_move_the_cursor_in_the_body() {
+        use iced::advanced::text::editor::Motion;
+
+        let expected = [
+            ("a", '\u{1}', Motion::Home),
+            ("e", '\u{5}', Motion::End),
+            ("b", '\u{2}', Motion::Left),
+            ("f", '\u{6}', Motion::Right),
+            ("n", '\u{e}', Motion::Down),
+            ("p", '\u{10}', Motion::Up),
+        ];
+
+        for (c, control, motion) in expected {
+            for text in [Some(control.to_string()), None] {
+                let binding = editor_key_binding(ctrl_press(c, text.as_deref()));
+                assert!(
+                    matches!(binding, Some(text_editor::Binding::Move(m)) if m == motion),
+                    "Ctrl+{c}（text: {text:?}）が {motion:?} にならない: {binding:?}",
+                );
+            }
+        }
+    }
+
+    /// **`Ctrl+D` は後ろを 1 文字、`Ctrl+H` は前を 1 文字消すこと。**
+    ///
+    /// `Ctrl+H` は iced の既定が処理できているので自前では変換していない。
+    /// **どちらの層が担っているかではなく、効くことを固定する**（既定が変わったら気づける）。
+    #[test]
+    fn macos_control_keys_delete_one_character() {
+        assert!(matches!(
+            editor_key_binding(ctrl_press("d", Some("\u{4}"))),
+            Some(text_editor::Binding::Delete),
+        ));
+        assert!(matches!(
+            editor_key_binding(ctrl_press("h", Some("\u{8}"))),
+            Some(text_editor::Binding::Backspace),
+        ));
+    }
+
+    /// `Ctrl+K` は `update()` へ回すこと（`Binding::Sequence` では組めない。ADR-0016）。
+    #[test]
+    fn ctrl_k_is_handled_by_the_update_loop() {
+        assert!(matches!(
+            editor_key_binding(ctrl_press("k", Some("\u{b}"))),
+            Some(text_editor::Binding::Custom(Message::CutToLineEnd)),
+        ));
+    }
+
+    /// **`Ctrl+K` がカーソルから行末までを実際に消すこと。**
+    ///
+    /// **binding の形だけを見ていたせいで、選択されるだけで何も消えない実装を通した。**
+    /// `Binding::Sequence(vec![Select(End), Cut])` は `Cut` が選択前の `Content` を読むので
+    /// 永遠に空振りする（ADR-0016）。**効果を本文の文字列で見る**テストでしか捕まらない。
+    #[test]
+    fn ctrl_k_cuts_from_the_cursor_to_the_end_of_the_line() {
+        use iced::advanced::text::editor::{Action, Motion};
+
+        let (dir, mut app) = app_with_vault("ctrl-k-cut");
+        send(&mut app, Message::NoteSelected(0));
+        app.content = text_editor::Content::with_text("一行目\n二行目");
+        send(&mut app, Message::Edit(Action::Move(Motion::Right)));
+
+        send(&mut app, Message::CutToLineEnd);
+
+        assert_eq!(app.content.text(), "一\n二行目", "行末まで消えていない");
+        assert!(app.dirty, "編集したのに dirty が立っていない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **行末・空行の `Ctrl+K` では何も起きないこと**（`Backspace` で組むと手前が消える）。
+    ///
+    /// 本文が変わらないだけでなく **dirty も立たない**ことまで見る。立ててしまうと、
+    /// 何も編集していないのに自動保存が走って mtime が動く（`docs/spec.md` の
+    /// 「無編集の切替で mtime が動かない」と同じ約束）。
+    #[test]
+    fn ctrl_k_does_nothing_at_the_end_of_a_line() {
+        use iced::advanced::text::editor::{Action, Motion};
+
+        let (dir, mut app) = app_with_vault("ctrl-k-line-end");
+        send(&mut app, Message::NoteSelected(0));
+
+        for (text, where_) in [("一行目\n二行目", "行末"), ("\n二行目", "空行")] {
+            app.content = text_editor::Content::with_text(text);
+            app.content.perform(Action::Move(Motion::End));
+            app.dirty = false;
+
+            send(&mut app, Message::CutToLineEnd);
+
+            assert_eq!(app.content.text(), text, "{where_} で本文が変わった");
+            assert!(!app.dirty, "{where_} で dirty が立った（無編集で保存が走る）");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **フォーカスが無いエディタでは Control 系を効かせないこと。**
+    ///
+    /// `key_binding` はフォーカスの有無に関わらず呼ばれる。パレットを開いている間に
+    /// `Ctrl+N` を押すと一覧が下へ動くが、**同じ打鍵で裏の本文のカーソルまで動いてはいけない**。
+    /// `Ctrl+D` に至っては、見ていない本文から 1 文字消える。
+    #[test]
+    fn control_keys_do_nothing_while_the_editor_is_unfocused() {
+        for c in ["a", "e", "n", "p", "d", "k"] {
+            let mut kp = ctrl_press(c, Some("\u{1}"));
+            kp.status = text_editor::Status::Active;
+            assert!(
+                editor_key_binding(kp).is_none(),
+                "フォーカスの無いエディタが Ctrl+{c} に反応している",
+            );
+        }
+    }
+
+    /// **`Ctrl` に他の修飾が乗った組み合わせは拾わないこと。**
+    ///
+    /// `Ctrl+Shift+A`（選択のつもり）や `Ctrl+Alt+A` を行頭移動にしない。
+    /// `Cmd+Ctrl+A` はここには含めない — 既定が `SelectAll` を返す組み合わせで、
+    /// **既定が答えを出しているものは触らない**のがこの関数の約束（ADR-0016）。
+    #[test]
+    fn control_bindings_require_control_alone() {
+        for extra in [keyboard::Modifiers::SHIFT, keyboard::Modifiers::ALT] {
+            let mut kp = ctrl_press("a", Some("\u{1}"));
+            kp.modifiers = keyboard::Modifiers::CTRL | extra;
+            assert!(
+                editor_key_binding(kp).is_none(),
+                "Ctrl+{extra:?}+A まで拾っている",
             );
         }
     }
