@@ -391,18 +391,38 @@ fn parse(root: &Path, path: PathBuf, raw: String, modified: SystemTime) -> Note 
 }
 
 /// `---` で挟まれた frontmatter を切り出す。無ければ `None`。
+///
+/// **改行の種類は問わない。** CRLF のファイルをここで弾くと frontmatter 全体が
+/// 本文へ流れ込み、タグだけでなく `title` も `summary` も落ちる。取りこぼしの中で
+/// これが一番被害が大きい（他のエディタや Windows 由来のファイルで普通に起きる）。
 fn split_frontmatter(raw: &str) -> (Option<String>, &str) {
-    let Some(rest) = raw.strip_prefix("---\n") else {
+    let Some(rest) = raw
+        .strip_prefix("---\n")
+        .or_else(|| raw.strip_prefix("---\r\n"))
+    else {
         return (None, raw);
     };
     let Some(end) = rest.find("\n---") else {
         return (None, raw);
     };
+    // CRLF なら `end` は `\r` の直後を指すが、fm も body も行単位で読むので
+    // 残った `\r` は `str::lines()` が落とす。
     let fm = rest[..end].to_string();
     let body = rest[end..]
         .trim_start_matches("\n---")
-        .trim_start_matches('\n');
+        .trim_start_matches(['\r', '\n']);
     (Some(fm), body)
+}
+
+/// YAML の行末コメント（空白のあとの `#`）を落とす。
+///
+/// **空白を要求する。** `#` の直前が空白でなければコメントではないので、
+/// タグとして書かれた `#rust` のような値を削らずに済む。
+fn strip_comment(value: &str) -> &str {
+    match value.find(" #").or_else(|| value.find("\t#")) {
+        Some(at) => &value[..at],
+        None => value,
+    }
 }
 
 /// `key: value` を1つ拾う。YAML パーサは入れない（frontmatter は浅いので過剰）。
@@ -414,15 +434,19 @@ fn scalar(fm: &str, key: &str) -> Option<String> {
 }
 
 /// tags は `tags: [a, b]` と `tags:\n  - a\n  - b` の両方が現場に存在する。
+///
+/// **括弧は必須にしない。** `tags: rust` や `tags: rust, iced` は YAML として合法で、
+/// 実際に書かれる。ここで落とすと「書いたのに反映されない」を黙って作る。
 fn tags(fm: &str) -> Vec<String> {
-    if let Some(inline) = scalar(fm, "tags")
-        && let Some(inner) = inline.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
-    {
-        return inner
-            .split(',')
-            .map(|t| t.trim().trim_matches('"').to_string())
-            .filter(|t| !t.is_empty())
-            .collect();
+    if let Some(inline) = scalar(fm, "tags") {
+        let inner = match inline.strip_prefix('[') {
+            // `]` より後ろは行末コメントなど。`]` を書き忘れていても中身は拾う。
+            Some(rest) => rest.split(']').next().unwrap_or(rest),
+            // `tags:  # あとで書く` は YAML ではコメントだけの行＝タグ無し。
+            None if inline.starts_with('#') => "",
+            None => strip_comment(&inline),
+        };
+        return inner.split(',').filter_map(clean_tag).collect();
     }
     let mut out = Vec::new();
     let mut in_tags = false;
@@ -433,13 +457,24 @@ fn tags(fm: &str) -> Vec<String> {
         }
         if in_tags {
             if let Some(t) = line.trim().strip_prefix("- ") {
-                out.push(t.trim().trim_matches('"').to_string());
+                out.extend(clean_tag(t));
+            } else if line.trim().is_empty() {
+                // 空行では終わらせない。リストの途中に 1 行空けて書く人がいる。
             } else if !line.starts_with(' ') && !line.starts_with('\t') {
                 break;
             }
         }
     }
     out
+}
+
+/// タグ 1 つ分の前後を落とす。空になったものは捨てる。
+///
+/// 引用符は `"` と `'` の両方。片方だけだと `tags: ['a', 'b']` が
+/// `'a'` という別のタグとして残る。
+fn clean_tag(raw: &str) -> Option<String> {
+    let t = strip_comment(raw).trim().trim_matches(['"', '\'']).trim();
+    (!t.is_empty()).then(|| t.to_string())
 }
 
 #[cfg(test)]
@@ -761,5 +796,82 @@ mod tests {
         let path = reserve_unique(&dir, "README").unwrap();
         assert_eq!(path, dir.join("README-2"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ファイルシステムを触らずに 1 件だけパースする。
+    fn parsed(raw: &str) -> Note {
+        parse(
+            Path::new("/vault"),
+            PathBuf::from("/vault/n.md"),
+            raw.to_string(),
+            SystemTime::UNIX_EPOCH,
+        )
+    }
+
+    /// タグの書き方の揺れを吸収すること。
+    ///
+    /// パーサは YAML ではなく手書きなので（frontmatter が浅いので過剰と判断した）、
+    /// **現場にある書き方を回帰テストで固定しないと静かに落ちる。** 落ちたときの症状は
+    /// どれも「書いたのに反映されない」で、エラーにはならない。
+    #[test]
+    fn tags_survive_the_ways_people_actually_write_them() {
+        let cases: &[(&str, &[&str])] = &[
+            ("tags: [a, b]", &["a", "b"]),
+            ("tags: [\"a\", \"b\"]", &["a", "b"]),
+            // 片方だけ剥がすと `'a'` という別のタグが残る。
+            ("tags: ['a', 'b']", &["a", "b"]),
+            // 括弧なし。YAML として合法で、実際に書かれる。
+            ("tags: rust", &["rust"]),
+            ("tags: rust, iced", &["rust", "iced"]),
+            // 行末コメント。
+            ("tags: [a, b]  # あとで整理", &["a", "b"]),
+            ("tags: rust  # あとで整理", &["rust"]),
+            // 値がコメントだけなら、YAML ではタグ無し。
+            ("tags:  # あとで書く", &[]),
+            ("tags: []", &[]),
+            // ブロック形式。インデントの有無は問わない。
+            ("tags:\n  - a\n  - b", &["a", "b"]),
+            ("tags:\n- a\n- b", &["a", "b"]),
+            // 途中の空行で終わらせない。
+            ("tags:\n  - a\n\n  - b", &["a", "b"]),
+            // 次のキーが来たらそこで終わる（本文の `- ` を拾わないための境界）。
+            ("tags:\n  - a\ntitle: メモ", &["a"]),
+            ("title: メモ", &[]),
+        ];
+
+        for (fm, want) in cases {
+            let got = tags(fm);
+            let got: Vec<&str> = got.iter().map(String::as_str).collect();
+            assert_eq!(got.as_slice(), *want, "frontmatter: {fm:?}");
+        }
+    }
+
+    /// CRLF のファイルでも frontmatter を読むこと。
+    ///
+    /// **ここを弾くと巻き添えが大きい。** タグだけでなく `title` も `summary` も落ち、
+    /// frontmatter がそのまま本文として画面に出る（`date:` の行がプレビューに出る）。
+    #[test]
+    fn crlf_frontmatter_is_not_read_as_body() {
+        let note = parsed("---\r\ntitle: \"メモ\"\r\ntags: [a, b]\r\nsummary: 要約\r\n---\r\n\r\n本文。\r\n");
+        assert_eq!(note.title, "メモ");
+        assert_eq!(note.tags, ["a", "b"]);
+        assert_eq!(note.preview, "要約");
+
+        // summary が無いときのプレビューは本文の先頭行。行末の `\r` が残らないこと。
+        let note = parsed("---\r\ntitle: A\r\n---\r\n\r\n本文の先頭。\r\n");
+        assert_eq!(note.preview, "本文の先頭。");
+    }
+
+    /// frontmatter が無いノートは今までどおり本文だけで解釈すること。
+    #[test]
+    fn notes_without_frontmatter_fall_back_to_the_heading() {
+        let note = parsed("# 見出し\n\n本文。\n");
+        assert_eq!(note.title, "見出し");
+        assert_eq!(note.preview, "本文。");
+        assert!(note.tags.is_empty());
+
+        // 見出しも無ければファイル名。
+        let note = parsed("ただの本文。\n");
+        assert_eq!(note.title, "n");
     }
 }
