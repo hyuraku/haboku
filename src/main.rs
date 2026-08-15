@@ -158,6 +158,9 @@ const SAVE_RETRY_MAX: Duration = Duration::from_secs(30);
 /// パレットの入力欄を名指しする ID。開いた瞬間にフォーカスを飛ばすのに要る。
 const PALETTE_INPUT_ID: &str = "palette-input";
 
+/// パレットの候補リストを名指しする ID。選択に合わせてスクロールさせるのに要る。
+const PALETTE_LIST_ID: &str = "palette-list";
+
 /// エディタを名指しする ID。`Cmd+N` の直後にフォーカスを飛ばすのに要る。
 const EDITOR_ID: &str = "editor";
 
@@ -1333,16 +1336,46 @@ fn handle_palette_key(
             if len > 0 {
                 palette.selected = (palette.selected + 1) % len;
             }
-            Task::none()
+            snap_palette_to_selected(palette.selected, len)
         }
         keyboard::Key::Character(c) if c == "p" && modifiers.control() => {
             if len > 0 {
                 palette.selected = (palette.selected + len - 1) % len;
             }
-            Task::none()
+            snap_palette_to_selected(palette.selected, len)
         }
         _ => Task::none(),
     }
+}
+
+/// 選択中の候補が見えるところまで、パレットの候補リストをスクロールさせる。
+///
+/// iced には「選択中の子へ自動スクロールする」仕組みが無い（`snap_to_end` は末尾固定）。
+/// `selected` を動かしてもスクロール位置は据え置かれるので、`update()` から明示的に
+/// 指示を返さないと**ハイライトだけが可視領域の外へ出ていく**（実際にそうなっていた）。
+///
+/// 絶対座標ではなく相対オフセット（先頭 0.0 / 末尾 1.0）で出す。行の高さも、
+/// リストの高さ（360px）が行数の整数倍かどうかも計算に要らず、
+/// 「末尾を選んだら必ず最下部」が定義から保証される。
+fn snap_palette_to_selected(selected: usize, len: usize) -> Task<Message> {
+    iced::widget::operation::snap_to(
+        iced::widget::Id::new(PALETTE_LIST_ID),
+        iced::widget::operation::RelativeOffset {
+            x: 0.0,
+            y: palette_scroll_offset(selected, len),
+        },
+    )
+}
+
+/// 選択位置を相対オフセット（先頭 0.0 / 末尾 1.0）に直す。
+///
+/// `Task` にすると中身を検査できないので、境界の出る計算だけ関数に分けてある。
+fn palette_scroll_offset(selected: usize, len: usize) -> f32 {
+    // 1 件以下なら割る相手がいない。スクロールする余地も無いので先頭で足りる。
+    if len <= 1 {
+        return 0.0;
+    }
+    selected as f32 / (len - 1) as f32
 }
 
 /// 初回セットアップ中の `update()`（ADR-0015）。**扱うのは 3 つだけで、残りは捨てる。**
@@ -1511,6 +1544,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 palette.matches = refilter(&app.notes, &query);
                 palette.selected = 0;
                 palette.query = query;
+                // 候補が総入れ替えになってもスクロール位置は据え置かれる。戻さないと
+                // 「選択は先頭なのに、その先頭が上に隠れている」逆の症状になる。
+                return snap_palette_to_selected(0, palette.matches.len());
             }
         }
         Message::PaletteClose => app.palette = None,
@@ -1721,6 +1757,18 @@ fn folder_pane(app: &App) -> Element<'_, Message> {
         .into()
 }
 
+/// frontmatter のタグを 1 行の文字列にする。
+///
+/// `#` を前置するのは、プレビューやフォルダ名と同じ霞色のままでも
+/// 「これはタグだ」と読み分けられるようにするため。琥珀は選択・一致文字の
+/// ためのアクセントなので、副次情報のタグには回さない（ADR-0009）。
+fn tag_label(tags: &[String]) -> String {
+    tags.iter()
+        .map(|t| format!("#{t}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn note_pane(app: &App) -> Element<'_, Message> {
     // 全件（約 1200 件）をそのまま並べる。仮想リストは要らないと spike で実測済み
     // （打鍵時の `view()` 構築 0.13ms）。無い機能を先回りで作らない。
@@ -1728,13 +1776,19 @@ fn note_pane(app: &App) -> Element<'_, Message> {
         let note = &app.notes[index];
         let selected = app.selected == Some(index);
         // タイトルは生成り、選択中だけ琥珀の明るい側へ。プレビューは常に霞。
-        let body = column![
+        let mut body = column![
             text(&note.title)
                 .size(13)
                 .color(if selected { KOHAKU_SOFT } else { KINARI }),
             text(&note.preview).size(10).color(KASUMI),
         ]
         .spacing(2);
+
+        // タグが無いノートには行そのものを足さない。約 1200 件のうち大半は
+        // タグを持たないので、空行を常設すると一覧の密度だけが落ちる。
+        if !note.tags.is_empty() {
+            body = body.push(text(tag_label(&note.tags)).size(10).color(KASUMI));
+        }
 
         button(body)
             .on_press(Message::NoteSelected(index))
@@ -1854,7 +1908,12 @@ fn highlighted_title(title: &str, ranges: &[std::ops::Range<usize>]) -> Element<
         spans.push(span(rest.to_string()));
     }
 
-    rich_text(spans).size(13).into()
+    // 折り返させない。長いタイトルで行の高さが候補ごとに変わると、
+    // 相対オフセットでの追従（`snap_palette_to_selected`）が前提を失う。
+    rich_text(spans)
+        .size(13)
+        .wrapping(iced::advanced::text::Wrapping::None)
+        .into()
 }
 
 /// 浮きパレット本体。iced にモーダル用の標準ウィジェットは無いので、
@@ -1874,10 +1933,21 @@ fn palette_overlay(app: &App, palette: &Palette) -> Element<'static, Message> {
             let note = &app.notes[*note_index];
             let is_selected = row == palette.selected;
 
+            // タグはフォルダ名と同じ行に併記する。行を足すとタグの有無で行の高さが
+            // 変わり、`snap_palette_to_selected` の相対オフセットが前提を失う。
+            let meta = if note.tags.is_empty() {
+                note.folder.clone()
+            } else {
+                format!("{} · {}", note.folder, tag_label(&note.tags))
+            };
+
             container(
                 iced::widget::column![
                     highlighted_title(&note.title, &m.ranges),
-                    text(note.folder.clone()).size(10).color(KASUMI),
+                    text(meta)
+                        .size(10)
+                        .color(KASUMI)
+                        .wrapping(iced::advanced::text::Wrapping::None),
                 ]
                 .spacing(1),
             )
@@ -1907,7 +1977,9 @@ fn palette_overlay(app: &App, palette: &Palette) -> Element<'static, Message> {
     let panel = container(
         column![
             header,
-            scrollable(column(rows).spacing(1)).height(Length::Fixed(360.0)),
+            scrollable(column(rows).spacing(1))
+                .id(iced::widget::Id::new(PALETTE_LIST_ID))
+                .height(Length::Fixed(360.0)),
             text(format!(
                 "{} 件中 上位 {} 件 / ctrl-n・ctrl-p で移動、enter で開く、esc・✕・背景クリックで閉じる",
                 app.notes.len(),
@@ -3337,6 +3409,35 @@ mod tests {
         let _ = handle_palette_key(&mut app, &key("p"), ctrl);
         assert_eq!(app.palette.as_ref().unwrap().selected, 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// frontmatter のタグが `#` 付きの 1 行になること。
+    ///
+    /// 一覧の行とパレットの行はどちらもこの文字列を出すので、
+    /// 「タグを設定しても画面に出ない」の回帰はここで止まる。
+    #[test]
+    fn tags_render_as_a_single_hashed_line() {
+        assert_eq!(
+            tag_label(&["rust".to_string(), "iced".to_string()]),
+            "#rust #iced"
+        );
+        assert_eq!(tag_label(&[]), "");
+    }
+
+    /// 選択位置が候補リストのスクロール位置に変換されること。
+    ///
+    /// ここが常に 0 だと、ハイライトだけが可視領域（360px ≒ 8 行）の外へ出て
+    /// 「選択は動いているのに画面では見えない」状態になる（実際にそうなっていた）。
+    #[test]
+    fn palette_scroll_offset_reaches_both_ends() {
+        assert_eq!(palette_scroll_offset(0, 50), 0.0);
+        // 末尾を選んだら最下部。相対で出すので 360px が行の高さの整数倍でなくても、
+        // 最後の 1 件が切れ残らない。
+        assert_eq!(palette_scroll_offset(49, 50), 1.0);
+        assert_eq!(palette_scroll_offset(24, 49), 0.5);
+        // 候補が 0 件・1 件でもゼロ除算しない。
+        assert_eq!(palette_scroll_offset(0, 0), 0.0);
+        assert_eq!(palette_scroll_offset(0, 1), 0.0);
     }
 
     /// Escape で閉じること（`Cmd+P` のトグルが使えないので、閉じ方はこちらに寄せている）。
