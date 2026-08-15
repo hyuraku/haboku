@@ -82,6 +82,52 @@ pub fn match_query(query: &str, target: &str) -> Option<Match> {
     Some(Match { score, ranges })
 }
 
+/// `query` が `target` に**連続して**現れる最初の位置（`target` 基準のバイト範囲）。
+///
+/// **`match_query` と違って飛び飛びは当たらない。** 本文は長いので、部分列一致だと
+/// 任意のクエリがほぼ必ず当たってフィルタにならない（21 万文字のノートは
+/// ほぼ全ての文字を含む）。「打った語がそのまま本文にある」という素直な意味にする。
+///
+/// 正規化の規則は `match_query` と共有する（どちらも `folded()` を通る）。
+///
+/// **空クエリは `None`。** `match_query` の「空は全部当たる」とはわざと非対称にした。
+/// こちらは「探した結果ここに当たった」を返す道具で、位置の無い当たりを表せない。
+/// 全件を出すのは呼び出し側の仕事。
+pub fn contains_query(query: &str, target: &str) -> Option<Range<usize>> {
+    let needle: Vec<char> = folded(query).map(|(_, c)| c).collect();
+    if needle.is_empty() {
+        return None;
+    }
+
+    // 開始位置を 1 単位ずつずらして、そこから連続で一致するかを見る。
+    // **再スライスの開始は常に畳んだ単位の境界**なので、濁点の合成ペア（ｶ+ﾞ）を割らない。
+    let mut cursor = 0usize;
+    while cursor < target.len() {
+        let mut rest = folded(&target[cursor..]);
+        let Some((head, first)) = rest.next() else {
+            break;
+        };
+        if first == needle[0] {
+            let mut matched = 1;
+            let mut end = cursor + head.end;
+            while matched < needle.len() {
+                match rest.next() {
+                    Some((range, c)) if c == needle[matched] => {
+                        matched += 1;
+                        end = cursor + range.end;
+                    }
+                    _ => break,
+                }
+            }
+            if matched == needle.len() {
+                return Some(cursor..end);
+            }
+        }
+        cursor += head.end;
+    }
+    None
+}
+
 /// 文字列を (バイト範囲, 正規化済み文字) の列として**その場で**返す。
 ///
 /// 半角カナの濁点・半濁点（ﾞ ﾟ）は直前の文字と合成する（ｶ+ﾞ → が）。
@@ -226,6 +272,52 @@ mod tests {
         assert!(match_query("ﾎﾞｰﾄ", "ボート競技").is_some());
         assert!(match_query("ぼーと", "ﾎﾞｰﾄの写真").is_some());
         assert!(match_query("ぱん", "ﾊﾟﾝの店").is_some());
+    }
+
+    /// **部分列は本文の一致にしない。** この設計の核。
+    ///
+    /// タイトルは飛び飛びで当ててよいが、本文で同じことをすると
+    /// 21 万文字のノートがほぼ全てのクエリに当たり、フィルタとして機能しない。
+    /// 方式を取り違えたら必ずここが落ちる。
+    #[test]
+    fn a_subsequence_is_not_a_body_match() {
+        assert!(match_query("bstnt", "Boostnote 終了の件").is_some());
+        assert!(contains_query("bstnt", "Boostnote 終了の件").is_none());
+    }
+
+    /// 連続一致は最初の出現を返し、その範囲が元の文字列を正しく切り出すこと。
+    #[test]
+    fn contains_query_returns_the_first_occurrence() {
+        let target = "iced の text_editor と iced の scrollable";
+        let range = contains_query("iced", target).unwrap();
+        assert_eq!(range, 0..4);
+        assert_eq!(target.get(range), Some("iced"));
+
+        let target = "前置き。ここに iced がある";
+        let range = contains_query("iced", target).unwrap();
+        assert_eq!(target.get(range.clone()), Some("iced"));
+        assert!(range.start > 0, "先頭以外の位置を返せていない");
+    }
+
+    /// 正規化の規則がタイトル側と同じであること。
+    #[test]
+    fn body_matching_normalizes_like_titles() {
+        // 全角クエリ → 半角本文、およびその逆。
+        assert!(contains_query("６０", "60 分で学ぶ").is_some());
+        assert!(contains_query("60", "６０分で学ぶ").is_some());
+        // カタカナ ⇄ ひらがな。
+        assert!(contains_query("ブースト", "ぶーすとの記録").is_some());
+        // 半角カナの濁点は 2 文字を 1 文字に畳み、範囲は 2 文字ぶんを覆う。
+        let range = contains_query("ぼ", "ﾎﾞｰﾄ").unwrap();
+        assert_eq!(range, 0..6);
+    }
+
+    /// 空クエリは当たらないこと（`match_query` とわざと非対称）。
+    #[test]
+    fn an_empty_query_does_not_match_a_body() {
+        assert!(contains_query("", "なんでも書いてある本文").is_none());
+        // タイトル側は逆に「全部当たる」。この非対称は意図したもの。
+        assert!(match_query("", "なんでも書いてある本文").is_some());
     }
 
     /// 畳み込みの結果を (バイト範囲, 正規化後の文字) の列として固定する。
