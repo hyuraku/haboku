@@ -82,25 +82,47 @@ pub fn match_query(query: &str, target: &str) -> Option<Match> {
     Some(Match { score, ranges })
 }
 
-/// 文字列を (バイト範囲, 正規化済み文字) の列に畳む。
+/// 文字列を (バイト範囲, 正規化済み文字) の列として**その場で**返す。
 ///
 /// 半角カナの濁点・半濁点（ﾞ ﾟ）は直前の文字と合成する（ｶ+ﾞ → が）。
 /// 合成できたときは範囲が元の 2 文字分に広がるので、ハイライトも自然に繋がる。
-fn fold(s: &str) -> Vec<(Range<usize>, char)> {
-    let mut out: Vec<(Range<usize>, char)> = Vec::new();
-    for (i, c) in s.char_indices() {
-        let end = i + c.len_utf8();
-        if matches!(c, '\u{FF9E}' | '\u{FF9F}')
-            && let Some(last) = out.last_mut()
-            && let Some(voiced) = voice(last.1, c == '\u{FF9F}')
-        {
-            last.0.end = end;
-            last.1 = voiced;
-            continue;
-        }
-        out.push((i..end, lower(c)));
+///
+/// **正規化の規則はここが唯一の実装。** `fold()` はこれを集めただけで、
+/// 本文検索（`contains_query`）はこれを直接回して確保をゼロにする。
+/// 規則が 2 か所に分かれると、タイトルと本文で当たり方がずれる。
+fn folded(s: &str) -> Folded<'_> {
+    Folded {
+        inner: s.char_indices().peekable(),
     }
-    out
+}
+
+struct Folded<'a> {
+    inner: std::iter::Peekable<std::str::CharIndices<'a>>,
+}
+
+impl Iterator for Folded<'_> {
+    type Item = (Range<usize>, char);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (i, c) = self.inner.next()?;
+        let mut range = i..i + c.len_utf8();
+        let mut ch = lower(c);
+        // 濁点は**次に**来るので先読みする。畳めたぶん範囲の end だけ伸ばす。
+        if let Some(&(j, mark)) = self.inner.peek()
+            && matches!(mark, '\u{FF9E}' | '\u{FF9F}')
+            && let Some(voiced) = voice(ch, mark == '\u{FF9F}')
+        {
+            range.end = j + mark.len_utf8();
+            ch = voiced;
+            self.inner.next();
+        }
+        Some((range, ch))
+    }
+}
+
+/// `folded()` を集めたもの。位置で引きたい `match_query` はこちらを使う。
+fn fold(s: &str) -> Vec<(Range<usize>, char)> {
+    folded(s).collect()
 }
 
 /// ひらがな1文字に濁点（semi=false）/ 半濁点（semi=true）を付ける。付かない文字は None。
@@ -204,6 +226,24 @@ mod tests {
         assert!(match_query("ﾎﾞｰﾄ", "ボート競技").is_some());
         assert!(match_query("ぼーと", "ﾎﾞｰﾄの写真").is_some());
         assert!(match_query("ぱん", "ﾊﾟﾝの店").is_some());
+    }
+
+    /// 畳み込みの結果を (バイト範囲, 正規化後の文字) の列として固定する。
+    ///
+    /// **正規化の規則はここが唯一の実装で、タイトル検索も本文検索もここを通る。**
+    /// リファクタで静かにずれると、両方の当たり方が同時に変わる。
+    #[test]
+    fn folding_keeps_byte_ranges_aligned() {
+        let got: Vec<_> = folded("ﾊﾟnＡあ").collect();
+        assert_eq!(
+            got,
+            vec![
+                (0..6, 'ぱ'),  // ﾊ(3) + ﾟ(3) を 1 文字に畳み、範囲は 2 文字ぶん
+                (6..7, 'n'),
+                (7..10, 'a'), // 全角 Ａ → 半角 a
+                (10..13, 'あ'),
+            ]
+        );
     }
 
     /// 濁点合成のハイライト範囲は半角カナ2文字分をひとつながりで覆うこと。
