@@ -3428,6 +3428,140 @@ mod tests {
         );
     }
 
+    /// 打鍵 1 回ぶんの `refilter` を測って**平均**（ms）を返す。
+    ///
+    /// 予算を平均で見るのは、これが打鍵のたびに走るものだから。体感を決めるのは
+    /// 連続した打鍵の均しであって、他プロセスやサーマルの影響を拾った 1 回ではない。
+    /// 最悪値は記録として出すだけで、判定には使わない。
+    fn measure_refilter(notes: &[vault::Note], label: &str, query: &str) -> f64 {
+        const RUNS: usize = 20;
+        // 1 回捨てる。初回はページフォルトとキャッシュミスを含み、
+        // 「打鍵のたびに走る」という実態を表さない。
+        drop(refilter(notes, query));
+
+        let mut worst = 0.0_f64;
+        let mut total = 0.0_f64;
+        let mut hits = 0;
+        for _ in 0..RUNS {
+            let t0 = Instant::now();
+            let result = refilter(notes, query);
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            hits = result.len();
+            drop(result);
+            worst = worst.max(ms);
+            total += ms;
+        }
+        let avg = total / RUNS as f64;
+        println!("  {label}: 平均 {avg:.3}ms / 最悪 {worst:.3}ms（{hits} 件）");
+        avg
+    }
+
+    /// 実データの分布に寄せた合成 vault。**乱数は使わない**（数字が揺れると比較できない）。
+    fn synthetic_notes(count: usize) -> Vec<vault::Note> {
+        // 実データの vault は日本語主体で、コードブロックが混じる。
+        let paragraphs = [
+            "iced の text_editor は Content を持ち、view() では borrow するだけで済む。",
+            "保存は fsync してからアトミックに rename する。途中で落ちても壊れたファイルは残らない。",
+            "```rust\nfn main() {\n    println!(\"hello\");\n}\n```",
+            "frontmatter の tags は [a, b] とブロック形式の両方が現場に存在している。",
+            "パレットの候補リストにはスクロール追従が要る。選択だけ動いても画面は動かない。",
+        ];
+
+        let mut notes: Vec<vault::Note> = (0..count)
+            .map(|i| {
+                let mut body = format!("---\ntitle: \"メモ {i}\"\ntags: [rust, iced]\n---\n\n");
+                // 1 件あたり約 3KB。並べ方をノートごとにずらして同一内容を避ける。
+                for n in 0..24 {
+                    body.push_str(paragraphs[(i + n) % paragraphs.len()]);
+                    body.push_str("\n\n");
+                }
+                note_with(&format!("メモ {i}"), &body)
+            })
+            .collect();
+
+        // 実データの最大ノートに合わせて 1 件だけ極端に大きくする
+        // （212,564 文字 = docs/implementation-notes.md の実測値）。
+        let unit = paragraphs.join("\n\n");
+        let reps = 212_564 / unit.chars().count() + 1;
+        notes[0] = note_with("大きいノート", &unit.repeat(reps));
+
+        // 1 件にだけ当たる語。「絞り込めているのに速い」ことを確かめるため。
+        notes[count / 2].raw.push_str("\n特異な合言葉ヰヱヲン\n");
+        notes
+    }
+
+    /// **打鍵 1 回の `refilter` が予算内に収まること。** 予算は最悪 8ms（spec）。
+    ///
+    /// 約 1200 件級の実データ vault が手元に無くても回せるよう、コーパスを合成する。
+    /// ディスクには何も書かない。
+    ///
+    /// 実行: `cargo test --release -- --ignored --nocapture`
+    /// **必ず --release で。** debug の数字は判断材料にならない。
+    #[test]
+    #[ignore = "時間を測るテスト。--release で --ignored 指定のときだけ走らせる"]
+    fn measure_refilter_with_synthetic_vault() {
+        let notes = synthetic_notes(1200);
+        let bytes: usize = notes.iter().map(|n| n.raw.len()).sum();
+        println!(
+            "合成 vault: {} 件 / 本文 {:.1}MB（最大 {} 文字）",
+            notes.len(),
+            bytes as f64 / 1_048_576.0,
+            notes[0].raw.chars().count()
+        );
+
+        let mut slowest = 0.0_f64;
+        // 空クエリと 1 文字は本文を読まない経路。ここが遅いと全部が遅い。
+        slowest = slowest.max(measure_refilter(&notes, "空クエリ          ", ""));
+        slowest = slowest.max(measure_refilter(&notes, "1 文字            ", "い"));
+        // 大量に当たるクエリ。早期打ち切りが効くので速いはず。
+        slowest = slowest.max(measure_refilter(&notes, "大量に当たる      ", "iced"));
+        // 1 件だけに当たる。全件走査するが結果は絞れている。
+        slowest = slowest.max(measure_refilter(&notes, "1 件だけに当たる  ", "合言葉ヰヱヲン"));
+        // **最悪ケース: どこにも当たらないクエリ。** 打鍵途中の未完成語がこれになる。
+        slowest = slowest.max(measure_refilter(&notes, "どこにも当たらない", "ｑｚｘ在存"));
+
+        // 実使用の形。1 文字ずつ伸ばしていく。
+        println!("  --- 打鍵列 ---");
+        for len in 1..="scrollable".len() {
+            let query = &"scrollable"[..len];
+            slowest = slowest.max(measure_refilter(&notes, &format!("  {query:<12}"), query));
+        }
+
+        assert!(
+            slowest < 8.0,
+            "refilter の平均が予算 8ms を超えた: {slowest:.3}ms"
+        );
+    }
+
+    /// 同じ計測を実データで。合成コーパスの数字を答え合わせするためのもの。
+    ///
+    /// 実行: `VAULT="$HOME/..." cargo test --release -- --ignored --nocapture`
+    #[test]
+    #[ignore = "実データの vault が要る。VAULT を指定して --ignored で走らせる"]
+    fn measure_refilter_with_real_vault() {
+        let root = match resolve_vault(std::env::var("VAULT").ok(), None, PathBuf::new()) {
+            VaultChoice::Ready(root) => root,
+            other => panic!("VAULT に実データの vault を指定して実行する: {other:?}"),
+        };
+        let notes = vault::load_dir(&root).notes;
+        let bytes: usize = notes.iter().map(|n| n.raw.len()).sum();
+        println!(
+            "vault: {} 件 / 本文 {:.1}MB",
+            notes.len(),
+            bytes as f64 / 1_048_576.0
+        );
+
+        let mut slowest = 0.0_f64;
+        slowest = slowest.max(measure_refilter(&notes, "空クエリ          ", ""));
+        slowest = slowest.max(measure_refilter(&notes, "どこにも当たらない", "ｑｚｘ在存"));
+        slowest = slowest.max(measure_refilter(&notes, "よくある語        ", "した"));
+
+        assert!(
+            slowest < 8.0,
+            "refilter の平均が予算 8ms を超えた: {slowest:.3}ms"
+        );
+    }
+
     /// `refilter` だけを見たいので、ファイルシステムを触らずに Note を組み立てる。
     /// `app_with_folders` は本文を固定で作るため、本文検索の確認には使えない。
     fn note_with(title: &str, body: &str) -> vault::Note {

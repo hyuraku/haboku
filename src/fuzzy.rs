@@ -99,31 +99,29 @@ pub fn contains_query(query: &str, target: &str) -> Option<Range<usize>> {
         return None;
     }
 
-    // 開始位置を 1 単位ずつずらして、そこから連続で一致するかを見る。
-    // **再スライスの開始は常に畳んだ単位の境界**なので、濁点の合成ペア（ｶ+ﾞ）を割らない。
-    let mut cursor = 0usize;
-    while cursor < target.len() {
-        let mut rest = folded(&target[cursor..]);
-        let Some((head, first)) = rest.next() else {
-            break;
-        };
-        if first == needle[0] {
-            let mut matched = 1;
-            let mut end = cursor + head.end;
-            while matched < needle.len() {
-                match rest.next() {
-                    Some((range, c)) if c == needle[matched] => {
-                        matched += 1;
-                        end = cursor + range.end;
-                    }
-                    _ => break,
+    // **対象は 1 パスしかなめない。** 先頭文字が当たった位置でだけ、イテレータを
+    // 複製して残りを確かめる。位置ごとにスライスを切り直すと、1 文字進むたびに
+    // イテレータの作り直しが乗り、打鍵あたり数ミリ秒の差になる（実測）。
+    let mut outer = folded(target);
+    while let Some((head, first)) = outer.next() {
+        if first != needle[0] {
+            continue;
+        }
+        let mut rest = outer.clone();
+        let mut end = head.end;
+        let mut matched = 1;
+        while matched < needle.len() {
+            match rest.next() {
+                Some((range, c)) if c == needle[matched] => {
+                    matched += 1;
+                    end = range.end;
                 }
-            }
-            if matched == needle.len() {
-                return Some(cursor..end);
+                _ => break,
             }
         }
-        cursor += head.end;
+        if matched == needle.len() {
+            return Some(head.start..end);
+        }
     }
     None
 }
@@ -188,12 +186,17 @@ pub fn snippet(raw: &str, hit: Range<usize>) -> (String, Range<usize>) {
 /// 規則が 2 か所に分かれると、タイトルと本文で当たり方がずれる。
 fn folded(s: &str) -> Folded<'_> {
     Folded {
-        inner: s.char_indices().peekable(),
+        inner: s.char_indices(),
     }
 }
 
+/// `Clone` するのは `contains_query` が「この位置から先を試す」を巻き戻さずにやるため。
+///
+/// `Peekable` ではなく生の `CharIndices` を持つ。先読みは濁点のときにしか要らず、
+/// `CharIndices` の複製はスライスとオフセットの複写で済む。
+#[derive(Clone)]
 struct Folded<'a> {
-    inner: std::iter::Peekable<std::str::CharIndices<'a>>,
+    inner: std::str::CharIndices<'a>,
 }
 
 impl Iterator for Folded<'_> {
@@ -204,13 +207,19 @@ impl Iterator for Folded<'_> {
         let mut range = i..i + c.len_utf8();
         let mut ch = lower(c);
         // 濁点は**次に**来るので先読みする。畳めたぶん範囲の end だけ伸ばす。
-        if let Some(&(j, mark)) = self.inner.peek()
-            && matches!(mark, '\u{FF9E}' | '\u{FF9F}')
-            && let Some(voiced) = voice(ch, mark == '\u{FF9F}')
-        {
-            range.end = j + mark.len_utf8();
-            ch = voiced;
-            self.inner.next();
+        //
+        // **先読みするのは濁点が付きうる文字だけ。** `peek()` は Peekable の内部状態を
+        // 触るので、全文字で呼ぶと本文走査（1 打鍵で数百万文字）に効いてくる。
+        if can_voice(ch) {
+            let mut ahead = self.inner.clone();
+            if let Some((j, mark)) = ahead.next()
+                && matches!(mark, '\u{FF9E}' | '\u{FF9F}')
+                && let Some(voiced) = voice(ch, mark == '\u{FF9F}')
+            {
+                range.end = j + mark.len_utf8();
+                ch = voiced;
+                self.inner = ahead;
+            }
         }
         Some((range, ch))
     }
@@ -219,6 +228,13 @@ impl Iterator for Folded<'_> {
 /// `folded()` を集めたもの。位置で引きたい `match_query` はこちらを使う。
 fn fold(s: &str) -> Vec<(Range<usize>, char)> {
     folded(s).collect()
+}
+
+/// 濁点・半濁点が付きうる文字か。**先読みするかどうかの足切りにだけ使う。**
+/// `voice()` が `Some` を返す範囲を覆っていればよく、濁音自体を含んでも害はない
+/// （その場合は `voice()` が `None` を返して合成されない）。
+fn can_voice(c: char) -> bool {
+    matches!(c, '\u{3046}' | '\u{304B}'..='\u{3068}' | '\u{306F}'..='\u{307B}')
 }
 
 /// ひらがな1文字に濁点（semi=false）/ 半濁点（semi=true）を付ける。付かない文字は None。
@@ -255,6 +271,12 @@ const HALFWIDTH_KANA: [char; 56] = [
 /// カタカナ⇄ひらがな・半角カナも、IME の状態や書いた時の気分で揺れるだけで
 /// 検索する人にとっては同じ文字。全部ひらがなに畳んで比較する。
 fn lower(c: char) -> char {
+    // **ASCII は Unicode テーブルを引かない。** `to_lowercase()` は多対一の写像を
+    // 扱えるぶん重く、本文走査（1 打鍵で数百万文字）ではこれが支配項になる。
+    // ASCII の範囲では `to_ascii_lowercase()` と結果が完全に一致する。
+    if c.is_ascii() {
+        return c.to_ascii_lowercase();
+    }
     let c = match c {
         // 全角 ASCII（！..～ = U+FF01..U+FF5E）は 0xFEE0 引くと半角 ASCII になる。
         '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
@@ -266,6 +288,11 @@ fn lower(c: char) -> char {
         '\u{FF66}'..='\u{FF9D}' => HALFWIDTH_KANA[(c as u32 - 0xFF66) as usize],
         other => other,
     };
+    // かな・漢字には大文字小文字の対応が存在しない。実データは日本語が主体なので、
+    // ここで抜けるとテーブル参照がほぼ消える。
+    if matches!(c, '\u{3040}'..='\u{30FF}' | '\u{4E00}'..='\u{9FFF}') {
+        return c;
+    }
     c.to_lowercase().next().unwrap_or(c)
 }
 
