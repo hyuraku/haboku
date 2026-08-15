@@ -9,12 +9,16 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// サブフォルダに属さない（vault ルート直下に置かれた）ノートのフォルダ名。
+pub const ROOT_FOLDER: &str = "/";
+
 #[derive(Debug, Clone)]
 pub struct Note {
     pub path: PathBuf,
     pub title: String,
     pub tags: Vec<String>,
     /// vault ルート直下のディレクトリ名（`sources` / `topics` など）。
+    /// 直下に置かれたノートは [`ROOT_FOLDER`]。
     /// 実データは tags をほぼ持たず、分類はフォルダが担っていた。
     pub folder: String,
     /// 一覧に出す1行。frontmatter の `summary` があればそれ、無ければ本文の先頭行。
@@ -358,7 +362,7 @@ fn parse(root: &Path, path: PathBuf, raw: String, modified: SystemTime) -> Note 
         .and_then(|rel| rel.parent())
         .and_then(|p| p.components().next())
         .map(|c| c.as_os_str().to_string_lossy().to_string())
-        .unwrap_or_else(|| "/".to_string());
+        .unwrap_or_else(|| ROOT_FOLDER.to_string());
 
     // プレビューは frontmatter の summary を最優先。これが無い雑メモは本文の先頭行。
     // raw から取ると frontmatter の `date: "..."` を拾ってしまう（実際に拾っていた）。

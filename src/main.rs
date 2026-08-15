@@ -494,6 +494,10 @@ const HEADING_FONT: Font = Font {
 };
 
 /// フォルダごとの件数を数えて多い順に並べる。
+///
+/// **サブフォルダが 1 つも無い vault では `/` の行を出さない。** ルート直下しか無ければ
+/// `/` の件数は「すべて」と必ず一致し、選んでも絞り込みが起きない行になる。
+/// フォルダを作る導線がアプリに無い（Finder の仕事）ので、この状態はしばらく続く。
 fn count_folders(notes: &[vault::Note]) -> Vec<(String, usize)> {
     let mut counts: HashMap<&str, usize> = HashMap::new();
     for note in notes {
@@ -504,6 +508,9 @@ fn count_folders(notes: &[vault::Note]) -> Vec<(String, usize)> {
         .map(|(name, count)| (name.to_string(), count))
         .collect();
     out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    if out.len() == 1 && out[0].0 == vault::ROOT_FOLDER {
+        return Vec::new();
+    }
     out
 }
 
@@ -3212,6 +3219,30 @@ mod tests {
         assert!(app.palette.is_none(), "Enter でパレットから開けていない");
         let after: Vec<_> = app.notes.iter().map(|n| n.path.clone()).collect();
         assert_eq!(after, before, "パレットからの選択でリネームが走った");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// サブフォルダが無い vault では `/` の行を出さないこと。
+    ///
+    /// 出すと「すべて」と必ず同じ件数の行が隣に並び、しかも選んでも絞り込みが起きない。
+    /// サブフォルダが 1 つでもあれば `/` は「直下だけ見る」という意味を持つので出す。
+    #[test]
+    fn the_root_row_is_hidden_until_a_subfolder_exists() {
+        let (dir, app) = app_with_folders("root-only", &[("", "あ"), ("", "い")]);
+        assert_eq!(app.notes.len(), 2);
+        assert!(
+            app.folders.is_empty(),
+            "ルート直下だけなのに行が出ている: {:?}",
+            app.folders
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (dir, app) = app_with_folders("root-and-sub", &[("", "あ"), ("topics", "い")]);
+        let names: Vec<&str> = app.folders.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&vault::ROOT_FOLDER) && names.contains(&"topics"),
+            "サブフォルダがあるときは / も出す: {names:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
