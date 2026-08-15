@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use iced::keyboard;
 use iced::widget::{
-    button, column, container, mouse_area, rich_text, row, scrollable, span, stack, text,
-    text_editor, text_input,
+    button, column, container, markdown, mouse_area, rich_text, row, scrollable, span, stack,
+    text, text_editor, text_input,
 };
 use iced::{Color, Element, Fill, Font, Length, Subscription, Task};
 
@@ -252,6 +252,13 @@ struct App {
     /// リネーム入力中の名前（`Cmd+R`）。開いていないときは `None`。
     /// パレットとは同時に開かない（開くときに互いを畳む）。
     rename: Option<String>,
+    /// 読み取り専用プレビュー（`Cmd+Shift+V`。ADR-0019）。`None` は編集モード。
+    ///
+    /// **パース済みの結果を持つ。** `view()` でパースすると打鍵・フレームのたびに全文パースが
+    /// 走る（Done の定義: `view()` 構築 1ms 未満）。作り直すのはトグルで開いた瞬間と、
+    /// 本文が差し替わる瞬間（`replace_content`）だけ。プレビュー中はエディタが view に
+    /// 無いので編集は起こらず、この 2 点だけで表示と本文はズレない。
+    preview: Option<markdown::Content>,
     /// いま押されている修飾キー。**`text_input` への混入を弾くためだけに持つ**（ADR-0010）。
     ///
     /// `text_editor` は `key_binding` で塞げるが、`text_input` に同じ差し込み口は無い。
@@ -411,6 +418,10 @@ enum Message {
     PaletteQueryChanged(String),
     /// パレットを閉じる。✕ ボタンと背景クリックから飛ぶ。
     PaletteClose,
+    /// `Cmd+Shift+V`。エディタと読み取り専用プレビューを行き来する（ADR-0019）。
+    TogglePreview,
+    /// プレビュー内のリンククリック。既定ブラウザで開く。
+    LinkClicked(markdown::Uri),
     /// ノートを新規作成する（`Cmd+N`）。
     NewNote,
     /// リネームを開始する（`Cmd+R`）。入力欄に現在のファイル名を入れて開く。
@@ -607,6 +618,7 @@ fn boot(root: PathBuf, load: vault::Load, load_ms: f64) -> App {
         content: text_editor::Content::with_text(WELCOME),
         palette: None,
         rename: None,
+        preview: None,
         modifiers: keyboard::Modifiers::empty(),
         dirty: false,
         dirty_since: None,
@@ -991,6 +1003,12 @@ fn restore(app: &mut App, snapshot: Snapshot) {
 /// この関数 1 つに絞ってあるのは、その漏れを構造で防ぐため（ADR-0017）。
 fn replace_content(app: &mut App, text: &str) {
     app.content = text_editor::Content::with_text(text);
+    // プレビュー中のノート切替はプレビューのまま読み続ける（ADR-0019）。表示は常に
+    // 本文の写しなので、差し替えたらここで一緒に作り直す。ここは `selected` が動く
+    // 全経路（一覧クリック・パレット・新規作成・削除）の合流点で、畳み忘れが起きない。
+    if app.preview.is_some() {
+        app.preview = Some(markdown::Content::parse(text));
+    }
     app.undo.clear();
     app.redo.clear();
     app.edit_group = None;
@@ -1628,6 +1646,22 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::PaletteClose => app.palette = None,
+        Message::TogglePreview => {
+            // 出入りは表示の切り替えだけ。**編集ではない**ので dirty には触らない
+            // （無編集の切替でディスクに書かない、と同じ規律）。
+            app.preview = if app.preview.is_some() {
+                None
+            } else {
+                Some(markdown::Content::parse(&app.content.text()))
+            };
+        }
+        Message::LinkClicked(url) => {
+            // macOS 専用アプリなので `open` を直接叩く（新しい依存を増やさない）。
+            // 失敗は握りつぶさない。`.app` では stderr が誰にも見えない（ADR-0015 と同じ理由）。
+            if let Err(e) = std::process::Command::new("/usr/bin/open").arg(&url).spawn() {
+                app.error = Some(format!("リンクを開けません: {e}"));
+            }
+        }
         Message::NewNote => {
             // 作成もエディタを上書きする操作なので、切替と同じ保存ガードを通す。
             return begin_save(app, Some(PendingAction::NewNote), None);
@@ -1718,15 +1752,37 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 return update(app, Message::NewNote);
             }
 
+            // `Cmd+Shift+V` でエディタとプレビューを行き来する（ADR-0019）。
+            //
+            // **ここのトグルは成立する。** ADR-0004 で `Cmd+P` のトグルを諦めたのは、
+            // 消費できないイベントがフォーカス中の入力欄へ文字として混入するため。
+            // プレビュー中はエディタ自体が view に無く、再押下が漏れる先が無い。
+            // 開く方向も混入しない: `text_editor` への ⌘ 付き Insert は
+            // `editor_key_binding` が捨てる（ADR-0010）。
+            //
+            // パレット・リネームが開いている間は効かせない。そこへ打っているときに
+            // **見えていない画面**を切り替えない（`Cmd+Z` を塞いだのと同じ理由）。
+            if modifiers.command()
+                && modifiers.shift()
+                && matches!(&key, keyboard::Key::Character(c) if c == "v")
+                && app.palette.is_none()
+                && app.rename.is_none()
+            {
+                return update(app, Message::TogglePreview);
+            }
+
             // `Cmd+Z` で元に戻す、`Cmd+Shift+Z` でやり直す（ADR-0017）。
             //
             // **パレット・リネーム欄が開いている間は効かせない。** そこへ打っているときの
             // ⌘Z は「見ていない本文を書き換える」操作になる（Control 系をフォーカスで
             // 塞いだのと同じ理由。ADR-0016）。
+            // プレビュー中も効かせない。undo は**見えていない本文**を書き換える操作になる
+            // （ADR-0019。表示は編集に戻ってから戻す）。
             if modifiers.command()
                 && matches!(&key, keyboard::Key::Character(c) if c == "z")
                 && app.palette.is_none()
                 && app.rename.is_none()
+                && app.preview.is_none()
             {
                 let message = if modifiers.shift() {
                     Message::Redo
@@ -1757,6 +1813,17 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     }
                     _ => {}
                 }
+            }
+
+            // プレビュー中の Escape は編集へ戻る。「一時的に被さったものは Escape で畳む」
+            // の一貫（ADR-0004 / ADR-0019）。パレットが上に開いているときはそちらが先
+            // （`handle_palette_key` が拾う）。リネームの Escape は上の分岐が先に返している。
+            if app.preview.is_some()
+                && app.palette.is_none()
+                && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape))
+            {
+                app.preview = None;
+                return Task::none();
             }
 
             return handle_palette_key(app, &key, modifiers);
@@ -1943,6 +2010,9 @@ fn macos_control_binding(key: &keyboard::Key) -> Option<text_editor::Binding<Mes
 }
 
 fn editor_pane(app: &App) -> Element<'_, Message> {
+    if let Some(preview) = &app.preview {
+        return preview_pane(preview);
+    }
     text_editor(&app.content)
         .id(iced::widget::Id::new(EDITOR_ID))
         .on_action(Message::Edit)
@@ -1955,6 +2025,51 @@ fn editor_pane(app: &App) -> Element<'_, Message> {
         .style(editor_style)
         .height(Fill)
         .into()
+}
+
+/// 読み取り専用プレビュー（`Cmd+Shift+V`。ADR-0019）。エディタと同じ面（淡墨）に描く。
+///
+/// パース済みの [`markdown::Content`] を並べるだけで、ここでは何も計算しない
+/// （パースは `TogglePreview` と `replace_content` がやる）。
+fn preview_pane(preview: &markdown::Content) -> Element<'_, Message> {
+    // 戻り方は常時表示する（パレットの「esc・✕・背景クリックで閉じる」と同じ流儀。ADR-0004）。
+    let hint = text("プレビュー ─ esc / ⌘⇧V で編集に戻る").size(10).color(KASUMI);
+
+    let body = markdown::view(preview.items(), preview_settings()).map(Message::LinkClicked);
+
+    container(column![hint, scrollable(body).height(Fill).width(Fill)].spacing(8))
+        .style(|_theme: &iced::Theme| container::Style {
+            background: Some(TANBOKU.into()),
+            ..container::Style::default()
+        })
+        .padding(12)
+        .height(Fill)
+        .width(Fill)
+        .into()
+}
+
+/// プレビューの意匠。幽玄の面に合わせ、既定から動かすのは次の 3 点:
+///
+/// - **書体は本文もコードも `EDITOR_FONT` を名指しする。** コードの既定
+///   `Font::MONOSPACE` は cosmic-text が漢字に GB18030 Bitmap を選んで**漢字だけ消える**
+///   （ADR-0003 / ADR-0013 の罠）。本文も `Font::DEFAULT` のままだと**イタリック span の
+///   漢字が豆腐になる**（`*斜体*` の 2 文字が横縞グリフに化けるのを実測）。CJK に
+///   italic face は無く、名指しのファミリなら立体のまま描かれて文字は消えない
+/// - 色は幽玄の値に置き換える（既定は白文字 + `#111111` の地で、淡墨の面では浮く。
+///   リンクは琥珀 = 「押せる」合図の色に寄せる。ADR-0009）
+fn preview_settings() -> markdown::Settings {
+    markdown::Settings::with_style(markdown::Style {
+        font: EDITOR_FONT,
+        inline_code_highlight: markdown::Highlight {
+            background: KOBOKU.into(),
+            border: iced::border::rounded(4),
+        },
+        inline_code_padding: iced::padding::left(2).right(2),
+        inline_code_color: KOHAKU_SOFT,
+        inline_code_font: EDITOR_FONT,
+        code_block_font: EDITOR_FONT,
+        link_color: KOHAKU,
+    })
 }
 
 /// マッチした文字だけ色を変えた span を作る。タイトル行と本文の抜粋行で共有する。
@@ -4512,5 +4627,93 @@ mod tests {
         let task = update(&mut app, Message::CloseRequested(iced::window::Id::unique()));
 
         assert_ne!(task.units(), 0, "閉じる要求が無視されている");
+    }
+
+    // ── プレビュー（ADR-0019）───────────────────────────────
+
+    /// `Cmd+Shift+V` でプレビューに入り、再押下で編集へ戻る。Escape でも戻る。
+    ///
+    /// ADR-0004 のトグル不成立は「フォーカス中の入力欄への混入」が理由だった。
+    /// プレビュー中はエディタが view に無く漏れる先が無いので、ここはトグルでよい。
+    #[test]
+    fn preview_toggles_with_cmd_shift_v_and_escape() {
+        let (dir, mut app) = app_with_vault("preview-toggle");
+        send(&mut app, Message::NoteSelected(0));
+        let cmd_shift = keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT;
+
+        send(&mut app, pressed(key("v"), cmd_shift));
+        assert!(app.preview.is_some(), "Cmd+Shift+V でプレビューに入っていない");
+
+        send(&mut app, pressed(key("v"), cmd_shift));
+        assert!(app.preview.is_none(), "再押下で編集へ戻っていない");
+
+        send(&mut app, pressed(key("v"), cmd_shift));
+        send(&mut app, pressed(named(keyboard::key::Named::Escape), keyboard::Modifiers::empty()));
+        assert!(app.preview.is_none(), "Escape で編集へ戻っていない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **プレビューの出入りは編集ではないこと。** dirty が立つと、無編集のノート切替で
+    /// ディスクに書く（mtime が動く）ようになり、Done の定義に反する。
+    #[test]
+    fn toggling_preview_does_not_mark_dirty() {
+        let (dir, mut app) = app_with_vault("preview-clean");
+        send(&mut app, Message::NoteSelected(0));
+        let cmd_shift = keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT;
+
+        send(&mut app, pressed(key("v"), cmd_shift));
+        send(&mut app, pressed(key("v"), cmd_shift));
+
+        assert!(!app.dirty, "表示を切り替えただけで dirty が立った");
+        assert_eq!(app.saves, 0, "表示を切り替えただけでディスクに書いた");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **プレビュー中にノートを切り替えたら、プレビューのまま新しい本文になること。**
+    ///
+    /// 表示だけ古いままだと「開いたのに前のノートが見えている」となり、読み歩きが成立しない。
+    #[test]
+    fn preview_follows_note_switch() {
+        let dir = std::env::temp_dir()
+            .join(format!("haboku-app-test-{}-preview-switch", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 段落数を変えて、パース結果の項目数で「どちらの本文か」を見分けられるようにする。
+        std::fs::write(dir.join("a.md"), "# 一段落\n").unwrap();
+        std::fs::write(dir.join("b.md"), "# 見出し\n\n本文。\n\n- 箇条書き\n").unwrap();
+        let mut app = boot(dir.clone(), vault::load_dir(&dir), 0.0);
+
+        send(&mut app, Message::NoteSelected(1));
+        send(
+            &mut app,
+            pressed(key("v"), keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT),
+        );
+        let before = app.preview.as_ref().unwrap().items().len();
+
+        send(&mut app, Message::NoteSelected(0));
+
+        assert_eq!(app.selected, Some(0), "前提: 切替が起きていない");
+        let after = app.preview.as_ref().expect("切替でプレビューが畳まれた").items().len();
+        assert_ne!(before, after, "プレビューが前のノートの本文のまま");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **プレビュー中の `Cmd+Z` は効かないこと。** 効くと「見えていない本文」を
+    /// 書き換え、自動保存がそれをディスクまで届ける（パレット中の ⌘Z と同じ穴）。
+    #[test]
+    fn undo_is_inert_while_previewing() {
+        let (dir, mut app) = app_with_vault("preview-undo");
+        send(&mut app, Message::NoteSelected(0));
+        type_text(&mut app, "X");
+        let typed = app.content.text();
+
+        send(
+            &mut app,
+            pressed(key("v"), keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT),
+        );
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), typed, "プレビュー中の ⌘Z が本文を書き換えた");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

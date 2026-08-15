@@ -11,8 +11,10 @@ publish = false
 #   advanced    … text_input / editor の低レベル API に触るため
 #   tokio       … `iced::time::every` は iced_futures のランタイム backend 越しに生える。
 #                 tokio か smol を選ぶまで `time::every` はそもそも名前解決に失敗する（自動保存のデバウンスに要る）
+#   markdown    … `Cmd+Shift+V` の読み取り専用プレビュー（ADR-0019）。
+#                 増える依存は pulldown-cmark だけで、描画は iced 標準の widget に任せる
 [dependencies]
-iced = { version = "0.14", features = ["highlighter", "advanced", "tokio"] }
+iced = { version = "0.14", features = ["highlighter", "advanced", "tokio", "markdown"] }
 
 # 保存の `sync_all` を UI スレッドから追い出すためだけ。ADR-0014。
 # **新しい依存ではない**（iced の tokio feature で既に依存ツリーにいる）。直接宣言するのは
