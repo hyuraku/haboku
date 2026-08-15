@@ -128,6 +128,56 @@ pub fn contains_query(query: &str, target: &str) -> Option<Range<usize>> {
     None
 }
 
+/// 抜粋で一致箇所の手前に見せる文字数。前後の文脈が無いと「なぜ当たったか」が読めない。
+const SNIPPET_LEAD_CHARS: usize = 12;
+/// 抜粋の最大文字数。パレットの幅（640px）に収まる目安。
+const SNIPPET_MAX_CHARS: usize = 60;
+
+/// 一致箇所の周りを 1 行ぶん切り出す。返すのは (抜粋, **抜粋基準**の一致範囲)。
+///
+/// **行をまたがない。** パレットの行の高さは全行で同じでなければならず
+/// （スクロール追従が相対オフセットで効いている）、改行が入ると崩れる。
+///
+/// 切った側には `…` を付ける。付けないと「途中から始まる文字列」が壊れて見える。
+/// 文字数で数えて歩くので、切り口が文字境界を割ることはない。
+pub fn snippet(raw: &str, hit: Range<usize>) -> (String, Range<usize>) {
+    // 一致を含む 1 行へ切り詰める。CRLF のファイルは行末に `\r` が残るので落とす。
+    let line_start = raw[..hit.start].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = raw[hit.end..].find('\n').map_or(raw.len(), |i| hit.end + i);
+    let line = &raw[line_start..line_end];
+    let line = line.strip_suffix('\r').unwrap_or(line);
+
+    let hit_start = (hit.start - line_start).min(line.len());
+    let hit_end = (hit.end - line_start).min(line.len());
+
+    // 一致の手前へ 12 文字ぶん戻る。文字単位で歩くので境界は割れない。
+    let start = line[..hit_start]
+        .char_indices()
+        .rev()
+        .take(SNIPPET_LEAD_CHARS)
+        .last()
+        .map_or(hit_start, |(i, _)| i);
+    // そこから 60 文字ぶん取る。一致自体が上限より長くても同じ歩き方で切る。
+    let end = line[start..]
+        .char_indices()
+        .nth(SNIPPET_MAX_CHARS)
+        .map_or(line.len(), |(i, _)| start + i);
+
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    // 先頭に付けた `…` のぶんだけ、一致の位置が後ろへずれる。
+    let lead = out.len();
+    out.push_str(&line[start..end]);
+    if end < line.len() {
+        out.push('…');
+    }
+
+    let range = (lead + hit_start - start)..(lead + hit_end.min(end) - start);
+    (out, range)
+}
+
 /// 文字列を (バイト範囲, 正規化済み文字) の列として**その場で**返す。
 ///
 /// 半角カナの濁点・半濁点（ﾞ ﾟ）は直前の文字と合成する（ｶ+ﾞ → が）。
@@ -318,6 +368,76 @@ mod tests {
         assert!(contains_query("", "なんでも書いてある本文").is_none());
         // タイトル側は逆に「全部当たる」。この非対称は意図したもの。
         assert!(match_query("", "なんでも書いてある本文").is_some());
+    }
+
+    /// 抜粋は 1 行に収まり、切った側に `…` が付き、範囲がそのぶんずれること。
+    #[test]
+    fn snippet_stays_on_one_line_and_marks_what_it_cut() {
+        let raw = "---\ntitle: メモ\n---\n\n前の行。\nここに iced のことが書いてある。\n次の行。\n";
+        let hit = contains_query("iced", raw).unwrap();
+        let (text, range) = snippet(raw, hit);
+
+        assert!(!text.contains('\n'), "抜粋が行をまたいでいる: {text:?}");
+        assert_eq!(text.get(range), Some("iced"), "範囲が一致箇所を指していない");
+        assert!(!text.contains("前の行"), "前の行を巻き込んでいる: {text:?}");
+        assert!(!text.contains("次の行"), "次の行を巻き込んでいる: {text:?}");
+    }
+
+    /// 行の先頭に当たったときは `…` を付けず、範囲もずらさないこと。
+    /// （0 から遡ろうとしてアンダーフローしない、という確認でもある）
+    #[test]
+    fn snippet_at_the_start_of_a_line_has_no_leading_ellipsis() {
+        let raw = "iced のことが書いてある";
+        let hit = contains_query("iced", raw).unwrap();
+        let (text, range) = snippet(raw, hit);
+
+        assert!(!text.starts_with('…'));
+        assert_eq!(range, 0..4);
+        assert_eq!(text.get(range), Some("iced"));
+    }
+
+    /// 手前が長いときは `…` が付き、範囲が 3 バイト（`…` のぶん）ずれること。
+    #[test]
+    fn snippet_shifts_the_range_by_the_leading_ellipsis() {
+        let raw = "あ".repeat(40) + "iced";
+        let hit = contains_query("iced", &raw).unwrap();
+        let (text, range) = snippet(&raw, hit);
+
+        assert!(text.starts_with('…'), "先頭を切ったのに … が無い: {text:?}");
+        assert_eq!(range.start, "…".len() + SNIPPET_LEAD_CHARS * "あ".len());
+        assert_eq!(text.get(range), Some("iced"));
+    }
+
+    /// CRLF のファイルでも行末の `\r` が抜粋に残らないこと。
+    #[test]
+    fn snippet_drops_the_carriage_return() {
+        let raw = "---\r\ntitle: メモ\r\n---\r\n\r\nここに iced がある\r\n次の行\r\n";
+        let hit = contains_query("iced", raw).unwrap();
+        let (text, _) = snippet(raw, hit);
+
+        assert!(!text.contains('\r'), "\\r が残っている: {text:?}");
+        assert!(!text.contains("次の行"));
+    }
+
+    /// 末尾に改行が無いファイルでも切り出せること。
+    #[test]
+    fn snippet_handles_a_file_without_a_trailing_newline() {
+        let raw = "最後の行に iced がある";
+        let hit = contains_query("iced", raw).unwrap();
+        let (text, range) = snippet(raw, hit);
+        assert_eq!(text.get(range), Some("iced"));
+    }
+
+    /// 一致そのものが上限より長いときも、切り口が文字境界を割らないこと。
+    #[test]
+    fn snippet_truncates_a_match_longer_than_the_limit() {
+        let long = "あ".repeat(SNIPPET_MAX_CHARS * 2);
+        let hit = contains_query(&long, &long).unwrap();
+        let (text, range) = snippet(&long, hit);
+
+        // 切っても文字列として成立していること（バイト境界を割ると String が作れない）。
+        assert!(text.chars().count() <= SNIPPET_MAX_CHARS + 1, "上限を超えている");
+        assert!(text.get(range).is_some(), "範囲が文字境界を割っている");
     }
 
     /// 畳み込みの結果を (バイト範囲, 正規化後の文字) の列として固定する。
