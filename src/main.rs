@@ -175,6 +175,11 @@ const NEW_NOTE_NAME_FORMAT: &str = "%Y-%m-%d-%H%M%S";
 /// 絞り込むための道具なので上位だけ出せば足りる。
 const PALETTE_MAX_RESULTS: usize = 50;
 
+/// 本文を探し始めるクエリの長さ。**1 文字では探さない。**
+/// 1 文字の連続一致はほぼ全ノートに当たって情報量がゼロで、しかも検索は必ず
+/// 1 文字目を通る。ここが打鍵あたりで最も頻度の高い無駄になる（ADR-0018）。
+const BODY_MIN_QUERY_CHARS: usize = 2;
+
 /// サイドバー（フォルダ）の幅。
 const SIDEBAR_WIDTH: f32 = 180.0;
 /// ノート一覧の幅。
@@ -183,13 +188,33 @@ const LIST_WIDTH: f32 = 320.0;
 /// 開いているパレットの状態。閉じているときは `None`。
 struct Palette {
     query: String,
-    /// 絞り込み結果。`(notes のインデックス, マッチ情報)`。
+    /// 絞り込み結果。
     ///
     /// **`view()` では絞り込みを一切やらない。** クエリが変わった時だけ計算してここに置く。
     /// 打鍵のたびに全ノートを走査する穴（前身の `render()` で開けた穴）を塞ぐため。
-    matches: Vec<(usize, fuzzy::Match)>,
+    matches: Vec<Hit>,
     /// いま選んでいる `matches` の位置。
     selected: usize,
+}
+
+/// パレットの 1 行。**タイトルに当たったのか本文に当たったのかで見せ方が変わる。**
+struct Hit {
+    /// `App.notes` のインデックス。
+    note: usize,
+    kind: HitKind,
+}
+
+enum HitKind {
+    /// タイトルに当たった。範囲は**タイトル基準**のバイト範囲。
+    Title(fuzzy::Match),
+    /// タイトルには当たらず、本文に当たった。
+    ///
+    /// `hit` は `snippet` 基準のバイト範囲（`raw` 基準ではない）。本文の一致は
+    /// 連続一致なので範囲は必ず 1 本で、`Vec` は要らない。
+    Body {
+        snippet: String,
+        hit: std::ops::Range<usize>,
+    },
 }
 
 struct App {
@@ -1280,20 +1305,66 @@ fn rescue_and_close(
 ///
 /// 絞り込み中のフォルダは無視して**全ノート**を対象にする。`Cmd+P` は「どのフォルダにいても
 /// 目的のノートへ飛ぶ」道具なので、いまの絞り込みに引きずられると用を成さない。
-fn refilter(notes: &[vault::Note], query: &str) -> Vec<(usize, fuzzy::Match)> {
-    let mut hits: Vec<(usize, fuzzy::Match)> = notes
+/// **タイトルを先に全部出し、余った枠にだけ本文ヒットを足す**（ADR-0018）。
+/// タイトルと本文は別種の証拠なので、1 本のスコアに混ぜない。
+fn refilter(notes: &[vault::Note], query: &str) -> Vec<Hit> {
+    let mut scored: Vec<(usize, fuzzy::Match)> = notes
         .iter()
         .enumerate()
         .filter_map(|(i, note)| fuzzy::match_query(query, &note.title).map(|m| (i, m)))
         .collect();
 
     // スコアの高い順。同点はタイトル順で安定させる（同じクエリで並びが変わらないように）。
-    hits.sort_by(|a, b| {
+    scored.sort_by(|a, b| {
         b.1.score
             .cmp(&a.1.score)
             .then_with(|| notes[a.0].title.cmp(&notes[b.0].title))
     });
-    hits.truncate(PALETTE_MAX_RESULTS);
+
+    // **本文を読むかどうかは打ち切る前に決める。** タイトルだけで 50 件埋まるなら
+    // 本文は 1 バイトも読まない。空クエリは全件がタイトルに当たるのでここで止まる。
+    let searches_body = scored.len() < PALETTE_MAX_RESULTS
+        && query.chars().count() >= BODY_MIN_QUERY_CHARS;
+    // 同じノートを二度出さないための印。**打ち切る前**のヒットで作る。
+    let title_hit = searches_body.then(|| {
+        let mut flags = vec![false; notes.len()];
+        for (i, _) in &scored {
+            flags[*i] = true;
+        }
+        flags
+    });
+
+    scored.truncate(PALETTE_MAX_RESULTS);
+    let mut hits: Vec<Hit> = scored
+        .into_iter()
+        .map(|(note, m)| Hit {
+            note,
+            kind: HitKind::Title(m),
+        })
+        .collect();
+
+    let Some(title_hit) = title_hit else {
+        return hits;
+    };
+
+    // 本文は一覧と同じ順（更新の新しい順）に見る。**スコアは作らない。**
+    // 重み付けの根拠になる実データが無い状態で決めるのは占いなので、
+    // 「一覧と同じ順」という説明できる順序に倒す。
+    for (i, note) in notes.iter().enumerate() {
+        if hits.len() == PALETTE_MAX_RESULTS {
+            break;
+        }
+        if title_hit[i] {
+            continue;
+        }
+        if let Some(range) = fuzzy::contains_query(query, &note.raw) {
+            let (snippet, hit) = fuzzy::snippet(&note.raw, range);
+            hits.push(Hit {
+                note: i,
+                kind: HitKind::Body { snippet, hit },
+            });
+        }
+    }
     hits
 }
 
@@ -1320,7 +1391,7 @@ fn handle_palette_key(
             Task::none()
         }
         keyboard::Key::Named(Named::Enter) => {
-            let Some(index) = palette.matches.get(palette.selected).map(|(i, _)| *i) else {
+            let Some(index) = palette.matches.get(palette.selected).map(|hit| hit.note) else {
                 app.palette = None;
                 return Task::none();
             };
@@ -1886,13 +1957,18 @@ fn editor_pane(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-/// マッチした文字だけ色を変えたタイトルを作る。
+/// マッチした文字だけ色を変えた span を作る。タイトル行と本文の抜粋行で共有する。
 ///
-/// `fuzzy::Match::ranges` は**バイト範囲**なので `get()` で受ける。日本語タイトルで
-/// 文字境界を跨いだときに panic しないため（`&title[range]` だと落ちる）。
-fn highlighted_title(title: &str, ranges: &[std::ops::Range<usize>]) -> Element<'static, Message> {
+/// 範囲は**バイト範囲**なので `get()` で受ける。日本語で文字境界を跨いだときに
+/// panic しないため（`&text[range]` だと落ちる）。
+///
+/// 地の色を引数で受けるのは、タイトル（生成り）と抜粋（霞）で違うから。
+fn highlight_spans(
+    text: &str,
+    ranges: &[std::ops::Range<usize>],
+    base: Color,
+) -> Vec<iced::advanced::text::Span<'static, ()>> {
     // 一致文字は琥珀の明るい側 + セミボールド。色だけだと霞んだ地の上で見落とすことがある。
-    let hit = KOHAKU_SOFT;
     let hit_font = Font {
         weight: iced::font::Weight::Semibold,
         ..Font::DEFAULT
@@ -1902,22 +1978,26 @@ fn highlighted_title(title: &str, ranges: &[std::ops::Range<usize>]) -> Element<
 
     for range in ranges {
         if range.start > last
-            && let Some(plain) = title.get(last..range.start)
+            && let Some(plain) = text.get(last..range.start)
         {
-            spans.push(span(plain.to_string()));
+            spans.push(span(plain.to_string()).color(base));
         }
-        if let Some(matched) = title.get(range.clone()) {
-            spans.push(span(matched.to_string()).color(hit).font(hit_font));
+        if let Some(matched) = text.get(range.clone()) {
+            spans.push(span(matched.to_string()).color(KOHAKU_SOFT).font(hit_font));
         }
         last = range.end;
     }
-    if let Some(rest) = title.get(last..) {
-        spans.push(span(rest.to_string()));
+    if let Some(rest) = text.get(last..) {
+        spans.push(span(rest.to_string()).color(base));
     }
+    spans
+}
 
+/// マッチした文字だけ色を変えたタイトルを作る。
+fn highlighted_title(title: &str, ranges: &[std::ops::Range<usize>]) -> Element<'static, Message> {
     // 折り返させない。長いタイトルで行の高さが候補ごとに変わると、
     // 相対オフセットでの追従（`snap_palette_to_selected`）が前提を失う。
-    rich_text(spans)
+    rich_text(highlight_spans(title, ranges, KINARI))
         .size(13)
         .wrapping(iced::advanced::text::Wrapping::None)
         .into()
@@ -1936,27 +2016,48 @@ fn palette_overlay(app: &App, palette: &Palette) -> Element<'static, Message> {
         .matches
         .iter()
         .enumerate()
-        .map(|(row, (note_index, m))| {
-            let note = &app.notes[*note_index];
+        .map(|(row, hit)| {
+            let note = &app.notes[hit.note];
             let is_selected = row == palette.selected;
 
-            // タグはフォルダ名と同じ行に併記する。行を足すとタグの有無で行の高さが
-            // 変わり、`snap_palette_to_selected` の相対オフセットが前提を失う。
-            let meta = if note.tags.is_empty() {
-                note.folder.clone()
-            } else {
-                format!("{} · {}", note.folder, tag_label(&note.tags))
-            };
+            // **2 行目はどちらか一方。** 本文に当たった行では、フォルダ・タグより
+            // 「なぜ当たったか」を優先する（フォルダは開けば分かる）。両方出すと
+            // 幅 640px を食い、折り返して行の高さが変わる。
+            let (title_ranges, second): (&[std::ops::Range<usize>], Element<'static, Message>) =
+                match &hit.kind {
+                    HitKind::Title(m) => {
+                        // タグはフォルダ名と同じ行に併記する。行を足すとタグの有無で
+                        // 行の高さが変わり、相対オフセットの追従が前提を失う。
+                        let meta = if note.tags.is_empty() {
+                            note.folder.clone()
+                        } else {
+                            format!("{} · {}", note.folder, tag_label(&note.tags))
+                        };
+                        (
+                            &m.ranges,
+                            text(meta)
+                                .size(10)
+                                .color(KASUMI)
+                                .wrapping(iced::advanced::text::Wrapping::None)
+                                .into(),
+                        )
+                    }
+                    HitKind::Body { snippet, hit } => (
+                        &[],
+                        rich_text(highlight_spans(
+                            snippet,
+                            std::slice::from_ref(hit),
+                            KASUMI,
+                        ))
+                        .size(10)
+                        .wrapping(iced::advanced::text::Wrapping::None)
+                        .into(),
+                    ),
+                };
 
             container(
-                iced::widget::column![
-                    highlighted_title(&note.title, &m.ranges),
-                    text(meta)
-                        .size(10)
-                        .color(KASUMI)
-                        .wrapping(iced::advanced::text::Wrapping::None),
-                ]
-                .spacing(1),
+                iced::widget::column![highlighted_title(&note.title, title_ranges), second]
+                    .spacing(1),
             )
             .padding(6)
             .width(Fill)
@@ -3325,6 +3426,108 @@ mod tests {
             plain < 1.0 && with_palette < 1.0,
             "view() の構築が 1ms を超えた（Done の定義違反）"
         );
+    }
+
+    /// `refilter` だけを見たいので、ファイルシステムを触らずに Note を組み立てる。
+    /// `app_with_folders` は本文を固定で作るため、本文検索の確認には使えない。
+    fn note_with(title: &str, body: &str) -> vault::Note {
+        vault::Note {
+            path: PathBuf::from(format!("{title}.md")),
+            title: title.to_string(),
+            tags: Vec::new(),
+            folder: "/".to_string(),
+            preview: String::new(),
+            raw: body.to_string(),
+            modified: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    /// **タイトルに無い語でも本文で辿り着けること。** この機能の眼目。
+    #[test]
+    fn palette_finds_a_note_by_its_body() {
+        let notes = vec![
+            note_with("設計メモ", "本文に scrollable のことを書いた"),
+            note_with("買い物", "牛乳とパン"),
+        ];
+        let hits = refilter(&notes, "scrollable");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(notes[hits[0].note].title, "設計メモ");
+        assert!(matches!(hits[0].kind, HitKind::Body { .. }));
+    }
+
+    /// タイトル一致は本文一致より必ず上に出ること。
+    #[test]
+    fn title_hits_come_before_body_hits() {
+        let notes = vec![
+            note_with("買い物", "そういえば iced のことも書いた"),
+            note_with("iced のメモ", "本文には書いていない"),
+        ];
+        let hits = refilter(&notes, "iced");
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            notes[hits[0].note].title, "iced のメモ",
+            "タイトル一致が先頭に来ていない"
+        );
+        assert!(matches!(hits[0].kind, HitKind::Title(_)));
+        assert!(matches!(hits[1].kind, HitKind::Body { .. }));
+    }
+
+    /// タイトルにも本文にも当たるノートを二度出さないこと。
+    #[test]
+    fn a_note_is_listed_once_when_both_match() {
+        let notes = vec![note_with("iced のメモ", "本文にも iced と書いてある")];
+        let hits = refilter(&notes, "iced");
+
+        assert_eq!(hits.len(), 1, "同じノートが 2 行に出ている");
+        assert!(
+            matches!(hits[0].kind, HitKind::Title(_)),
+            "タイトル一致が優先されていない"
+        );
+    }
+
+    /// **タイトルだけで枠が埋まったら本文を 1 バイトも読まないこと。**
+    /// 打ち切りをソートの後に置いていた頃は、ここが走査コストの削減にならなかった。
+    #[test]
+    fn body_is_not_searched_when_the_title_hits_fill_the_list() {
+        let mut notes: Vec<vault::Note> = (0..PALETTE_MAX_RESULTS + 5)
+            .map(|i| note_with(&format!("aa-{i}"), "本文は関係ない"))
+            .collect();
+        // タイトルには当たらず本文にだけ当たるノート。枠が無いので出てはいけない。
+        notes.push(note_with("ほか", "ここに aa がある"));
+
+        let hits = refilter(&notes, "aa");
+
+        assert_eq!(hits.len(), PALETTE_MAX_RESULTS);
+        assert!(
+            hits.iter().all(|h| matches!(h.kind, HitKind::Title(_))),
+            "枠が埋まっているのに本文ヒットが混じっている"
+        );
+    }
+
+    /// 1 文字では本文を探さないこと。ほぼ全件に当たって情報量がゼロなため。
+    #[test]
+    fn a_single_character_query_does_not_search_bodies() {
+        let notes = vec![note_with("メモ", "本文に z がある")];
+        assert!(refilter(&notes, "z").is_empty(), "1 文字で本文を探している");
+
+        let notes = vec![note_with("メモ", "本文に zz がある")];
+        assert_eq!(refilter(&notes, "zz").len(), 1, "2 文字なら探すこと");
+    }
+
+    /// 本文ヒットは一覧と同じ順（`notes` の順 = 更新の新しい順）に並ぶこと。
+    #[test]
+    fn body_hits_keep_the_note_list_order() {
+        let notes = vec![
+            note_with("あ", "zzz は先頭のノートにある"),
+            note_with("い", "zzz は 2 番目にもある"),
+            note_with("う", "zzz は 3 番目にも"),
+        ];
+        let hits = refilter(&notes, "zzz");
+
+        let order: Vec<usize> = hits.iter().map(|h| h.note).collect();
+        assert_eq!(order, [0, 1, 2]);
     }
 
     /// 上位 `PALETTE_MAX_RESULTS` 件で打ち切ること。約 1200 件を全部描いても人は読まない。
