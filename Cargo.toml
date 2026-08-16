@@ -32,3 +32,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # pollster なので全部切る。切った結果 Cargo.lock の増分は rfd 1 crate だけ
 # （objc2 系・block2・dispatch2 は既に依存ツリーにいた）。
 rfd = { version = "0.17.2", default-features = false }
+
+# 配布する .app のサイズを削るため。挙動は変えない設定だけを入れる。
+#   lto / codegen-units … crate をまたいだ inline と dead code 削除を効かせる（ビルドは遅くなる）
+#   strip               … デバッグシンボルを落とす。バックトレースは release 配布物では使わない
+# `panic = "abort"` は入れない。ADR-0014 の `spawn_blocking` 保存パスで、
+# パニックが JoinError（＝保存エラーとして扱える）ではなくプロセス即死に変わるため。
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
