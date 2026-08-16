@@ -47,7 +47,10 @@ pub fn match_query(query: &str, target: &str) -> Option<Match> {
     let mut ti = 0usize; // target 側の走査位置
     let mut last_matched: Option<usize> = None;
 
-    for (_, qc) in fold(query) {
+    // **クエリ側は集めない。** 位置は使わず 1 パスなめるだけなので `Vec` に要らない。
+    // `refilter` はこの関数を打鍵ごとに全ノートへ掛けるので、集めると同じ確保が
+    // ノート件数ぶん（約 1200 回）繰り返される。
+    for (_, qc) in folded(query) {
         // qc に当たる最初の位置まで進める
         let found = chars[ti..]
             .iter()

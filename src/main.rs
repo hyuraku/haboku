@@ -267,8 +267,9 @@ struct App {
     modifiers: keyboard::Modifiers,
 
     // ── 自動保存 ────────────────────────────────────────────
-    dirty: bool,
-    /// dirty になった時刻。上限判定と「未保存」表示に使う。
+    /// dirty になった時刻。**「未保存の編集があるか」はこれ 1 つで表す**
+    /// （別に `dirty: bool` を持つと、片方だけ更新するコードが書ける）。
+    /// 上限判定と「未保存」表示にも使う。
     ///
     /// **打鍵のたびに更新してはいけない。** false → true の遷移でだけ記録する。
     /// 毎回更新すると「打ち続けている間の経過時間」が測れず、上限に永遠に届かない。
@@ -560,6 +561,13 @@ fn refresh_derived(app: &mut App) {
     app.visible = visible_indices(&app.notes, app.selected_folder.as_deref());
 }
 
+/// 絞り込むフォルダを変える。**選択と一覧をここでしか動かさない。**
+/// 2 行 1 組を呼び出し側に書かせると、片方だけ更新するコードが書ける。
+fn set_folder(app: &mut App, folder: Option<String>) {
+    app.selected_folder = folder;
+    app.visible = visible_indices(&app.notes, app.selected_folder.as_deref());
+}
+
 /// 一覧に出すノートの index を作り直す。フォルダ選択が変わった時だけ呼ぶ。
 fn visible_indices(notes: &[vault::Note], folder: Option<&str>) -> Vec<usize> {
     notes
@@ -620,7 +628,6 @@ fn boot(root: PathBuf, load: vault::Load, load_ms: f64) -> App {
         rename: None,
         preview: None,
         modifiers: keyboard::Modifiers::empty(),
-        dirty: false,
         dirty_since: None,
         last_edit: Instant::now(),
         show_marker: false,
@@ -704,11 +711,14 @@ fn adopt_vault(app: &mut App, root: PathBuf) {
     let load = vault::load_dir(&root);
     app.load_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
-    app.folders = count_folders(&load.notes);
-    app.visible = visible_indices(&load.notes, None);
+    // `notes` を move する前に読む。
+    let warning = load_warning(&load);
+
     app.root = root;
     app.selected = None;
     app.selected_folder = None;
+    app.notes = load.notes;
+    refresh_derived(app);
     replace_content(app, WELCOME);
     app.setup = None;
     // **読めなかった件数も、記憶できなかった件も、どちらも黙らない。**
@@ -717,9 +727,8 @@ fn adopt_vault(app: &mut App, root: PathBuf) {
         remembered
             .err()
             .map(|e| format!("保存先を覚えられませんでした（次回もこの画面が出ます）: {e}")),
-        load_warning(&load),
+        warning,
     );
-    app.notes = load.notes;
 }
 
 fn set_setup_error(app: &mut App, message: String) {
@@ -728,9 +737,13 @@ fn set_setup_error(app: &mut App, message: String) {
     }
 }
 
+/// 未保存の編集があるか。**`dirty_since` が唯一の真実**で、bool は持たない。
+fn is_dirty(app: &App) -> bool {
+    app.dirty_since.is_some()
+}
+
 /// 保存が済んだ（または差分が無かった）ときに dirty 関連を畳む。
 fn clear_dirty(app: &mut App) {
-    app.dirty = false;
     app.dirty_since = None;
     app.show_marker = false;
     clear_save_backoff(app);
@@ -845,8 +858,7 @@ fn run_action(app: &mut App, action: PendingAction) -> Task<Message> {
                     .as_deref()
                     .is_some_and(|folder| folder != app.notes[index].folder);
                 if hidden_by_filter {
-                    app.selected_folder = None;
-                    app.visible = visible_indices(&app.notes, None);
+                    set_folder(app, None);
                 }
             }
             open_note(app, index);
@@ -1017,7 +1029,6 @@ fn replace_content(app: &mut App, text: &str) {
 /// 編集が起きたことを dirty へ記録する。**`Message::Edit` と undo / redo で共有する。**
 fn mark_edited(app: &mut App) {
     if app.selected.is_some() {
-        app.dirty = true;
         app.last_edit = Instant::now();
         // **false → true の遷移でだけ**記録する。
         app.dirty_since.get_or_insert_with(Instant::now);
@@ -1343,15 +1354,6 @@ fn refilter(notes: &[vault::Note], query: &str) -> Vec<Hit> {
     // 本文は 1 バイトも読まない。空クエリは全件がタイトルに当たるのでここで止まる。
     let searches_body = scored.len() < PALETTE_MAX_RESULTS
         && query.chars().count() >= BODY_MIN_QUERY_CHARS;
-    // 同じノートを二度出さないための印。**打ち切る前**のヒットで作る。
-    let title_hit = searches_body.then(|| {
-        let mut flags = vec![false; notes.len()];
-        for (i, _) in &scored {
-            flags[*i] = true;
-        }
-        flags
-    });
-
     scored.truncate(PALETTE_MAX_RESULTS);
     let mut hits: Vec<Hit> = scored
         .into_iter()
@@ -1361,9 +1363,16 @@ fn refilter(notes: &[vault::Note], query: &str) -> Vec<Hit> {
         })
         .collect();
 
-    let Some(title_hit) = title_hit else {
+    if !searches_body {
         return hits;
-    };
+    }
+
+    // 同じノートを二度出さないための印。**本文を読むときは打ち切りが起きていない**
+    // （`searches_body` は 50 件に満たないときだけ真）ので、打ち切り後の `hits` から作れる。
+    let mut title_hit = vec![false; notes.len()];
+    for hit in &hits {
+        title_hit[hit.note] = true;
+    }
 
     // 本文は一覧と同じ順（更新の新しい順）に見る。**スコアは作らない。**
     // 重み付けの根拠になる実データが無い状態で決めるのは占いなので、
@@ -1528,10 +1537,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
     }
 
     match message {
-        Message::FolderSelected(folder) => {
-            app.visible = visible_indices(&app.notes, folder.as_deref());
-            app.selected_folder = folder;
-        }
+        Message::FolderSelected(folder) => set_folder(app, folder),
         Message::NoteSelected(index) => {
             // **保存に失敗したら遷移しない。** ここで進むと未保存の本文が
             // ディスクにもメモリにも残らず消える。前身でデータ喪失を招いた欠陥がこれ。
@@ -1747,58 +1753,45 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 return iced::widget::operation::focus(iced::widget::Id::new(PALETTE_INPUT_ID));
             }
 
-            // `Cmd+N` で新規作成。パレットが開いていても効く（中で畳む）。
-            if modifiers.command() && matches!(&key, keyboard::Key::Character(c) if c == "n") {
-                return update(app, Message::NewNote);
-            }
+            // ⌘ のショートカットは 1 つの表にまとめる。`if` を並べると
+            // 「どのキーがどの状況で効くか」がキーごとに散り、ガードの食い違い
+            // （`Cmd+N` だけリネーム欄を畳んでいなかった類）が目で見つからなくなる。
+            if modifiers.command() {
+                use keyboard::key::Named;
 
-            // `Cmd+Shift+V` でエディタとプレビューを行き来する（ADR-0019）。
-            //
-            // **ここのトグルは成立する。** ADR-0004 で `Cmd+P` のトグルを諦めたのは、
-            // 消費できないイベントがフォーカス中の入力欄へ文字として混入するため。
-            // プレビュー中はエディタ自体が view に無く、再押下が漏れる先が無い。
-            // 開く方向も混入しない: `text_editor` への ⌘ 付き Insert は
-            // `editor_key_binding` が捨てる（ADR-0010）。
-            //
-            // パレット・リネームが開いている間は効かせない。そこへ打っているときに
-            // **見えていない画面**を切り替えない（`Cmd+Z` を塞いだのと同じ理由）。
-            if modifiers.command()
-                && modifiers.shift()
-                && matches!(&key, keyboard::Key::Character(c) if c == "v")
-                && app.palette.is_none()
-                && app.rename.is_none()
-            {
-                return update(app, Message::TogglePreview);
-            }
-
-            // `Cmd+Z` で元に戻す、`Cmd+Shift+Z` でやり直す（ADR-0017）。
-            //
-            // **パレット・リネーム欄が開いている間は効かせない。** そこへ打っているときの
-            // ⌘Z は「見ていない本文を書き換える」操作になる（Control 系をフォーカスで
-            // 塞いだのと同じ理由。ADR-0016）。
-            // プレビュー中も効かせない。undo は**見えていない本文**を書き換える操作になる
-            // （ADR-0019。表示は編集に戻ってから戻す）。
-            if modifiers.command()
-                && matches!(&key, keyboard::Key::Character(c) if c == "z")
-                && app.palette.is_none()
-                && app.rename.is_none()
-                && app.preview.is_none()
-            {
-                let message = if modifiers.shift() {
-                    Message::Redo
-                } else {
-                    Message::Undo
+                // **上に何か被さっている間は、見えていない画面を触らせない。**
+                // ADR-0016 で Control 系をフォーカスで塞いだのと同じ理由。
+                let bare = app.palette.is_none() && app.rename.is_none();
+                let shortcut = match key.as_ref() {
+                    // 新規作成・リネーム・退避はパレットが開いていても効く（中で畳む）。
+                    keyboard::Key::Character("n") => Some(Message::NewNote),
+                    keyboard::Key::Character("r") => Some(Message::RenameStarted),
+                    keyboard::Key::Named(Named::Backspace) => Some(Message::DeleteNote),
+                    // `Cmd+Shift+V` でエディタとプレビューを行き来する（ADR-0019）。
+                    //
+                    // **ここのトグルは成立する。** ADR-0004 で `Cmd+P` のトグルを諦めたのは、
+                    // 消費できないイベントがフォーカス中の入力欄へ文字として混入するため。
+                    // プレビュー中はエディタ自体が view に無く、再押下が漏れる先が無い。
+                    // 開く方向も混入しない: `text_editor` への ⌘ 付き Insert は
+                    // `editor_key_binding` が捨てる（ADR-0010）。
+                    keyboard::Key::Character("v") if modifiers.shift() && bare => {
+                        Some(Message::TogglePreview)
+                    }
+                    // `Cmd+Z` で元に戻す、`Cmd+Shift+Z` でやり直す（ADR-0017）。
+                    // **プレビュー中も効かせない。** undo は見えていない本文を
+                    // 書き換える操作になる（ADR-0019。表示は編集に戻ってから戻す）。
+                    keyboard::Key::Character("z") if bare && app.preview.is_none() => Some(
+                        if modifiers.shift() {
+                            Message::Redo
+                        } else {
+                            Message::Undo
+                        },
+                    ),
+                    _ => None,
                 };
-                return update(app, message);
-            }
-
-            // `Cmd+R` でリネーム、`Cmd+Delete` で `.trash` へ退避。
-            if modifiers.command() && matches!(&key, keyboard::Key::Character(c) if c == "r") {
-                return update(app, Message::RenameStarted);
-            }
-            if modifiers.command() && matches!(&key, keyboard::Key::Named(keyboard::key::Named::Backspace))
-            {
-                return update(app, Message::DeleteNote);
+                if let Some(message) = shortcut {
+                    return update(app, message);
+                }
             }
 
             // リネーム入力中のキー。Enter で確定、Escape で取り消し。
@@ -1855,7 +1848,7 @@ fn subscription(app: &App) -> Subscription<Message> {
     // 「閉じた瞬間に dirty が解ける」ような競合で取りこぼしたときに黙って終了する。
     let close = iced::window::close_requests().map(Message::CloseRequested);
 
-    if app.dirty || app.saved_flash_until.is_some() {
+    if is_dirty(app) || app.saved_flash_until.is_some() {
         Subscription::batch([keys, close, iced::time::every(TICK).map(Message::Tick)])
     } else {
         Subscription::batch([keys, close])
@@ -1864,26 +1857,10 @@ fn subscription(app: &App) -> Subscription<Message> {
 
 fn folder_pane(app: &App) -> Element<'_, Message> {
     // フォルダ名は副文字（霞）。選ばれている行だけ生成りに持ち上げ、件数は常に霞のまま。
-    let all_selected = app.selected_folder.is_none();
-    let all = button(
-        row![
-            text("すべて")
-                .size(12)
-                .color(if all_selected { KINARI } else { KASUMI })
-                .width(Fill),
-            text(app.notes.len().to_string()).size(12).color(KASUMI),
-        ]
-        .padding(2),
-    )
-    .on_press(Message::FolderSelected(None))
-    .width(Fill)
-    .style(if all_selected { selected_row } else { button::text });
-
-    let items = app.folders.iter().map(|(name, count)| {
-        let selected = app.selected_folder.as_deref() == Some(name.as_str());
+    let row_for = |label: &str, count: usize, selected: bool| {
         button(
             row![
-                text(name)
+                text(label.to_string())
                     .size(12)
                     .color(if selected { KINARI } else { KASUMI })
                     .width(Fill),
@@ -1891,10 +1868,19 @@ fn folder_pane(app: &App) -> Element<'_, Message> {
             ]
             .padding(2),
         )
-        .on_press(Message::FolderSelected(Some(name.clone())))
         .width(Fill)
         .style(if selected { selected_row } else { button::text })
-        .into()
+    };
+
+    let all_selected = app.selected_folder.is_none();
+    let all = row_for("すべて", app.notes.len(), all_selected)
+        .on_press(Message::FolderSelected(None));
+
+    let items = app.folders.iter().map(|(name, count)| {
+        let selected = app.selected_folder.as_deref() == Some(name.as_str());
+        row_for(name, *count, selected)
+            .on_press(Message::FolderSelected(Some(name.clone())))
+            .into()
     });
 
     scrollable(column(std::iter::once(all.into()).chain(items)).spacing(1))
@@ -2108,14 +2094,54 @@ fn highlight_spans(
     spans
 }
 
-/// マッチした文字だけ色を変えたタイトルを作る。
-fn highlighted_title(title: &str, ranges: &[std::ops::Range<usize>]) -> Element<'static, Message> {
-    // 折り返させない。長いタイトルで行の高さが候補ごとに変わると、
-    // 相対オフセットでの追従（`snap_palette_to_selected`）が前提を失う。
-    rich_text(highlight_spans(title, ranges, KINARI))
-        .size(13)
+/// 当たった文字だけ色を変えた 1 行。候補のタイトル行と本文の抜粋行で共有する。
+///
+/// **折り返させない。** 行の高さが候補ごとに変わると、相対オフセットでの追従
+/// （`snap_palette_to_selected`）が前提を失う。
+fn hit_text(
+    body: &str,
+    ranges: &[std::ops::Range<usize>],
+    base: Color,
+    size: f32,
+) -> Element<'static, Message> {
+    rich_text(highlight_spans(body, ranges, base))
+        .size(size)
         .wrapping(iced::advanced::text::Wrapping::None)
         .into()
+}
+
+/// スクリム + 中央パネル。iced にモーダル用の標準ウィジェットは無いので自前に組む。
+///
+/// スクリムは**背景側だけを覆う層**として敷き、その上にパネルを重ねる。パネルごと
+/// `mouse_area` で包むと、パネル内のクリックまで「背景クリック」として拾ってしまう。
+fn overlay(
+    panel: Element<'static, Message>,
+    dismiss: Message,
+    pad: u16,
+) -> Element<'static, Message> {
+    let scrim = mouse_area(
+        container(iced::widget::Space::new().width(Fill).height(Fill))
+            .width(Fill)
+            .height(Fill)
+            .style(|_theme: &iced::Theme| {
+                // 濃墨よりさらに深い墨でぼかす。真っ黒ではなく地の色相を保つ。
+                container::background(Color::from_rgba8(0x0A, 0x09, 0x0B, 0.6))
+            }),
+    )
+    .on_press(dismiss);
+
+    stack![scrim, container(panel).center_x(Fill).padding(pad)].into()
+}
+
+/// エラーの 1 行。セットアップ画面と本画面で同じ見た目にする。
+///
+/// **エラーも枯茶。赤を持ち込まない**（ADR-0009）。出すものが無くても
+/// 空の `text` を置いて、行の有無でレイアウトが跳ねないようにする。
+fn error_line(error: Option<&String>) -> Element<'static, Message> {
+    match error {
+        Some(message) => text(format!("⚠ {message}")).size(11).color(KARACHA).into(),
+        None => text("").size(11).into(),
+    }
 }
 
 /// 浮きパレット本体。iced にモーダル用の標準ウィジェットは無いので、
@@ -2157,21 +2183,13 @@ fn palette_overlay(app: &App, palette: &Palette) -> Element<'static, Message> {
                                 .into(),
                         )
                     }
-                    HitKind::Body { snippet, hit } => (
-                        &[],
-                        rich_text(highlight_spans(
-                            snippet,
-                            std::slice::from_ref(hit),
-                            KASUMI,
-                        ))
-                        .size(10)
-                        .wrapping(iced::advanced::text::Wrapping::None)
-                        .into(),
-                    ),
+                    HitKind::Body { snippet, hit } => {
+                        (&[], hit_text(snippet, std::slice::from_ref(hit), KASUMI, 10.0))
+                    }
                 };
 
             container(
-                iced::widget::column![highlighted_title(&note.title, title_ranges), second]
+                iced::widget::column![hit_text(&note.title, title_ranges, KINARI, 13.0), second]
                     .spacing(1),
             )
             .padding(6)
@@ -2217,20 +2235,7 @@ fn palette_overlay(app: &App, palette: &Palette) -> Element<'static, Message> {
     .width(Length::Fixed(640.0))
     .style(panel_style);
 
-    // スクリムは背景側だけを覆う層として敷き、その上にパネルを重ねる。
-    // パネルごと `mouse_area` で包むと、パネル内のクリックまで「背景クリック」として拾う。
-    let scrim = mouse_area(
-        container(iced::widget::Space::new().width(Fill).height(Fill))
-            .width(Fill)
-            .height(Fill)
-            .style(|_theme: &iced::Theme| {
-                // 濃墨よりさらに深い墨でぼかす。真っ黒ではなく地の色相を保つ。
-                container::background(Color::from_rgba8(0x0A, 0x09, 0x0B, 0.6))
-            }),
-    )
-    .on_press(Message::PaletteClose);
-
-    stack![scrim, container(panel).center_x(Fill).padding(80)].into()
+    overlay(panel.into(), Message::PaletteClose, 80)
 }
 
 /// リネームの入力欄。パレットと同じ「スクリム + 中央パネル」の作りに揃える。
@@ -2259,18 +2264,7 @@ fn rename_overlay(current: &str) -> Element<'static, Message> {
     .width(Length::Fixed(520.0))
     .style(panel_style);
 
-    let scrim = mouse_area(
-        container(iced::widget::Space::new().width(Fill).height(Fill))
-            .width(Fill)
-            .height(Fill)
-            .style(|_theme: &iced::Theme| {
-                // 濃墨よりさらに深い墨でぼかす。真っ黒ではなく地の色相を保つ。
-                container::background(Color::from_rgba8(0x0A, 0x09, 0x0B, 0.6))
-            }),
-    )
-    .on_press(Message::RenameCancel);
-
-    stack![scrim, container(panel).center_x(Fill).padding(120)].into()
+    overlay(panel.into(), Message::RenameCancel, 120)
 }
 
 /// 初回セットアップの画面（ADR-0015）。Boostnote に倣い、**候補を見せてから選ばせる**。
@@ -2278,11 +2272,7 @@ fn rename_overlay(current: &str) -> Element<'static, Message> {
 /// OS のフォルダ選択をいきなり開かないのは、「何を選ばされているのか」が分からないまま
 /// Finder の窓が出る形を避けるため。
 fn setup_view(setup: &Setup) -> Element<'_, Message> {
-    let error: Element<'_, Message> = match &setup.error {
-        // エラーも枯茶。赤を持ち込まない（ADR-0009）。
-        Some(message) => text(format!("⚠ {message}")).size(11).color(KARACHA).into(),
-        None => text("").size(11).into(),
-    };
+    let error = error_line(setup.error.as_ref());
 
     let panel = container(
         column![
@@ -2341,7 +2331,7 @@ fn view(app: &App) -> Element<'_, Message> {
     // 保存状態は色でも語る。未保存・編集中は枯茶（警告の色）、保存済みは琥珀の明るい側。
     let (state_label, state_color) = if app.show_marker {
         ("● 未保存", KARACHA)
-    } else if app.dirty {
+    } else if is_dirty(app) {
         ("… 編集中", KARACHA)
     } else if app.saved_flash_until.is_some() {
         ("保存しました", KOHAKU_SOFT)
@@ -2365,11 +2355,7 @@ fn view(app: &App) -> Element<'_, Message> {
     ]
     .spacing(16);
 
-    let error: Element<'_, Message> = match &app.error {
-        // エラーも枯茶。赤を持ち込まない（ADR-0009）。
-        Some(message) => text(format!("⚠ {message}")).size(11).color(KARACHA).into(),
-        None => text("").size(11).into(),
-    };
+    let error = error_line(app.error.as_ref());
 
     // **高さを固定する。** 可変にすると表示の桁数が変わるたびに下段の高さが動き、
     // 「打った文字が1つ上の行に入った」ように見える（`Fill` の隣に可変長を置く罠）。
@@ -2421,7 +2407,15 @@ fn main() -> ExitCode {
                 load.failed,
                 root.display()
             );
-            Box::new(move || boot(root.clone(), load.clone(), load_ms))
+            // **`load` を clone しない。** vault 全文（約 1200 件ぶんの `String`）の
+            // deep copy になる。しかもこのクロージャは `Fn` として iced に握られたまま
+            // プロセス終了まで生きるので、clone だと App の実体とは別に
+            // vault 1 本ぶんが常駐し続ける。呼ばれるのは 1 回なので取り出して渡す。
+            let load = std::cell::RefCell::new(Some(load));
+            Box::new(move || {
+                let load = load.borrow_mut().take().expect("boot は 1 回しか呼ばれない");
+                boot(root.clone(), load, load_ms)
+            })
         }
         VaultChoice::NeedsSetup { suggested } => {
             eprintln!("vault: 未設定（初回セットアップを表示します）");
@@ -2455,14 +2449,14 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use haboku::testing::TempDir;
+    use std::os::unix::fs::PermissionsExt;
 
     /// 使い捨て vault を作って `App` を組み立てる。
     ///
     /// **実データを自動保存の実験台にしない。** 本物のノートが壊れる。
-    fn app_with_vault(name: &str) -> (PathBuf, App) {
-        let dir = std::env::temp_dir().join(format!("haboku-app-test-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    fn app_with_vault(name: &str) -> (TempDir, App) {
+        let dir = TempDir::new(name);
 
         // mtime 降順で並ぶので、後に書いたほうが index 0 に来る。
         for (i, title) in ["古い", "新しい"].iter().enumerate() {
@@ -2472,7 +2466,7 @@ mod tests {
 
         let load = vault::load_dir(&dir);
         assert_eq!(load.notes.len(), 2);
-        let app = boot(dir.clone(), load, 0.0);
+        let app = boot(dir.to_path_buf(), load, 0.0);
         (dir, app)
     }
 
@@ -2509,9 +2503,8 @@ mod tests {
 
     /// フォルダ違いのノートを持つ vault を作る。`(フォルダ, タイトル)` の順で置き、
     /// 後に書いたものほど新しい = 一覧の上に来る。
-    fn app_with_folders(name: &str, entries: &[(&str, &str)]) -> (PathBuf, App) {
-        let dir = std::env::temp_dir().join(format!("haboku-app-test-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn app_with_folders(name: &str, entries: &[(&str, &str)]) -> (TempDir, App) {
+        let dir = TempDir::new(name);
 
         for (i, (folder, title)) in entries.iter().enumerate() {
             let sub = dir.join(folder);
@@ -2520,7 +2513,7 @@ mod tests {
             std::fs::write(sub.join(format!("n-{i}.md")), body).unwrap();
         }
 
-        let app = boot(dir.clone(), vault::load_dir(&dir), 0.0);
+        let app = boot(dir.to_path_buf(), vault::load_dir(&dir), 0.0);
         (dir, app)
     }
 
@@ -2531,19 +2524,14 @@ mod tests {
     /// （`docs/spec.md` の「読めないファイルは黙って捨てず件数に出す」）。
     #[test]
     fn unreadable_notes_surface_on_screen() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir =
-            std::env::temp_dir().join(format!("haboku-app-test-{}-unreadable", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("unreadable");
         std::fs::write(dir.join("読める.md"), "# 読める").unwrap();
         let locked = dir.join("鍵付き");
         std::fs::create_dir_all(&locked).unwrap();
         std::fs::write(locked.join("読めない.md"), "# 読めない").unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        let app = boot(dir.clone(), vault::load_dir(&dir), 0.0);
+        let app = boot(dir.to_path_buf(), vault::load_dir(&dir), 0.0);
 
         assert_eq!(app.notes.len(), 1, "読めるノートまで落としている");
         let error = app.error.as_deref().unwrap_or_default();
@@ -2552,8 +2540,6 @@ mod tests {
             "読めなかったことが画面に出ていない: {error:?}"
         );
 
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn insert(c: char) -> Message {
@@ -2584,19 +2570,18 @@ mod tests {
     /// 編集して手を止めたら、デバウンス経過でディスクに書かれること。
     #[test]
     fn autosave_writes_after_debounce() {
-        let (dir, mut app) = app_with_vault("writes");
+        let (_dir, mut app) = app_with_vault("writes");
         send(&mut app,Message::NoteSelected(0));
         send(&mut app,insert('X'));
-        assert!(app.dirty, "編集したのに dirty が立っていない");
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
 
         send(&mut app,Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
         flush_saves(&mut app);
 
         assert_eq!(app.saves, 1, "デバウンス経過後に保存されていない");
-        assert!(!app.dirty, "保存後も dirty が残っている");
+        assert!(!is_dirty(&app), "保存後も dirty が残っている");
         let on_disk = std::fs::read_to_string(&app.notes[0].path).unwrap();
         assert!(on_disk.contains('X'), "編集がディスクに届いていない");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **書き込みが `update()` の中で終わっていないこと。** これが ADR-0014 の要求そのもの。
@@ -2609,7 +2594,7 @@ mod tests {
     /// 外にいること**を固定する。同期保存へ戻したらここが落ちる。
     #[test]
     fn the_disk_write_does_not_happen_inside_update() {
-        let (dir, mut app) = app_with_vault("write-outside-update");
+        let (_dir, mut app) = app_with_vault("write-outside-update");
         send(&mut app, Message::NoteSelected(0));
         send(&mut app, insert('X'));
 
@@ -2625,7 +2610,6 @@ mod tests {
 
         flush_saves(&mut app);
         assert_eq!(app.saves, 1, "投げた保存が完了していない");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **保存が飛んでいる最中の打鍵を、保存済み扱いにしないこと。**
@@ -2635,7 +2619,7 @@ mod tests {
     /// 畳むと、次の切替で「保存済み」と判断されて打った分が消える。
     #[test]
     fn edits_made_while_saving_are_kept_dirty() {
-        let (dir, mut app) = app_with_vault("edit-while-saving");
+        let (_dir, mut app) = app_with_vault("edit-while-saving");
         send(&mut app, Message::NoteSelected(0));
         send(&mut app, insert('X'));
         send(&mut app, Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
@@ -2646,16 +2630,15 @@ mod tests {
         flush_saves(&mut app);
 
         assert_eq!(app.saves, 1, "投げた保存が完了していない");
-        assert!(app.dirty, "保存中に打った分まで保存済み扱いになっている");
+        assert!(is_dirty(&app), "保存中に打った分まで保存済み扱いになっている");
         assert!(app.content.text().contains('Y'), "保存中の打鍵が消えた");
 
         // 次のデバウンスで、遅れた分もちゃんと届く。
         send(&mut app, Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
         flush_saves(&mut app);
-        assert!(!app.dirty, "追いつきの保存が走っていない");
+        assert!(!is_dirty(&app), "追いつきの保存が走っていない");
         let on_disk = std::fs::read_to_string(&app.notes[0].path).unwrap();
         assert!(on_disk.contains('Y'), "保存中に打った分がディスクに届いていない");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **保存中に来た切替は、保存が通ってから実行されること。**
@@ -2664,7 +2647,7 @@ mod tests {
     /// 変わったのは判定の場所だけで、待っている間も UI は生きている。
     #[test]
     fn a_switch_requested_while_saving_waits_for_it() {
-        let (dir, mut app) = app_with_vault("switch-while-saving");
+        let (_dir, mut app) = app_with_vault("switch-while-saving");
         send(&mut app, Message::NoteSelected(0));
         send(&mut app, insert('X'));
         send(&mut app, Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
@@ -2681,7 +2664,6 @@ mod tests {
         assert_eq!(app.selected, Some(1), "保存が通ったのに切り替わらない");
         let on_disk = std::fs::read_to_string(&saving_path).unwrap();
         assert!(on_disk.contains('X'), "切替前の編集がディスクに届いていない");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **何も編集せずノートを切り替えたら、ディスクに書かないこと。**
@@ -2690,7 +2672,7 @@ mod tests {
     /// Done の定義に明記された禁止事項。
     #[test]
     fn switching_without_editing_does_not_touch_the_file() {
-        let (dir, mut app) = app_with_vault("no-write");
+        let (_dir, mut app) = app_with_vault("no-write");
         send(&mut app,Message::NoteSelected(0));
         let before = mtime(&app.notes[0].path);
 
@@ -2698,7 +2680,6 @@ mod tests {
 
         assert_eq!(app.saves, 0, "無編集なのに書き込んでいる");
         assert_eq!(mtime(&app.notes[0].path), before, "無編集なのに mtime が動いた");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **保存に失敗したらノート切替を中断し、編集内容をエディタに残すこと。**
@@ -2707,7 +2688,6 @@ mod tests {
     /// 招いた欠陥がこれ。失敗系は失敗させないと検証できないので、実際に書けなくする。
     #[test]
     fn failed_save_blocks_the_switch_and_keeps_the_text() {
-        use std::os::unix::fs::PermissionsExt;
 
         let (dir, mut app) = app_with_vault("save-fails");
         send(&mut app,Message::NoteSelected(0));
@@ -2722,14 +2702,12 @@ mod tests {
 
         assert_eq!(app.selected, Some(0), "保存に失敗したのに切り替わった");
         assert!(app.error.is_some(), "保存失敗が表に出ていない");
-        assert!(app.dirty, "保存できていないのに dirty が畳まれている");
+        assert!(is_dirty(&app), "保存できていないのに dirty が畳まれている");
         assert!(
             app.content.text().contains('X'),
             "未保存の編集内容がエディタから消えた"
         );
 
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **ウィンドウを閉じるときに、デバウンス途中の編集が書き戻されること。**
@@ -2739,20 +2717,19 @@ mod tests {
     /// 一番踏みやすいデータ喪失の穴だった。
     #[test]
     fn closing_the_window_saves_pending_edits() {
-        let (dir, mut app) = app_with_vault("close-saves");
+        let (_dir, mut app) = app_with_vault("close-saves");
         send(&mut app, Message::NoteSelected(0));
         send(&mut app, insert('X'));
-        assert!(app.dirty, "編集したのに dirty が立っていない");
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
 
         // デバウンス（1 秒）を待たずに閉じる。ここが実際の操作と同じ条件。
         let _ = close_window(&mut app, iced::window::Id::unique());
         flush_saves(&mut app);
 
         assert_eq!(app.saves, 1, "閉じるときに保存されていない");
-        assert!(!app.dirty, "保存したのに dirty が残っている");
+        assert!(!is_dirty(&app), "保存したのに dirty が残っている");
         let on_disk = std::fs::read_to_string(&app.notes[0].path).unwrap();
         assert!(on_disk.contains('X'), "閉じる直前の編集がディスクに届いていない");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **保存に失敗したら、1 回目は閉じないこと。** 黙って終了すると、切替を中断してまで
@@ -2762,7 +2739,6 @@ mod tests {
     /// （dirty が残る・エラーが出る・未保存マーカーが立つ）で確かめる。
     #[test]
     fn first_close_attempt_is_refused_when_saving_fails() {
-        use std::os::unix::fs::PermissionsExt;
 
         let (dir, mut app) = app_with_vault("close-blocked");
         send(&mut app, Message::NoteSelected(0));
@@ -2772,15 +2748,13 @@ mod tests {
         let _ = close_window(&mut app, iced::window::Id::unique());
         flush_saves(&mut app);
 
-        assert!(app.dirty, "保存できていないのに dirty が畳まれている");
+        assert!(is_dirty(&app), "保存できていないのに dirty が畳まれている");
         assert!(app.show_marker, "閉じられない理由が画面に出ていない");
         assert!(app.content.text().contains('X'), "未保存の編集がエディタから消えた");
         // **次に何が起きるかまで伝わっていること。** 「閉じられない」だけでは打つ手がない。
         let error = app.error.as_deref().unwrap_or_default();
         assert!(error.contains("退避"), "2 回目に何が起きるかが伝わっていない: {error}");
 
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **2 回目の要求では、本文を退避してから閉じること。**
@@ -2791,7 +2765,6 @@ mod tests {
     /// ノートのあるフォルダだけを書けなくして、**退避先が vault ルートへ落ちる**ことも同時に見る。
     #[test]
     fn second_close_attempt_rescues_the_text_before_closing() {
-        use std::os::unix::fs::PermissionsExt;
 
         let (dir, mut app) = app_with_folders("close-rescue", &[("topics", "消えては困る")]);
         send(&mut app, Message::NoteSelected(0));
@@ -2826,8 +2799,6 @@ mod tests {
             "退避ファイルが一覧に出ている"
         );
 
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **保存が通ったら「一度断った」記憶を畳むこと。**
@@ -2836,7 +2807,6 @@ mod tests {
     /// 1 回目の要求がそのまま退避＋終了になる。2 段階にした意味が消える。
     #[test]
     fn a_successful_save_resets_the_refusal() {
-        use std::os::unix::fs::PermissionsExt;
 
         let (dir, mut app) = app_with_folders("close-reset", &[("topics", "あ")]);
         send(&mut app, Message::NoteSelected(0));
@@ -2855,7 +2825,6 @@ mod tests {
 
         assert_eq!(app.saves, 1, "権限を戻したのに保存されていない");
         assert!(!app.close_refused, "保存が通ったのに断った記憶が残っている");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **退避にも失敗したら閉じないこと。** ADR-0007 の「2 回目は必ず閉じる」は
@@ -2866,7 +2835,6 @@ mod tests {
     /// （本文がエディタに残る・自力退避の手段が画面に出る）で確かめる。
     #[test]
     fn a_failed_rescue_keeps_the_window_open() {
-        use std::os::unix::fs::PermissionsExt;
 
         let (dir, mut app) = app_with_folders("rescue-fail", &[("topics", "消えては困る")]);
         send(&mut app, Message::NoteSelected(0));
@@ -2891,8 +2859,6 @@ mod tests {
             "自力で退避する手段が伝わっていない: {error}"
         );
 
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **保存が失敗している間、tick のたびに再試行しないこと。**
@@ -2903,7 +2869,6 @@ mod tests {
     /// **保存できない環境ほど画面が固まって、本文をコピーして逃がすことすらできなくなる。**
     #[test]
     fn a_failing_autosave_backs_off_instead_of_retrying_every_tick() {
-        use std::os::unix::fs::PermissionsExt;
 
         let (dir, mut app) = app_with_folders("retry-backoff", &[("topics", "あ")]);
         send(&mut app, Message::NoteSelected(0));
@@ -2936,18 +2901,15 @@ mod tests {
         );
 
         // 本文はどこにも消えていない。
-        assert!(app.dirty, "保存できていないのに dirty が畳まれている");
+        assert!(is_dirty(&app), "保存できていないのに dirty が畳まれている");
         assert!(app.content.text().contains('X'));
 
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **権限が直ったら、バックオフも一緒に畳まれること。**
     /// 待ちが残ったままだと、直ったあとも最大 30 秒書かれない。
     #[test]
     fn a_successful_save_clears_the_backoff() {
-        use std::os::unix::fs::PermissionsExt;
 
         let (dir, mut app) = app_with_folders("retry-clear", &[("topics", "あ")]);
         send(&mut app, Message::NoteSelected(0));
@@ -2967,7 +2929,6 @@ mod tests {
         assert_eq!(app.saves, 1, "権限を戻したのに保存されていない");
         assert_eq!(app.save_failures, 0, "失敗の数が畳まれていない");
         assert!(app.retry_after.is_none(), "待ちが残ったままになっている");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 待ち時間は倍々に伸び、上限で頭打ちになること。
@@ -3009,7 +2970,6 @@ mod tests {
     /// 「異常のシグナル」と doc に書かれた安全装置が、異常時に沈黙していた。
     #[test]
     fn dirty_marker_lights_up_when_saving_keeps_failing() {
-        use std::os::unix::fs::PermissionsExt;
 
         let (dir, mut app) = app_with_vault("marker");
         send(&mut app, Message::NoteSelected(0));
@@ -3020,22 +2980,20 @@ mod tests {
 
         // 上限（2.5 秒）は超えたがマーカー（3 秒）には届かない時点。まだ黙っている。
         send(&mut app, Message::Tick(edited + AUTOSAVE_MAX_WAIT));
-        assert!(app.dirty, "保存に失敗したのに dirty が畳まれた");
+        assert!(is_dirty(&app), "保存に失敗したのに dirty が畳まれた");
         assert!(!app.show_marker, "マーカーの時間に届く前に点灯した");
 
         // マーカーの時間を越えたら点灯する。
         send(&mut app, Message::Tick(edited + DIRTY_MARKER_DELAY));
         assert!(app.show_marker, "保存できていないのに「未保存」が出ない");
 
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 正常に保存できているうちはマーカーを出さないこと。
     /// 常時点灯したらシグナルとして役に立たない。
     #[test]
     fn dirty_marker_stays_off_while_saves_succeed() {
-        let (dir, mut app) = app_with_vault("marker-quiet");
+        let (_dir, mut app) = app_with_vault("marker-quiet");
         send(&mut app, Message::NoteSelected(0));
         send(&mut app, insert('X'));
         let edited = Instant::now();
@@ -3045,7 +3003,6 @@ mod tests {
 
         assert_eq!(app.saves, 1);
         assert!(!app.show_marker, "保存できているのに「未保存」が出た");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **捨てる前に書き戻すこと。** `.trash` に残るのが「最後に自動保存された内容」だと、
@@ -3067,7 +3024,6 @@ mod tests {
         assert_eq!(trashed.len(), 1, ".trash に退避されていない");
         let body = std::fs::read_to_string(trashed[0].path()).unwrap();
         assert!(body.contains('X'), "消す直前の編集が .trash に残っていない");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 打鍵した直後は書かない。1 文字ごとにディスクへ行ったら意味がない。
@@ -3107,7 +3063,7 @@ mod tests {
     /// 新規ノートは**開いているノートと同じフォルダ**に作られ、一覧の先頭に出ること。
     #[test]
     fn new_note_lands_next_to_the_open_note_and_appears_first() {
-        let (dir, mut app) =
+        let (_dir, mut app) =
             app_with_folders("new-note", &[("topics", "設計メモ"), ("notes", "走り書き")]);
 
         // notes フォルダのノートを開いてから作る。
@@ -3124,7 +3080,6 @@ mod tests {
         assert_eq!(app.notes[0].folder, "notes", "開いていたノートと別のフォルダに作られた");
         assert!(app.notes[0].path.exists(), "ファイルが作られていない");
         assert!(app.visible.contains(&0), "作ったノートが一覧に見えていない");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **新規ノートは `0600` で生まれ、保存を重ねても緩まないこと。**
@@ -3134,9 +3089,8 @@ mod tests {
     /// `0600` に保つ修正を入れてもなお、**新しく書いたメモだけが `0644`** で並んでいた。
     #[test]
     fn a_new_note_is_created_private_and_stays_private() {
-        use std::os::unix::fs::PermissionsExt;
 
-        let (dir, mut app) = app_with_folders("new-note-perms", &[("notes", "走り書き")]);
+        let (_dir, mut app) = app_with_folders("new-note-perms", &[("notes", "走り書き")]);
         send(&mut app, Message::NewNote);
         let path = app.notes[0].path.clone();
 
@@ -3150,7 +3104,6 @@ mod tests {
 
         let saved = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(saved, 0o600, "保存で新規ノートの権限が緩んだ");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **作成したらサイドバーのフォルダ件数も増えること。**
@@ -3159,7 +3112,7 @@ mod tests {
     /// `notes` から導かれる状態を更新し忘れる類の食い違いなので、回帰テストとして残す。
     #[test]
     fn creating_a_note_updates_the_folder_count() {
-        let (dir, mut app) =
+        let (_dir, mut app) =
             app_with_folders("folder-count", &[("notes", "あ"), ("notes", "い")]);
         let before = app
             .folders
@@ -3179,7 +3132,6 @@ mod tests {
             .map(|(_, count)| *count)
             .expect("notes フォルダが消えた");
         assert_eq!(after, before + 1, "サイドバーの件数が増えていない");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **先頭への差し込みで既存インデックスがずれても、開いているノートがすり替わらないこと。**
@@ -3188,7 +3140,7 @@ mod tests {
     /// 再現条件が分かりにくいので回帰テストとして残す。
     #[test]
     fn creating_a_note_does_not_swap_the_previously_open_note() {
-        let (dir, mut app) =
+        let (_dir, mut app) =
             app_with_folders("reindex", &[("topics", "あ"), ("topics", "い"), ("topics", "う")]);
         send(&mut app, Message::NoteSelected(2));
         let before = app.notes[2].title.clone();
@@ -3207,13 +3159,12 @@ mod tests {
             app.content.text().contains("本文"),
             "別のノートの本文が開いている"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 同一秒に連打しても両方残ること（ファイル名は秒精度）。
     #[test]
     fn creating_twice_in_the_same_second_keeps_both() {
-        let (dir, mut app) = app_with_folders("same-second", &[("topics", "あ")]);
+        let (_dir, mut app) = app_with_folders("same-second", &[("topics", "あ")]);
         send(&mut app, Message::NoteSelected(0));
 
         send(&mut app, Message::NewNote);
@@ -3224,13 +3175,11 @@ mod tests {
         assert_ne!(first, second, "同じパスを 2 回使っている");
         assert!(first.exists() && second.exists(), "先に作ったファイルが消えた");
         assert_eq!(app.notes.len(), 3);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **保存に失敗したら新規作成もしないこと。** 作成もエディタを上書きする操作。
     #[test]
     fn new_note_is_blocked_when_saving_fails() {
-        use std::os::unix::fs::PermissionsExt;
 
         let (dir, mut app) = app_with_folders("new-note-blocked", &[("topics", "あ")]);
         send(&mut app, Message::NoteSelected(0));
@@ -3245,8 +3194,6 @@ mod tests {
         assert!(app.content.text().contains('X'), "編集内容が消えた");
         assert!(app.error.is_some());
 
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **絞り込み中は、開いているノートのフォルダより絞り込みが優先されること。**
@@ -3255,7 +3202,7 @@ mod tests {
     /// 一覧がすべてに戻る」という動きになる（実際に触って直した）。
     #[test]
     fn creating_while_filtered_uses_that_folder_and_keeps_the_filter() {
-        let (dir, mut app) =
+        let (_dir, mut app) =
             app_with_folders("filter-wins", &[("topics", "設計メモ"), ("notes", "走り書き")]);
 
         // topics のノートを開いたまま、notes で絞り込んで作る。
@@ -3271,7 +3218,6 @@ mod tests {
             "絞り込みが勝手に解除された"
         );
         assert!(app.visible.contains(&0), "作ったノートが一覧に見えていない");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **一覧から消える名前は拒否し、拡張子は補うこと。**
@@ -3293,7 +3239,7 @@ mod tests {
     /// リネームはファイル名だけを変え、本文には触らないこと。
     #[test]
     fn rename_changes_the_file_name_and_keeps_the_body() {
-        let (dir, mut app) = app_with_folders("rename", &[("topics", "設計メモ")]);
+        let (_dir, mut app) = app_with_folders("rename", &[("topics", "設計メモ")]);
         send(&mut app, Message::NoteSelected(0));
         let before = app.notes[0].raw.clone();
 
@@ -3311,13 +3257,12 @@ mod tests {
         assert_eq!(app.notes[0].raw, before, "本文が書き換わった");
         // frontmatter の title: があるので、表示タイトルは変わらないのが仕様。
         assert_eq!(app.notes[0].title, "設計メモ");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **同名が居たら枝番へ逃がし、既存を絶対に潰さないこと。**
     #[test]
     fn rename_into_an_existing_name_gets_a_suffix() {
-        let (dir, mut app) =
+        let (_dir, mut app) =
             app_with_folders("rename-collision", &[("topics", "先客"), ("topics", "動くほう")]);
         let moving = app.notes.iter().position(|n| n.title == "動くほう").unwrap();
         let victim = app.notes.iter().position(|n| n.title == "先客").unwrap();
@@ -3340,14 +3285,13 @@ mod tests {
         );
         assert_eq!(app.notes[victim].raw, victim_body, "先客が潰された");
         assert!(app.notes[victim].path.exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 一覧から消える名前は、エラーを出して**入力欄を開いたまま**にすること。
     /// 閉じてしまうと打ち直せない。
     #[test]
     fn rejected_rename_keeps_the_input_open() {
-        let (dir, mut app) = app_with_folders("rename-rejected", &[("topics", "設計メモ")]);
+        let (_dir, mut app) = app_with_folders("rename-rejected", &[("topics", "設計メモ")]);
         send(&mut app, Message::NoteSelected(0));
         let before = app.notes[0].path.clone();
 
@@ -3358,7 +3302,6 @@ mod tests {
         assert!(app.rename.is_some(), "打ち直せない");
         assert!(app.error.is_some(), "理由が表に出ていない");
         assert_eq!(app.notes[0].path, before, "拒否したのにリネームされた");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// subscription が拾う打鍵を組み立てる（`Message::Key` の実経路を通すため）。
@@ -3383,7 +3326,7 @@ mod tests {
     /// 新規ノートなので、**前のノートのファイル名で誤リネームされる**実害があった。
     #[test]
     fn creating_a_note_closes_an_open_rename() {
-        let (dir, mut app) = app_with_folders("rename-vs-new", &[("topics", "設計メモ")]);
+        let (_dir, mut app) = app_with_folders("rename-vs-new", &[("topics", "設計メモ")]);
         send(&mut app, Message::NoteSelected(0));
         send(&mut app, Message::RenameStarted);
 
@@ -3394,13 +3337,12 @@ mod tests {
         let before = app.notes[0].path.clone();
         send(&mut app, Message::RenameCommit);
         assert_eq!(app.notes[0].path, before, "新規ノートが前の名前でリネームされた");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **リネーム欄を開いたまま一覧の別ノートを選んでも、そのノートがリネームされないこと。**
     #[test]
     fn selecting_a_note_closes_an_open_rename() {
-        let (dir, mut app) =
+        let (_dir, mut app) =
             app_with_folders("rename-vs-select", &[("topics", "先客"), ("topics", "動くほう")]);
         send(&mut app, Message::NoteSelected(0));
         send(&mut app, Message::RenameStarted);
@@ -3411,7 +3353,6 @@ mod tests {
         let before = app.notes[1].path.clone();
         send(&mut app, Message::RenameCommit);
         assert_eq!(app.notes[1].path, before, "選択先が前の名前でリネームされた");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **リネーム欄を開いたまま `Cmd+P` すると入力欄が畳まれ、パレットの Enter が
@@ -3421,7 +3362,7 @@ mod tests {
     /// パレットで選んだつもりの Enter が `RenameCommit` として走る。
     #[test]
     fn opening_the_palette_closes_an_open_rename() {
-        let (dir, mut app) =
+        let (_dir, mut app) =
             app_with_folders("rename-vs-palette", &[("topics", "先客"), ("topics", "動くほう")]);
         send(&mut app, Message::NoteSelected(0));
         send(&mut app, Message::RenameStarted);
@@ -3435,7 +3376,6 @@ mod tests {
         assert!(app.palette.is_none(), "Enter でパレットから開けていない");
         let after: Vec<_> = app.notes.iter().map(|n| n.path.clone()).collect();
         assert_eq!(after, before, "パレットからの選択でリネームが走った");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// サブフォルダが無い vault では `/` の行を出さないこと。
@@ -3444,22 +3384,20 @@ mod tests {
     /// サブフォルダが 1 つでもあれば `/` は「直下だけ見る」という意味を持つので出す。
     #[test]
     fn the_root_row_is_hidden_until_a_subfolder_exists() {
-        let (dir, app) = app_with_folders("root-only", &[("", "あ"), ("", "い")]);
+        let (_dir, app) = app_with_folders("root-only", &[("", "あ"), ("", "い")]);
         assert_eq!(app.notes.len(), 2);
         assert!(
             app.folders.is_empty(),
             "ルート直下だけなのに行が出ている: {:?}",
             app.folders
         );
-        let _ = std::fs::remove_dir_all(&dir);
 
-        let (dir, app) = app_with_folders("root-and-sub", &[("", "あ"), ("topics", "い")]);
+        let (_dir, app) = app_with_folders("root-and-sub", &[("", "あ"), ("topics", "い")]);
         let names: Vec<&str> = app.folders.iter().map(|(n, _)| n.as_str()).collect();
         assert!(
             names.contains(&vault::ROOT_FOLDER) && names.contains(&"topics"),
             "サブフォルダがあるときは / も出す: {names:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 削除は `.trash` へ退避し、一覧とフォルダ件数から消えること。ファイルは残ること。
@@ -3484,7 +3422,6 @@ mod tests {
         // ファイルとしては .trash に残っている（Finder で戻せる）。
         let trashed: Vec<_> = std::fs::read_dir(dir.join(".trash")).unwrap().collect();
         assert_eq!(trashed.len(), 1, ".trash に退避されていない");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **実データで `view()` の構築時間を測る。** Done の定義は打鍵時 1ms 未満。
@@ -3497,10 +3434,7 @@ mod tests {
     #[ignore = "実データの vault が要る。VAULT を指定して --ignored で走らせる"]
     fn measure_view_construction_with_real_vault() {
         // このテストは実データ専用なので、記憶した保存先ではなく `VAULT` だけを見る。
-        let root = match resolve_vault(std::env::var("VAULT").ok(), None, PathBuf::new()) {
-            VaultChoice::Ready(root) => root,
-            other => panic!("VAULT に実データの vault を指定して実行する: {other:?}"),
-        };
+        let root = real_vault_root();
         let load = vault::load_dir(&root);
         let count = load.notes.len();
         let mut app = boot(root, load, 0.0);
@@ -3541,6 +3475,15 @@ mod tests {
             plain < 1.0 && with_palette < 1.0,
             "view() の構築が 1ms を超えた（Done の定義違反）"
         );
+    }
+
+    /// 実測用の vault。**記憶した保存先ではなく `VAULT` だけを見る**
+    /// （実データ専用の計測を、うっかり普段の vault で走らせない）。
+    fn real_vault_root() -> PathBuf {
+        match resolve_vault(std::env::var("VAULT").ok(), None, PathBuf::new()) {
+            VaultChoice::Ready(root) => root,
+            other => panic!("VAULT に実データの vault を指定して実行する: {other:?}"),
+        }
     }
 
     /// 打鍵 1 回ぶんの `refilter` を測って**平均**（ms）を返す。
@@ -3654,10 +3597,7 @@ mod tests {
     #[test]
     #[ignore = "実データの vault が要る。VAULT を指定して --ignored で走らせる"]
     fn measure_refilter_with_real_vault() {
-        let root = match resolve_vault(std::env::var("VAULT").ok(), None, PathBuf::new()) {
-            VaultChoice::Ready(root) => root,
-            other => panic!("VAULT に実データの vault を指定して実行する: {other:?}"),
-        };
+        let root = real_vault_root();
         let notes = vault::load_dir(&root).notes;
         let bytes: usize = notes.iter().map(|n| n.raw.len()).sum();
         println!(
@@ -3789,10 +3729,9 @@ mod tests {
             .iter()
             .map(|(f, t)| (f.as_str(), t.as_str()))
             .collect();
-        let (dir, app) = app_with_folders("truncate", &refs);
+        let (_dir, app) = app_with_folders("truncate", &refs);
 
         assert_eq!(refilter(&app.notes, "").len(), PALETTE_MAX_RESULTS);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **パレットは絞り込み中のフォルダを無視して全ノートを探し、開いたら絞り込みを解除すること。**
@@ -3800,7 +3739,7 @@ mod tests {
     /// 解除しないと「選択中のノートが左の一覧に無い」状態が生まれる。
     #[test]
     fn palette_opens_a_note_from_another_folder_and_clears_the_filter() {
-        let (dir, mut app) =
+        let (_dir, mut app) =
             app_with_folders("cross-folder", &[("topics", "設計メモ"), ("notes", "走り書き")]);
 
         send(&mut app, Message::FolderSelected(Some("notes".to_string())));
@@ -3819,7 +3758,6 @@ mod tests {
             app.visible.contains(&opened),
             "開いたノートが一覧に見えていない"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **絞り込みの中のノートをパレットから開いたときは、絞り込みを維持すること。**
@@ -3828,7 +3766,7 @@ mod tests {
     /// すべてに戻る」動きになっていた。解除は「開いたノートが一覧から消える」ときだけの手段。
     #[test]
     fn palette_keeps_the_filter_when_the_note_is_already_visible() {
-        let (dir, mut app) = app_with_folders(
+        let (_dir, mut app) = app_with_folders(
             "palette-keeps-filter",
             &[("topics", "設計メモ"), ("topics", "別の設計"), ("notes", "走り書き")],
         );
@@ -3843,14 +3781,12 @@ mod tests {
             Some("topics"),
             "同じフォルダのノートを開いただけで絞り込みが解除された"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **保存に失敗したらパレットからも遷移しないこと。** 一覧クリックと同じガードが要る。
     /// パレットは閉じない（閉じてから中断すると、なぜ切り替わらないのかが分からなくなる）。
     #[test]
     fn palette_enter_is_blocked_when_saving_fails() {
-        use std::os::unix::fs::PermissionsExt;
 
         let (dir, mut app) =
             app_with_folders("palette-save-fails", &[("topics", "あ"), ("topics", "い")]);
@@ -3871,14 +3807,12 @@ mod tests {
         assert!(app.error.is_some(), "保存失敗が表に出ていない");
         assert!(app.content.text().contains('X'), "編集内容が消えた");
 
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ctrl-n / ctrl-p が循環すること。矢印キーは `text_input` に消費されて届かない。
     #[test]
     fn palette_selection_cycles_with_ctrl_n_and_ctrl_p() {
-        let (dir, mut app) =
+        let (_dir, mut app) =
             app_with_folders("cycle", &[("topics", "あ"), ("topics", "い"), ("topics", "う")]);
         open_palette(&mut app, "");
         assert_eq!(app.palette.as_ref().unwrap().matches.len(), 3);
@@ -3891,7 +3825,6 @@ mod tests {
         // 先頭で戻ると末尾へ回り込む。
         let _ = handle_palette_key(&mut app, &key("p"), ctrl);
         assert_eq!(app.palette.as_ref().unwrap().selected, 2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// frontmatter のタグが `#` 付きの 1 行になること。
@@ -3926,18 +3859,19 @@ mod tests {
     /// Escape で閉じること（`Cmd+P` のトグルが使えないので、閉じ方はこちらに寄せている）。
     #[test]
     fn palette_closes_on_escape() {
-        let (dir, mut app) = app_with_folders("escape", &[("topics", "あ")]);
+        let (_dir, mut app) = app_with_folders("escape", &[("topics", "あ")]);
         open_palette(&mut app, "");
         let _ = handle_palette_key(&mut app, &named(keyboard::key::Named::Escape), <_>::default());
         assert!(app.palette.is_none());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `text_editor` に届く打鍵を組み立てる。
     ///
     /// **`text` は `Cmd` を押していても付いてくる。** iced はこれを見て `Insert` を作るので、
     /// ここが混入の入口になる。だから `Cmd+P` の再現には `text: Some("p")` が要る。
-    fn key_press(c: &str, modifiers: keyboard::Modifiers) -> text_editor::KeyPress {
+    /// エディタへ直接渡す打鍵。`text` は macOS の実機が制御文字を載せてくる経路と、
+    /// 何も載らない経路の両方を作り分けられるように引数で受ける。
+    fn press(c: &str, modifiers: keyboard::Modifiers, text: Option<&str>) -> text_editor::KeyPress {
         text_editor::KeyPress {
             key: key(c),
             modified_key: key(c),
@@ -3945,9 +3879,13 @@ mod tests {
                 keyboard::key::NativeCode::Unidentified,
             ),
             modifiers,
-            text: Some(c.into()),
+            text: text.map(Into::into),
             status: text_editor::Status::Focused { is_hovered: false },
         }
+    }
+
+    fn key_press(c: &str, modifiers: keyboard::Modifiers) -> text_editor::KeyPress {
+        press(c, modifiers, Some(c))
     }
 
     /// **`Cmd+P` の "p" が本文に入らないこと。** 実 vault のノートに "p" が入って
@@ -3969,16 +3907,7 @@ mod tests {
     /// `Ctrl+A` は `Some("\u{1}")` になる。iced 0.14.2 の既定はこれを見て `None` を返し、
     /// せっかく `Home` へ変換した結果を捨てる（ADR-0016）。**その入力を再現しないと回帰にならない。**
     fn ctrl_press(c: &str, text: Option<&str>) -> text_editor::KeyPress {
-        text_editor::KeyPress {
-            key: key(c),
-            modified_key: key(c),
-            physical_key: keyboard::key::Physical::Unidentified(
-                keyboard::key::NativeCode::Unidentified,
-            ),
-            modifiers: keyboard::Modifiers::CTRL,
-            text: text.map(Into::into),
-            status: text_editor::Status::Focused { is_hovered: false },
-        }
+        press(c, keyboard::Modifiers::CTRL, text)
     }
 
     /// **macOS の Control 系編集操作が本文で効くこと。**
@@ -4035,7 +3964,7 @@ mod tests {
     /// **`Cmd+Z` で直前の編集が戻り、カーソルもその位置へ戻ること。**
     #[test]
     fn undo_restores_the_previous_text_and_cursor() {
-        let (dir, mut app) = app_with_vault("undo-basic");
+        let (_dir, mut app) = app_with_vault("undo-basic");
         send(&mut app, Message::NoteSelected(0));
         replace_content(&mut app, "元の本文");
         let before = app.content.cursor();
@@ -4047,7 +3976,6 @@ mod tests {
 
         assert_eq!(app.content.text(), "元の本文", "元に戻っていない");
         assert_eq!(app.content.cursor(), before, "カーソルが戻っていない");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **連続した同じ種類の編集は 1 ステップ、種類が変わったら区切ること**（ADR-0017）。
@@ -4058,7 +3986,7 @@ mod tests {
     fn undo_groups_the_same_kind_of_edit_and_breaks_on_a_different_one() {
         use iced::advanced::text::editor::{Action, Edit};
 
-        let (dir, mut app) = app_with_vault("undo-grouping");
+        let (_dir, mut app) = app_with_vault("undo-grouping");
         send(&mut app, Message::NoteSelected(0));
         replace_content(&mut app, "");
 
@@ -4076,7 +4004,6 @@ mod tests {
         assert_eq!(app.content.text(), "今日の予定", "削除がまとめて戻っていない");
         undo(&mut app);
         assert_eq!(app.content.text(), "", "入力がまとめて戻っていない");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **カーソルを動かしたら、そこで区切ること。**
@@ -4086,7 +4013,7 @@ mod tests {
     fn moving_the_cursor_starts_a_new_undo_step() {
         use iced::advanced::text::editor::{Action, Motion};
 
-        let (dir, mut app) = app_with_vault("undo-cursor-break");
+        let (_dir, mut app) = app_with_vault("undo-cursor-break");
         send(&mut app, Message::NoteSelected(0));
         replace_content(&mut app, "");
 
@@ -4098,13 +4025,12 @@ mod tests {
         send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
 
         assert_eq!(app.content.text(), "あ", "移動をまたいで 1 ステップにまとめている");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **`Cmd+Shift+Z` でやり直せること。やり直したあとに編集したら、その先は捨てること。**
     #[test]
     fn redo_puts_the_edit_back_and_a_new_edit_drops_the_rest() {
-        let (dir, mut app) = app_with_vault("undo-redo");
+        let (_dir, mut app) = app_with_vault("undo-redo");
         send(&mut app, Message::NoteSelected(0));
         replace_content(&mut app, "");
         type_text(&mut app, "あ");
@@ -4125,7 +4051,6 @@ mod tests {
         send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
         type_text(&mut app, "い");
         assert!(app.redo.is_empty(), "新しい編集で redo が捨てられていない");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **ノートを切り替えたら履歴を捨てること。これは事故防止の核心。**
@@ -4134,7 +4059,7 @@ mod tests {
     /// 今のノートへ書き込まれ、自動保存がそれをディスクまで届ける。
     #[test]
     fn switching_notes_drops_the_undo_history() {
-        let (dir, mut app) = app_with_vault("undo-switch");
+        let (_dir, mut app) = app_with_vault("undo-switch");
         send(&mut app, Message::NoteSelected(0));
         type_text(&mut app, "X");
         // 先に保存を済ませる。dirty のまま切り替えると**保存の完了まで切替が待たされる**
@@ -4153,7 +4078,6 @@ mod tests {
             after_switch,
             "別のノートの本文が今のノートへ入った"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **パレットを開いている間の `Cmd+Z` は本文に効かないこと。**
@@ -4162,7 +4086,7 @@ mod tests {
     /// （Control 系をフォーカスで塞いだのと同じ理由。ADR-0016）。
     #[test]
     fn undo_does_not_fire_while_the_palette_is_open() {
-        let (dir, mut app) = app_with_vault("undo-palette");
+        let (_dir, mut app) = app_with_vault("undo-palette");
         send(&mut app, Message::NoteSelected(0));
         replace_content(&mut app, "");
         type_text(&mut app, "あ");
@@ -4171,14 +4095,13 @@ mod tests {
         send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
 
         assert_eq!(app.content.text(), "あ", "パレット表示中に本文が戻った");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **戻した本文もディスクへ書くこと。** 画面とファイルが食い違ったままになると、
     /// 次に開いたときに戻したはずの編集が復活する。
     #[test]
     fn undo_marks_the_note_for_saving() {
-        let (dir, mut app) = app_with_vault("undo-saves");
+        let (_dir, mut app) = app_with_vault("undo-saves");
         send(&mut app, Message::NoteSelected(0));
         let path = app.notes[0].path.clone();
         type_text(&mut app, "X");
@@ -4191,13 +4114,12 @@ mod tests {
         );
 
         send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
-        assert!(app.dirty, "戻したのに保存対象になっていない");
+        assert!(is_dirty(&app), "戻したのに保存対象になっていない");
         send(&mut app, Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
         flush_saves(&mut app);
 
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(!on_disk.contains('X'), "戻した編集がディスクに残っている");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `Ctrl+K` は `update()` へ回すこと（`Binding::Sequence` では組めない。ADR-0016）。
@@ -4218,7 +4140,7 @@ mod tests {
     fn ctrl_k_cuts_from_the_cursor_to_the_end_of_the_line() {
         use iced::advanced::text::editor::{Action, Motion};
 
-        let (dir, mut app) = app_with_vault("ctrl-k-cut");
+        let (_dir, mut app) = app_with_vault("ctrl-k-cut");
         send(&mut app, Message::NoteSelected(0));
         app.content = text_editor::Content::with_text("一行目\n二行目");
         send(&mut app, Message::Edit(Action::Move(Motion::Right)));
@@ -4226,8 +4148,7 @@ mod tests {
         send(&mut app, Message::CutToLineEnd);
 
         assert_eq!(app.content.text(), "一\n二行目", "行末まで消えていない");
-        assert!(app.dirty, "編集したのに dirty が立っていない");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
     }
 
     /// **行末・空行の `Ctrl+K` では何も起きないこと**（`Backspace` で組むと手前が消える）。
@@ -4239,20 +4160,19 @@ mod tests {
     fn ctrl_k_does_nothing_at_the_end_of_a_line() {
         use iced::advanced::text::editor::{Action, Motion};
 
-        let (dir, mut app) = app_with_vault("ctrl-k-line-end");
+        let (_dir, mut app) = app_with_vault("ctrl-k-line-end");
         send(&mut app, Message::NoteSelected(0));
 
         for (text, where_) in [("一行目\n二行目", "行末"), ("\n二行目", "空行")] {
             app.content = text_editor::Content::with_text(text);
             app.content.perform(Action::Move(Motion::End));
-            app.dirty = false;
+            app.dirty_since = None;
 
             send(&mut app, Message::CutToLineEnd);
 
             assert_eq!(app.content.text(), text, "{where_} で本文が変わった");
-            assert!(!app.dirty, "{where_} で dirty が立った（無編集で保存が走る）");
+            assert!(!is_dirty(&app), "{where_} で dirty が立った（無編集で保存が走る）");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **フォーカスが無いエディタでは Control 系を効かせないこと。**
@@ -4322,7 +4242,7 @@ mod tests {
     /// `key_binding` が無いので、混入はここ（メッセージを受け取る側）でしか止められない。
     #[test]
     fn command_shortcuts_do_not_reach_the_palette_query() {
-        let (dir, mut app) = app_with_folders("cmd-palette", &[("topics", "あ")]);
+        let (_dir, mut app) = app_with_folders("cmd-palette", &[("topics", "あ")]);
         open_palette(&mut app, "graphql");
 
         app.modifiers = keyboard::Modifiers::COMMAND;
@@ -4333,7 +4253,6 @@ mod tests {
         app.modifiers = keyboard::Modifiers::empty();
         let _ = update(&mut app, Message::PaletteQueryChanged("graphqls".to_string()));
         assert_eq!(app.palette.as_ref().unwrap().query, "graphqls");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **⌘ 押下中の打鍵がリネーム欄に入らないこと。**
@@ -4341,7 +4260,7 @@ mod tests {
     /// ここは Enter で**ファイル名としてディスクに届く**ので、混入が実害になる。
     #[test]
     fn command_shortcuts_do_not_reach_the_rename_input() {
-        let (dir, mut app) = app_with_folders("cmd-rename", &[("topics", "設計メモ")]);
+        let (_dir, mut app) = app_with_folders("cmd-rename", &[("topics", "設計メモ")]);
         app.rename = Some("設計メモ.md".to_string());
 
         app.modifiers = keyboard::Modifiers::COMMAND;
@@ -4351,7 +4270,6 @@ mod tests {
         app.modifiers = keyboard::Modifiers::empty();
         let _ = update(&mut app, Message::RenameChanged("新しい名前.md".to_string()));
         assert_eq!(app.rename.as_deref(), Some("新しい名前.md"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **⌘ の押しっぱなしが、フォーカスを失った時点で解けること。**
@@ -4361,7 +4279,7 @@ mod tests {
     /// **安全装置が壊れたときに何が起きるか**まで含めての対処（ADR-0010）。
     #[test]
     fn losing_focus_releases_a_stuck_command_key() {
-        let (dir, mut app) = app_with_folders("stuck-cmd", &[("topics", "あ")]);
+        let (_dir, mut app) = app_with_folders("stuck-cmd", &[("topics", "あ")]);
         app.rename = Some("あ.md".to_string());
         app.modifiers = keyboard::Modifiers::COMMAND;
 
@@ -4371,7 +4289,6 @@ mod tests {
         // 解けているので、戻ってきたあとは普通に打てる。
         let _ = update(&mut app, Message::RenameChanged("い.md".to_string()));
         assert_eq!(app.rename.as_deref(), Some("い.md"), "戻ってきても打てない");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **エディタに入れて出しただけの本文が、元ファイルと 1 バイトも違わないこと。**
@@ -4428,14 +4345,6 @@ mod tests {
     // 「ノートが消えたように見える」経路を作らないための安全装置がここに集まっている。
 
     /// 使い捨ての作業ディレクトリ。`$HOME` の代わりに使う。
-    fn temp_dir_for(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("haboku-setup-test-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     /// セットアップ画面から始まる `App`。**設定ファイルを使い捨てのパスへ向ける**
     /// （本物の `~/Library/Application Support` を汚さない）。
     fn app_in_setup(home: &Path, suggested: PathBuf) -> App {
@@ -4446,7 +4355,7 @@ mod tests {
 
     #[test]
     fn vault_env_wins_over_the_remembered_path() {
-        let home = temp_dir_for("env-wins");
+        let home = TempDir::new("env-wins");
         let env_root = home.join("env-vault");
         let remembered = home.join("remembered-vault");
         std::fs::create_dir_all(&env_root).unwrap();
@@ -4465,13 +4374,13 @@ mod tests {
     /// ここでセットアップへ倒すと、借り物 vault を指したつもりで別の場所へ書き始める。
     #[test]
     fn an_invalid_vault_env_refuses_to_start() {
-        let home = temp_dir_for("env-invalid");
+        let home = TempDir::new("env-invalid");
         let missing = home.join("not-there");
 
         let choice = resolve_vault(
             Some(missing.display().to_string()),
             // 記憶があっても、そちらへ倒さないことが要点。
-            Some(home.clone()),
+            Some(home.to_path_buf()),
             config::default_vault(&home),
         );
 
@@ -4480,7 +4389,7 @@ mod tests {
 
     #[test]
     fn the_remembered_path_opens_without_setup() {
-        let home = temp_dir_for("remembered");
+        let home = TempDir::new("remembered");
         let remembered = home.join("Documents/somewhere else");
         std::fs::create_dir_all(&remembered).unwrap();
 
@@ -4493,7 +4402,7 @@ mod tests {
     /// 同期の失敗などで vault が見えないときに「空になった」と誤解する。
     #[test]
     fn a_remembered_path_that_vanished_falls_back_to_setup() {
-        let home = temp_dir_for("vanished");
+        let home = TempDir::new("vanished");
         let suggested = config::default_vault(&home);
 
         let choice = resolve_vault(None, Some(home.join("gone")), suggested.clone());
@@ -4503,7 +4412,7 @@ mod tests {
 
     #[test]
     fn no_memory_at_all_starts_setup() {
-        let home = temp_dir_for("first-run");
+        let home = TempDir::new("first-run");
         let suggested = config::default_vault(&home);
 
         let choice = resolve_vault(None, None, suggested.clone());
@@ -4515,7 +4424,7 @@ mod tests {
     /// まだ候補でしかないパスへ自動保存が走る。
     #[test]
     fn nothing_reaches_the_disk_while_the_setup_screen_is_up() {
-        let home = temp_dir_for("no-writes");
+        let home = TempDir::new("no-writes");
         let suggested = config::default_vault(&home);
         let mut app = app_in_setup(&home, suggested.clone());
         let before = app.content.text();
@@ -4533,7 +4442,7 @@ mod tests {
 
     #[test]
     fn adopting_the_suggested_folder_creates_remembers_and_loads_it() {
-        let home = temp_dir_for("adopt");
+        let home = TempDir::new("adopt");
         let suggested = config::default_vault(&home);
         // 既にメモが入っているフォルダを選んだ場合も、そのまま開けること。
         std::fs::create_dir_all(&suggested).unwrap();
@@ -4553,7 +4462,7 @@ mod tests {
     /// フォルダが無い場合は作って始める（Boostnote と同じ。ADR-0015）。
     #[test]
     fn adopting_a_folder_that_does_not_exist_yet_creates_it() {
-        let home = temp_dir_for("adopt-new");
+        let home = TempDir::new("adopt-new");
         let suggested = config::default_vault(&home);
         let mut app = app_in_setup(&home, suggested.clone());
 
@@ -4568,7 +4477,7 @@ mod tests {
     /// そこへ書いたものが「消えた」ように見える（ADR-0002 と同じ穴）。
     #[test]
     fn a_folder_that_cannot_be_created_keeps_the_setup_screen_with_a_reason() {
-        let home = temp_dir_for("adopt-fails");
+        let home = TempDir::new("adopt-fails");
         // ファイルの下にディレクトリは作れない。許可を拒否されたときと同じ形の失敗。
         let blocker = home.join("これはファイル");
         std::fs::write(&blocker, "").unwrap();
@@ -4586,7 +4495,7 @@ mod tests {
     /// 記憶に失敗しても**開くのは続ける**（書いたものは失われない）。ただし黙らない。
     #[test]
     fn a_vault_that_cannot_be_remembered_still_opens_but_says_so() {
-        let home = temp_dir_for("cannot-remember");
+        let home = TempDir::new("cannot-remember");
         let suggested = config::default_vault(&home);
         let mut app = app_in_setup(&home, suggested.clone());
         // 設定ファイルの親を作れない場所へ向ける。
@@ -4605,7 +4514,7 @@ mod tests {
     /// 取り消し（フォルダ選択を閉じた）で**勝手に候補を採用しない**。
     #[test]
     fn cancelling_the_folder_dialog_changes_nothing() {
-        let home = temp_dir_for("cancel");
+        let home = TempDir::new("cancel");
         let suggested = config::default_vault(&home);
         let mut app = app_in_setup(&home, suggested.clone());
 
@@ -4619,7 +4528,7 @@ mod tests {
     /// してあるので、ここを落とすと ✕ も `Cmd+Q` も効かない窓になる。
     #[test]
     fn the_window_can_still_be_closed_during_setup() {
-        let home = temp_dir_for("close");
+        let home = TempDir::new("close");
         let mut app = app_in_setup(&home, config::default_vault(&home));
 
         // `Task` の中身は iced ランタイムのものなので、ここでは「空の Task を返して
@@ -4637,7 +4546,7 @@ mod tests {
     /// プレビュー中はエディタが view に無く漏れる先が無いので、ここはトグルでよい。
     #[test]
     fn preview_toggles_with_cmd_shift_v_and_escape() {
-        let (dir, mut app) = app_with_vault("preview-toggle");
+        let (_dir, mut app) = app_with_vault("preview-toggle");
         send(&mut app, Message::NoteSelected(0));
         let cmd_shift = keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT;
 
@@ -4650,23 +4559,21 @@ mod tests {
         send(&mut app, pressed(key("v"), cmd_shift));
         send(&mut app, pressed(named(keyboard::key::Named::Escape), keyboard::Modifiers::empty()));
         assert!(app.preview.is_none(), "Escape で編集へ戻っていない");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **プレビューの出入りは編集ではないこと。** dirty が立つと、無編集のノート切替で
     /// ディスクに書く（mtime が動く）ようになり、Done の定義に反する。
     #[test]
     fn toggling_preview_does_not_mark_dirty() {
-        let (dir, mut app) = app_with_vault("preview-clean");
+        let (_dir, mut app) = app_with_vault("preview-clean");
         send(&mut app, Message::NoteSelected(0));
         let cmd_shift = keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT;
 
         send(&mut app, pressed(key("v"), cmd_shift));
         send(&mut app, pressed(key("v"), cmd_shift));
 
-        assert!(!app.dirty, "表示を切り替えただけで dirty が立った");
+        assert!(!is_dirty(&app), "表示を切り替えただけで dirty が立った");
         assert_eq!(app.saves, 0, "表示を切り替えただけでディスクに書いた");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **プレビュー中にノートを切り替えたら、プレビューのまま新しい本文になること。**
@@ -4674,14 +4581,11 @@ mod tests {
     /// 表示だけ古いままだと「開いたのに前のノートが見えている」となり、読み歩きが成立しない。
     #[test]
     fn preview_follows_note_switch() {
-        let dir = std::env::temp_dir()
-            .join(format!("haboku-app-test-{}-preview-switch", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new("preview-switch");
         // 段落数を変えて、パース結果の項目数で「どちらの本文か」を見分けられるようにする。
         std::fs::write(dir.join("a.md"), "# 一段落\n").unwrap();
         std::fs::write(dir.join("b.md"), "# 見出し\n\n本文。\n\n- 箇条書き\n").unwrap();
-        let mut app = boot(dir.clone(), vault::load_dir(&dir), 0.0);
+        let mut app = boot(dir.to_path_buf(), vault::load_dir(&dir), 0.0);
 
         send(&mut app, Message::NoteSelected(1));
         send(
@@ -4695,14 +4599,13 @@ mod tests {
         assert_eq!(app.selected, Some(0), "前提: 切替が起きていない");
         let after = app.preview.as_ref().expect("切替でプレビューが畳まれた").items().len();
         assert_ne!(before, after, "プレビューが前のノートの本文のまま");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **プレビュー中の `Cmd+Z` は効かないこと。** 効くと「見えていない本文」を
     /// 書き換え、自動保存がそれをディスクまで届ける（パレット中の ⌘Z と同じ穴）。
     #[test]
     fn undo_is_inert_while_previewing() {
-        let (dir, mut app) = app_with_vault("preview-undo");
+        let (_dir, mut app) = app_with_vault("preview-undo");
         send(&mut app, Message::NoteSelected(0));
         type_text(&mut app, "X");
         let typed = app.content.text();
@@ -4714,6 +4617,5 @@ mod tests {
         send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
 
         assert_eq!(app.content.text(), typed, "プレビュー中の ⌘Z が本文を書き換えた");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

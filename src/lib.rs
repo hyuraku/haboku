@@ -9,4 +9,5 @@
 
 pub mod config;
 pub mod fuzzy;
+pub mod testing;
 pub mod vault;

@@ -133,7 +133,7 @@ fn walk(root: &Path, dir: &Path, load: &mut Load) {
             walk(root, &path, load);
         } else if path.extension().is_some_and(|e| e == "md") {
             match read_with_mtime(&path) {
-                Ok((raw, modified)) => load.notes.push(parse(root, path, raw, modified)),
+                Ok((raw, modified)) => load.notes.push(parse_note(root, path, raw, modified)),
                 Err(e) => load.failed(format!("{} を読めません（{e}）", path.display())),
             }
         }
@@ -328,12 +328,9 @@ pub fn move_to_trash(root: &Path, path: &Path) -> std::io::Result<PathBuf> {
     move_to(path, &trash, &name)
 }
 
-/// 保存後にメタ情報（タイトル・プレビュー・タグ）を取り直すための公開版。
+/// 1 件ぶんのメタ情報（タイトル・プレビュー・タグ）を本文から取る。
+/// 読み込み時（`walk`）と、保存・リネーム後の取り直しの両方から呼ぶ。
 pub fn parse_note(root: &Path, path: PathBuf, raw: String, modified: SystemTime) -> Note {
-    parse(root, path, raw, modified)
-}
-
-fn parse(root: &Path, path: PathBuf, raw: String, modified: SystemTime) -> Note {
     let (fm, body) = split_frontmatter(&raw);
 
     // タイトルの決め方は frontmatter > 最初の見出し > ファイル名 の順。
@@ -395,7 +392,7 @@ fn parse(root: &Path, path: PathBuf, raw: String, modified: SystemTime) -> Note 
 /// **改行の種類は問わない。** CRLF のファイルをここで弾くと frontmatter 全体が
 /// 本文へ流れ込み、タグだけでなく `title` も `summary` も落ちる。取りこぼしの中で
 /// これが一番被害が大きい（他のエディタや Windows 由来のファイルで普通に起きる）。
-fn split_frontmatter(raw: &str) -> (Option<String>, &str) {
+fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
     let Some(rest) = raw
         .strip_prefix("---\n")
         .or_else(|| raw.strip_prefix("---\r\n"))
@@ -407,11 +404,13 @@ fn split_frontmatter(raw: &str) -> (Option<String>, &str) {
     };
     // CRLF なら `end` は `\r` の直後を指すが、fm も body も行単位で読むので
     // 残った `\r` は `str::lines()` が落とす。
-    let fm = rest[..end].to_string();
+    //
+    // **fm は借用のまま返す。** 読まれるだけなので所有権は要らず、
+    // `to_string()` にすると 約 1200 件ぶんのコピーが起動時に走る。
     let body = rest[end..]
         .trim_start_matches("\n---")
         .trim_start_matches(['\r', '\n']);
-    (Some(fm), body)
+    (Some(&rest[..end]), body)
 }
 
 /// YAML の行末コメント（空白のあとの `#`）を落とす。
@@ -427,8 +426,11 @@ fn strip_comment(value: &str) -> &str {
 
 /// `key: value` を1つ拾う。YAML パーサは入れない（frontmatter は浅いので過剰）。
 fn scalar(fm: &str, key: &str) -> Option<String> {
+    // **`format!("{key}:")` を作らない。** クロージャの中なので走査した行数ぶん
+    // `String` が確保される。`parse_note` は 1 件につき 3 回ここへ来るので、
+    // 約 1200 件では 1 万回規模の無駄になり、起動の 50ms 予算に直接効く。
     fm.lines()
-        .find_map(|l| l.strip_prefix(&format!("{key}:")))
+        .find_map(|l| l.strip_prefix(key)?.strip_prefix(':'))
         .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_string())
         .filter(|v| !v.is_empty())
 }
@@ -480,6 +482,8 @@ fn clean_tag(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::TempDir;
+    use std::os::unix::fs::PermissionsExt;
 
     /// 順序だけを見たいので、ファイルシステムは触らずに Note を組み立てる。
     /// mtime を実ファイルで作り分けるには filetime クレートか sleep が要り、
@@ -515,29 +519,20 @@ mod tests {
         assert_eq!(titles, ["a", "b", "c"]);
     }
 
-    fn tmp_dir(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("haboku-vault-test-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     /// 空きがあればそのままの名前で予約され、ファイルが実在すること。
     #[test]
     fn reserve_unique_uses_plain_name_when_free() {
-        let dir = tmp_dir("reserve-plain");
+        let dir = TempDir::new("reserve-plain");
         let path = reserve_unique(&dir, "a.md").unwrap();
         assert_eq!(path, dir.join("a.md"));
         assert!(path.exists(), "予約したファイルが作られていない");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 同じ名前を続けて予約すると -2, -3 と枝番が付き、既存を一切潰さないこと。
     /// 秒精度ファイル名の Cmd+N 連打・同名ノートの連続削除がこの性質に乗る。
     #[test]
     fn reserve_unique_never_replaces_existing_files() {
-        let dir = tmp_dir("reserve-suffix");
+        let dir = TempDir::new("reserve-suffix");
         std::fs::write(dir.join("a.md"), "既存の中身").unwrap();
 
         let second = reserve_unique(&dir, "a.md").unwrap();
@@ -550,14 +545,13 @@ mod tests {
             "既存の中身",
             "既存ファイルが置換された"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 移動先が埋まっていても既存を置換せず、枝番を付けて逃がすこと。
     /// **`fs::rename` を直接使うとここで既存が消える**（前身のデータ喪失欠陥の根）。
     #[test]
     fn move_to_never_replaces_an_existing_file() {
-        let dir = tmp_dir("move-collision");
+        let dir = TempDir::new("move-collision");
         std::fs::write(dir.join("a.md"), "先客").unwrap();
         std::fs::write(dir.join("b.md"), "移動するほう").unwrap();
 
@@ -567,14 +561,13 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("a.md")).unwrap(), "先客");
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "移動するほう");
         assert!(!dir.join("b.md").exists(), "移動元が残っている");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `.trash` へ退避すると、ファイルは残るが `load_dir` の走査からは外れること。
     /// 同名を 2 回捨てても先に捨てたほうが消えないこと。
     #[test]
     fn move_to_trash_hides_the_note_but_keeps_the_file() {
-        let dir = tmp_dir("trash");
+        let dir = TempDir::new("trash");
         std::fs::create_dir_all(dir.join("topics")).unwrap();
         std::fs::write(dir.join("topics/a.md"), "一件目").unwrap();
 
@@ -588,7 +581,6 @@ mod tests {
             load_dir(&dir).notes.is_empty(),
             "捨てたノートが一覧に残っている"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **symlink は辿らないこと。** 2 つの実害を同時に塞ぐ:
@@ -598,8 +590,8 @@ mod tests {
     /// - 自分自身（や親）を指すリンクは、辿れば再帰が止まらない
     #[test]
     fn walk_does_not_follow_symlinks() {
-        let dir = tmp_dir("symlink");
-        let outside = tmp_dir("symlink-outside");
+        let dir = TempDir::new("symlink");
+        let outside = TempDir::new("symlink-outside");
         std::fs::write(outside.join("外.md"), "vault の外の秘密").unwrap();
         std::fs::write(dir.join("中.md"), "vault の中").unwrap();
 
@@ -616,8 +608,6 @@ mod tests {
             load.failed, 0,
             "仕様どおりの除外を失敗に数えている（毎回警告が出てしまう）"
         );
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// **読めなかったものが件数と理由で返ること。** 呼び出し元がこれを持たないと、
@@ -627,9 +617,8 @@ mod tests {
     /// 権限を無視して読めてしまうため、**ファイル単体の `0000` では足りない**）。
     #[test]
     fn load_dir_counts_what_it_could_not_read() {
-        use std::os::unix::fs::PermissionsExt;
 
-        let dir = tmp_dir("load-failures");
+        let dir = TempDir::new("load-failures");
         std::fs::write(dir.join("読める.md"), "# 読める").unwrap();
         let locked = dir.join("鍵付き");
         std::fs::create_dir_all(&locked).unwrap();
@@ -651,15 +640,13 @@ mod tests {
             "どこで失敗したのか分からない: {reason}"
         );
 
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 保存が一時ファイルを残さないこと。残ると vault にゴミが積もり、
     /// 名前が `.md` で終われば一覧にも出る。
     #[test]
     fn save_leaves_no_temporary_file_behind() {
-        let dir = tmp_dir("save-tmp");
+        let dir = TempDir::new("save-tmp");
         let path = dir.join("a.md");
         std::fs::write(&path, "元の中身").unwrap();
 
@@ -672,7 +659,6 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, ["a.md"], "一時ファイルが残っている");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **保存が元ファイルの権限を引き継ぐこと。** tmp → rename は inode ごと差し替えるので、
@@ -680,9 +666,8 @@ mod tests {
     /// 「打っただけでファイルの公開範囲が変わる」は、保存層が起こしてよい副作用ではない。
     #[test]
     fn save_keeps_the_original_permissions() {
-        use std::os::unix::fs::PermissionsExt;
 
-        let dir = tmp_dir("save-perms");
+        let dir = TempDir::new("save-perms");
         let path = dir.join("私的なメモ.md");
         std::fs::write(&path, "元の中身").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -692,23 +677,20 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "保存でファイルの権限が緩んだ");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "新しい中身");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **元ファイルが無いときは緩いほうではなく厳しいほう（0600）へ倒すこと。**
     /// 外部で消えたノートを書き戻す場面で umask に任せると、公開範囲が勝手に広がる。
     #[test]
     fn save_creates_a_private_file_when_the_original_is_gone() {
-        use std::os::unix::fs::PermissionsExt;
 
-        let dir = tmp_dir("save-perms-missing");
+        let dir = TempDir::new("save-perms-missing");
         let path = dir.join("消えたメモ.md");
 
         save(&path, "書き戻した本文").unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "元が無いのに既定の umask で作られた");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **退避は書けない場所を飛ばして次の候補へ落ちること。** 保存が失敗した原因が
@@ -716,14 +698,13 @@ mod tests {
     /// 空の `.rescue`（＝予約はできたが書けなかった残骸）を残さないことも見る。
     #[test]
     fn write_rescue_falls_through_to_a_writable_directory() {
-        use std::os::unix::fs::PermissionsExt;
 
-        let locked = tmp_dir("rescue-locked");
-        let open = tmp_dir("rescue-open");
+        let locked = TempDir::new("rescue-locked");
+        let open = TempDir::new("rescue-open");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         let path = write_rescue(
-            &[locked.clone(), open.clone()],
+            &[locked.to_path_buf(), open.to_path_buf()],
             "メモ.md",
             "失われては困る本文",
         )
@@ -740,67 +721,58 @@ mod tests {
             "書けなかった場所に残骸ができた"
         );
 
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _ = std::fs::remove_dir_all(&locked);
-        let _ = std::fs::remove_dir_all(&open);
     }
 
     /// 退避は既存を絶対に潰さないこと。2 回続けて退避しても 1 回目が残る。
     /// **最後の手段が前回の最後の手段を消したら意味がない。**
     #[test]
     fn write_rescue_never_replaces_an_earlier_rescue() {
-        let dir = tmp_dir("rescue-collision");
+        let dir = TempDir::new("rescue-collision");
 
-        let first = write_rescue(std::slice::from_ref(&dir), "メモ.md", "1 回目").unwrap();
-        let second = write_rescue(std::slice::from_ref(&dir), "メモ.md", "2 回目").unwrap();
+        let first = write_rescue(&[dir.to_path_buf()], "メモ.md", "1 回目").unwrap();
+        let second = write_rescue(&[dir.to_path_buf()], "メモ.md", "2 回目").unwrap();
 
         assert_ne!(first, second, "同じパスへ 2 回書いている");
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "1 回目");
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "2 回目");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **予約は `0600` で作られること。** 新規ノートはこの inode に書き続け、`save()` は
     /// 元ファイルの権限を引き継ぐので、ここが umask 任せだと `0644` を永久に引きずる。
     #[test]
     fn reserve_unique_creates_a_private_file() {
-        use std::os::unix::fs::PermissionsExt;
 
-        let dir = tmp_dir("reserve-perms");
+        let dir = TempDir::new("reserve-perms");
         let path = reserve_unique(&dir, "新しいメモ.md").unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "予約が既定の umask で作られた");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **退避先も `0600` であること。** `.rescue` へ落ちるのは通常経路で保存できなかった本文で、
     /// 元ノートが非公開だった可能性がいちばん高い。最後の手段が公開範囲を広げてはいけない。
     #[test]
     fn write_rescue_creates_a_private_file() {
-        use std::os::unix::fs::PermissionsExt;
 
-        let dir = tmp_dir("rescue-perms");
-        let path = write_rescue(std::slice::from_ref(&dir), "私的なメモ.md", "秘密の本文").unwrap();
+        let dir = TempDir::new("rescue-perms");
+        let path = write_rescue(&[dir.to_path_buf()], "私的なメモ.md", "秘密の本文").unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "退避で本文の公開範囲が広がった");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 拡張子なしの名前でも枝番が末尾に付くこと（.trash へ雑ファイルが来ても壊れない）。
     #[test]
     fn reserve_unique_handles_names_without_extension() {
-        let dir = tmp_dir("reserve-noext");
+        let dir = TempDir::new("reserve-noext");
         std::fs::write(dir.join("README"), "").unwrap();
         let path = reserve_unique(&dir, "README").unwrap();
         assert_eq!(path, dir.join("README-2"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ファイルシステムを触らずに 1 件だけパースする。
     fn parsed(raw: &str) -> Note {
-        parse(
+        parse_note(
             Path::new("/vault"),
             PathBuf::from("/vault/n.md"),
             raw.to_string(),

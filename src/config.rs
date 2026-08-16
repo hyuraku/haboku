@@ -53,17 +53,7 @@ pub fn write_vault(config: &Path, root: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 使い捨ての `$HOME` を作る。テストごとに別のディレクトリを持つ。
-    fn temp_home(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "haboku-config-test-{}-{name}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::testing::TempDir;
 
     #[test]
     fn config_lives_under_application_support() {
@@ -85,7 +75,7 @@ mod tests {
 
     #[test]
     fn a_written_path_reads_back() {
-        let home = temp_home("roundtrip");
+        let home = TempDir::new("roundtrip");
         let config = config_file(&home);
         let root = home.join("Documents/haboku");
 
@@ -96,7 +86,7 @@ mod tests {
 
     #[test]
     fn a_missing_config_reads_as_none() {
-        let home = temp_home("missing");
+        let home = TempDir::new("missing");
         assert_eq!(read_vault(&config_file(&home)), None);
     }
 
@@ -104,7 +94,7 @@ mod tests {
     /// 呼ぶ側が「記憶がある」と誤解してルート直下を開きにいく。
     #[test]
     fn an_empty_config_reads_as_none() {
-        let home = temp_home("empty");
+        let home = TempDir::new("empty");
         let config = config_file(&home);
         fs::create_dir_all(config.parent().unwrap()).unwrap();
 
@@ -118,7 +108,7 @@ mod tests {
     /// フォルダ選択で選ばれるのは大抵ユーザーが名付けたフォルダなので、ここは通らないと困る。
     #[test]
     fn paths_with_japanese_and_spaces_survive_the_round_trip() {
-        let home = temp_home("unicode");
+        let home = TempDir::new("unicode");
         let config = config_file(&home);
         let root = home.join("Documents/わたしの メモ帳");
 
