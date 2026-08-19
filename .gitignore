@@ -9,5 +9,13 @@
 /notes
 /vault
 
+# 手元に置くだけの記録。追跡するのは docs/implementation-notes.md だけ
+/docs/decisions/
+/docs/spec.md
+/docs/lessons.md
+/docs/review-2026-08-11-release-readiness.md
+/docs/review-2026-08-17-public-release.md
+/docs/research-2026-08-15-boostnote-legacy-comparison.md
+
 # macOS
 .DS_Store

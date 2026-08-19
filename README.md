@@ -72,11 +72,6 @@ cargo run --release           # debug ビルドは読み込みが一桁遅くな
   （消えるのは自動保存の上限 2.5 秒ぶんまで。ADR-0021）
 - `BIZ UDGothic` が無い環境では別の等幅フォントに静かにフォールバックする（桁揃えは保証されない）
 
-## 設計の記録
-
-採用・不採用の判断は [docs/decisions/](docs/decisions/) に ADR として、
-仕様の現状は [docs/spec.md](docs/spec.md) に残している。
-
 ## ライセンス
 
 [MIT](LICENSE)
