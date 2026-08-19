@@ -1,0 +1,55 @@
+[package]
+name = "haboku"
+version = "0.2.0"
+edition = "2024"
+description = "ローカルの Markdown をそのまま扱う macOS 専用メモアプリ"
+license = "MIT"
+publish = false
+
+# iced 0.14。features の理由（ADR-0001 / spike の実測）:
+#   highlighter … コードブロックのシンタックスハイライト（syntect を iced_highlighter 越しに使う）
+#   advanced    … text_input / editor の低レベル API に触るため
+#   tokio       … `iced::time::every` は iced_futures のランタイム backend 越しに生える。
+#                 tokio か smol を選ぶまで `time::every` はそもそも名前解決に失敗する（自動保存のデバウンスに要る）
+#   markdown    … `Cmd+Shift+V` の読み取り専用プレビュー（ADR-0019）。
+#                 増える依存は pulldown-cmark だけで、描画は iced 標準の widget に任せる
+[dependencies]
+iced = { version = "0.14", features = ["highlighter", "advanced", "tokio", "markdown"] }
+
+# 保存の `sync_all` を UI スレッドから追い出すためだけ。ADR-0014。
+# **新しい依存ではない**（iced の tokio feature で既に依存ツリーにいる）。直接宣言するのは
+# `spawn_blocking` を名指しで呼ぶため。`rt` だけあれば足りるので default-features は切る。
+tokio = { version = "1", default-features = false, features = ["rt"] }
+
+# 新規ノートのファイル名（2026-08-09-153301.md）を作るためだけ。ADR-0005。
+# std にローカル時刻を得る手段が無く、依存ツリーに既にある time 0.3 は
+# `local-offset` がマルチスレッドで IndeterminateOffset を返すため使えない。
+# clock だけあれば足りるので default-features は切る。
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# 初回セットアップの「別の場所を選ぶ…」で NSOpenPanel を出すためだけ。ADR-0015。
+# **macOS の許可（TCC）を取る手段でもある**ので、UI の都合ではなく権限設計上必要。
+# default-features は Linux 向け backend（wayland / xdg-portal）と blocking API 用の
+# pollster なので全部切る。切った結果 Cargo.lock の増分は rfd 1 crate だけ
+# （objc2 系・block2・dispatch2 は既に依存ツリーにいた）。
+rfd = { version = "0.17.2", default-features = false }
+
+# 既定メニューの Quit 項目の飛び先を `terminate:` から `performClose:` へ付け替えるためだけ。
+# ADR-0021。**新しい依存ではない**（winit がこの版を使っており、既に依存ツリーにいる）。
+# これが無いと Cmd+Q が NSApp を直接終了させ、保存ガードごと素通りする。
+# objc2-app-kit は default-features（AppKit 全クラスの生成）を切り、触る 3 クラスだけ有効にする。
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "NSApplication",
+    "NSMenu",
+    "NSMenuItem",
+] }
+
+# 配布する .app のサイズを削るため。挙動は変えない設定だけを入れる。
+#   lto / codegen-units … crate をまたいだ inline と dead code 削除を効かせる（ビルドは遅くなる）
+#   strip               … デバッグシンボルを落とす。バックトレースは release 配布物では使わない
+# `panic = "abort"` は入れない。ADR-0014 の `spawn_blocking` 保存パスで、
+# パニックが JoinError（＝保存エラーとして扱える）ではなくプロセス即死に変わるため。
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

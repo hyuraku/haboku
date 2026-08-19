@@ -9,5 +9,12 @@
 /notes
 /vault
 
+# 手元に置くだけの記録。追跡するのは docs/implementation-notes.md だけ
+/docs/decisions/
+/docs/spec.md
+/docs/lessons.md
+/docs/review-*
+/docs/research-*
+
 # macOS
 .DS_Store

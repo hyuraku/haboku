@@ -22,7 +22,7 @@
 Rust 2024 edition / [iced](https://github.com/iced-rs/iced) 0.14（features: `highlighter`, `advanced`, `tokio`）。
 シンタックスハイライトは syntect（`iced_highlighter` 経由）。
 
-選定理由と却下した代替案は `docs/decisions/` を参照。非標準な技術を足すときは innovation token を1枚払う意識で、ADR に理由を残す。
+選定理由と却下した代替案は `docs/decisions/` を参照。非標準な技術を足すときは innovation token を1枚払う意識で、ADR に理由を残す。**ADR と `docs/spec.md` は手元にだけ置く**（git 管理外。`.gitignore` 参照）。
 
 ## 由来
 
@@ -48,6 +48,9 @@ gpui + gpui-component で書いた前身がある（凍結）。
 - **安全装置は、失敗したときに何が起きるかまで設計する。** 読み込み専用モードは借り物データを守るつもりで「打てるのに保存されない＝書いた本文が消える」経路を作っていた（`docs/decisions/` 参照）
 
 ## 記録の規約
+
+**追跡するのは `docs/implementation-notes.md` だけ。** ADR・spec・レビュー・research は
+手元に置き、git 管理から外してある（`.gitignore`）。書く場所は変わらないが、**公開物には出ない**。
 
 - 設計判断（採用・不採用と理由）→ `docs/decisions/` に ADR として残す。チャットに置き去りにしない
 - 実装中の計画からの逸脱・現場判断 → `docs/implementation-notes.md` の Deviations に追記
