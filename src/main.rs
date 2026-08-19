@@ -20,6 +20,7 @@ use iced::{Color, Element, Fill, Font, Length, Subscription, Task};
 
 use haboku::{config, fuzzy, vault};
 
+mod appkit;
 mod highlight;
 
 // ── 幽玄パレット。6 トークン + 派生値（ADR-0009、値の正は意匠 Artifact）──
@@ -447,12 +448,26 @@ enum Message {
     SetupBrowse,
     /// 初回セットアップ: フォルダ選択の結果。`None` は取り消し（何もしない）。
     SetupPicked(Option<PathBuf>),
-    /// ウィンドウを閉じる要求（`Cmd+W`・✕・`Cmd+Q`）。
+    /// ウィンドウを閉じる要求。
+    ///
+    /// **3 つの終了操作が、それぞれ違う道でここへ来る**（ADR-0021）:
+    ///
+    /// - **✕ ボタン** … `performClose:` → `windowShouldClose:` → winit の `CloseRequested`
+    /// - **`Cmd+Q`** … 既定メニューの Quit 項目。素のままだと `terminate:` で
+    ///   **プロセスを即死させる**ので、起動時に飛び先を `performClose:` へ付け替えて
+    ///   ✕ と同じ道に合流させている（`Message::RetargetQuitMenu`）
+    /// - **`Cmd+W`** … メニューに Close 項目が無く、届け先を持たない普通のキーイベント。
+    ///   `map_event` が拾ってここへ写す
     ///
     /// **既定の `exit_on_close_request = true` のままだと、これを受け取る前にプロセスが
     /// 終わる。** デバウンス（1 秒）の途中で閉じれば、その分の編集はディスクにも
     /// メモリにも残らず消える。`main` で false にして、保存を挟めるようにしてある。
     CloseRequested(iced::window::Id),
+    /// 起動直後に 1 回だけ流れる。Quit 項目の飛び先を付け替える（ADR-0021）。
+    ///
+    /// **boot からしか流さない。** これを受けたときだけ AppKit に触るので、
+    /// テストが送らない限り `update()` は今までどおり純粋に動く。
+    RetargetQuitMenu,
 }
 
 /// **いつディスクへ書くかを決める、この機能の心臓部。**
@@ -1551,6 +1566,7 @@ fn update_setup(app: &mut App, message: Message) -> Task<Message> {
         // `close_window`（保存を挟む経路）ではなく素直に閉じる。
         Message::CloseRequested(id) => return iced::window::close(id),
         // 打鍵・tick など。**保存先が決まる前に何も起こさせない。**
+        // （`RetargetQuitMenu` は `update()` の入口で処理済みでここへは来ない）
         _ => {}
     }
 
@@ -1558,6 +1574,20 @@ fn update_setup(app: &mut App, message: Message) -> Task<Message> {
 }
 
 fn update(app: &mut App, message: Message) -> Task<Message> {
+    // **セットアップ中でも通す**（下の `setup` ガードより手前に置く理由）。boot から
+    // 1 回しか流れないので、ここで捨てると初回起動の人だけ Cmd+Q が素通りしたままになる。
+    // vault には触らないメッセージなので、ADR-0015 の「選ぶ前に書かない」とは競合しない。
+    if matches!(message, Message::RetargetQuitMenu) {
+        if let Err(reason) = appkit::retarget_quit_to_close() {
+            // **黙って劣化させない。** この行が出ているときの Cmd+Q は保存を待たない。
+            app.error = join_errors(
+                app.error.take(),
+                Some(format!("Cmd+Q の保存ガードを取り付けられません（{reason}）")),
+            );
+        }
+        return Task::none();
+    }
+
     // **保存先が決まるまでは他を一切通さない**（ADR-0015）。`root` はまだ候補で、
     // 自動保存の tick や打鍵がここを抜けると「まだ選んでいない場所」へ書きに行く。
     if app.setup.is_some() {
@@ -1745,6 +1775,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         // 保存先が決まったあとに来ても、ここで vault を差し替えたりはしない。
         Message::SetupUseSuggested | Message::SetupBrowse | Message::SetupPicked(_) => {}
         Message::CloseRequested(id) => return close_window(app, id),
+        // 入口で先に処理して return しているので、ここへは来ない
+        // （`match` を網羅にしておくと、メッセージを足したとき取りこぼしが出ない）。
+        Message::RetargetQuitMenu => {}
         Message::WindowUnfocused => app.modifiers = keyboard::Modifiers::empty(),
         Message::Key(event) => {
             // 修飾キーの状態を控える。**⌘ の keydown は文字キーより必ず先に届く**ので、
@@ -1853,6 +1886,56 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
     Task::none()
 }
 
+/// subscription が拾った生イベントを `Message` へ写す。
+///
+/// **クロージャではなく名前付き関数なのは、`Cmd+W` の写像をテストから直接叩くため**
+/// （ADR-0021）。`listen_with` は `fn` ポインタを取るので、そのまま渡せる。
+///
+/// `window` は `Cmd+W` を `Message::CloseRequested` に写すのに要る。この Id は
+/// **subscription の第 3 引数でしか取れない**（`Message::Key` の側からは辿れない）ので、
+/// ⌘ のショートカット表（`update()` 側）ではなくここで受ける。
+fn map_event(
+    event: iced::event::Event,
+    _status: iced::event::Status,
+    window: iced::window::Id,
+) -> Option<Message> {
+    match event {
+        iced::event::Event::Keyboard(key_event) => {
+            // **`Cmd+W` はメニューに食われず、ここまで普通のキーとして届いている。**
+            // 既定メニューに Close 項目が無いせいで届け先が無く、不発だった（ADR-0021）。
+            if is_close_shortcut(&key_event) {
+                Some(Message::CloseRequested(window))
+            } else {
+                Some(Message::Key(key_event))
+            }
+        }
+        // ⌘ を押したまま抜けると「離した」通知が来ない。押しっぱなしのまま戻ると
+        // 入力欄が黙って無反応になるので、フォーカスを失った時点で解く（ADR-0010）。
+        iced::event::Event::Window(iced::window::Event::Unfocused) => {
+            Some(Message::WindowUnfocused)
+        }
+        _ => None,
+    }
+}
+
+/// このキーイベントが「窓を閉じる」操作かどうか（`Cmd+W`）。
+///
+/// 判定を切り出してあるのは、**閉じる操作の取りこぼしと誤爆を実時間なしで固定する**ため。
+/// `Message::Key` へ落ちたものは今までどおり本文やショートカット表へ流れるので、
+/// ここで true を返した瞬間に 2 段階クローズ（ADR-0012）の入口が開く。
+fn is_close_shortcut(event: &keyboard::Event) -> bool {
+    matches!(
+        event,
+        keyboard::Event::KeyPressed {
+            key,
+            modifiers,
+            repeat: false,
+            ..
+        } if key.as_ref() == keyboard::Key::Character("w")
+            && *modifiers == keyboard::Modifiers::COMMAND
+    )
+}
+
 /// キー入力と自動保存の tick。
 ///
 /// キーは **`keyboard::listen()` ではなく `event::listen_with()` で拾う。**
@@ -1862,15 +1945,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 /// tick は **dirty（か、消すべき表示がある）ときだけ**回す。`Subscription` は state を見て
 /// 出し分けられるので、何も編集していない間はタイマーがそもそも存在しない。
 fn subscription(app: &App) -> Subscription<Message> {
-    let keys = iced::event::listen_with(|event, _status, _window| match event {
-        iced::event::Event::Keyboard(key_event) => Some(Message::Key(key_event)),
-        // ⌘ を押したまま抜けると「離した」通知が来ない。押しっぱなしのまま戻ると
-        // 入力欄が黙って無反応になるので、フォーカスを失った時点で解く（ADR-0010）。
-        iced::event::Event::Window(iced::window::Event::Unfocused) => {
-            Some(Message::WindowUnfocused)
-        }
-        _ => None,
-    });
+    let keys = iced::event::listen_with(map_event);
 
     // 閉じる要求は **dirty かどうかに関わらず**常に拾う。dirty のときだけ購読すると、
     // 「閉じた瞬間に dirty が解ける」ような競合で取りこぼしたときに黙って終了する。
@@ -2437,7 +2512,10 @@ fn main() -> ExitCode {
     // 保存先が決まっているときだけ、iced を起動する前に読み込む。
     // **時間を測るのに UI の初期化を混ぜたくない**（初回セットアップ経由の分は
     // `adopt_vault` が測る。Done の定義の 50ms は 2 回目以降の起動で見る）。
-    let boot_app: Box<dyn Fn() -> App> = match choice {
+    // boot は `(App, Task)` を返せる（`IntoBoot`）。**起動直後に 1 回だけ**
+    // Quit 項目の付け替えを流すのにこれを使う。AppKit はメインスレッドからしか
+    // 触れないので、`main` の中ではなく `update()` の中で実行させる（ADR-0021）。
+    let boot_app: Box<dyn Fn() -> (App, Task<Message>)> = match choice {
         VaultChoice::Refuse(msg) => {
             eprintln!("haboku: {msg}");
             return ExitCode::from(2);
@@ -2459,12 +2537,20 @@ fn main() -> ExitCode {
             let load = std::cell::RefCell::new(Some(load));
             Box::new(move || {
                 let load = load.borrow_mut().take().expect("boot は 1 回しか呼ばれない");
-                boot(root.clone(), load, load_ms)
+                (
+                    boot(root.clone(), load, load_ms),
+                    Task::done(Message::RetargetQuitMenu),
+                )
             })
         }
         VaultChoice::NeedsSetup { suggested } => {
             eprintln!("vault: 未設定（初回セットアップを表示します）");
-            Box::new(move || boot_setup(suggested.clone()))
+            Box::new(move || {
+                (
+                    boot_setup(suggested.clone()),
+                    Task::done(Message::RetargetQuitMenu),
+                )
+            })
         }
     };
 
@@ -4760,5 +4846,96 @@ mod tests {
         send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
 
         assert_eq!(app.content.text(), typed, "プレビュー中の ⌘Z が本文を書き換えた");
+    }
+
+    // ── `Cmd+W` の写像（ADR-0021）────────────────────────────────────────
+    //
+    // **ここが柱 2 の全部。** `Cmd+W` は既定メニューに Close 項目が無いせいで
+    // 届け先を持たず不発だった（実機で確認: 窓ごと生存した）。写像を純関数に
+    // 切り出してあるので、閉じる操作の取りこぼしと誤爆を実時間なしで固定できる。
+
+    /// subscription が受け取る形の生イベントを組み立てる。
+    fn key_event(k: keyboard::Key, modifiers: keyboard::Modifiers, repeat: bool) -> iced::event::Event {
+        let Message::Key(mut event) = pressed(k, modifiers) else {
+            unreachable!("pressed は Message::Key を返す");
+        };
+        if let keyboard::Event::KeyPressed { repeat: r, .. } = &mut event {
+            *r = repeat;
+        }
+        iced::event::Event::Keyboard(event)
+    }
+
+    /// `map_event` に流して結果を得る。window Id は写し先の照合に使う。
+    fn mapped(event: iced::event::Event, window: iced::window::Id) -> Option<Message> {
+        map_event(event, iced::event::Status::Ignored, window)
+    }
+
+    /// **`Cmd+W` が閉じる要求になること。** これが写らないと窓が閉じない。
+    #[test]
+    fn cmd_w_asks_to_close_the_window() {
+        let window = iced::window::Id::unique();
+        let message = mapped(
+            key_event(key("w"), keyboard::Modifiers::COMMAND, false),
+            window,
+        );
+
+        let Some(Message::CloseRequested(id)) = message else {
+            panic!("Cmd+W が閉じる要求にならない: {message:?}");
+        };
+        assert_eq!(id, window, "別の窓を閉じようとしている");
+    }
+
+    /// **オートリピートは無視すること。**
+    ///
+    /// 保存が失敗している間の 2 段階クローズ（1 回目は拒否、2 回目で `.rescue` 退避）が、
+    /// キーの押しっぱなしで**警告を読む間もなく素通りする**のを防ぐ（ADR-0012）。
+    #[test]
+    fn a_held_down_cmd_w_does_not_close_twice() {
+        let message = mapped(
+            key_event(key("w"), keyboard::Modifiers::COMMAND, true),
+            iced::window::Id::unique(),
+        );
+
+        assert!(
+            matches!(message, Some(Message::Key(_))),
+            "リピートで閉じようとした: {message:?}"
+        );
+    }
+
+    /// **素の `w` は本文に入ること。** 写像が広すぎると打てない文字ができる。
+    #[test]
+    fn a_bare_w_is_still_typed() {
+        let message = mapped(
+            key_event(key("w"), keyboard::Modifiers::empty(), false),
+            iced::window::Id::unique(),
+        );
+
+        assert!(
+            matches!(message, Some(Message::Key(_))),
+            "素の w で窓を閉じようとした: {message:?}"
+        );
+    }
+
+    /// **修飾は完全一致。** `Cmd+Shift+W` では閉じない（ADR-0016 の `Ctrl` と同じ流儀）。
+    #[test]
+    fn cmd_shift_w_does_not_close_the_window() {
+        let modifiers = keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT;
+        let message = mapped(key_event(key("w"), modifiers, false), iced::window::Id::unique());
+
+        assert!(
+            matches!(message, Some(Message::Key(_))),
+            "Cmd+Shift+W で窓を閉じようとした: {message:?}"
+        );
+    }
+
+    /// **フォーカス喪失の写像を壊していないこと**（ADR-0010 の ⌘ 解除）。
+    #[test]
+    fn losing_focus_still_releases_the_command_key() {
+        let message = mapped(
+            iced::event::Event::Window(iced::window::Event::Unfocused),
+            iced::window::Id::unique(),
+        );
+
+        assert!(matches!(message, Some(Message::WindowUnfocused)), "{message:?}");
     }
 }

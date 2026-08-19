@@ -33,6 +33,17 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # （objc2 系・block2・dispatch2 は既に依存ツリーにいた）。
 rfd = { version = "0.17.2", default-features = false }
 
+# 既定メニューの Quit 項目の飛び先を `terminate:` から `performClose:` へ付け替えるためだけ。
+# ADR-0021。**新しい依存ではない**（winit がこの版を使っており、既に依存ツリーにいる）。
+# これが無いと Cmd+Q が NSApp を直接終了させ、保存ガードごと素通りする。
+# objc2-app-kit は default-features（AppKit 全クラスの生成）を切り、触る 3 クラスだけ有効にする。
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "NSApplication",
+    "NSMenu",
+    "NSMenuItem",
+] }
+
 # 配布する .app のサイズを削るため。挙動は変えない設定だけを入れる。
 #   lto / codegen-units … crate をまたいだ inline と dead code 削除を効かせる（ビルドは遅くなる）
 #   strip               … デバッグシンボルを落とす。バックトレースは release 配布物では使わない

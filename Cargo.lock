@@ -1183,6 +1183,8 @@ version = "0.2.0"
 dependencies = [
  "chrono",
  "iced",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
  "rfd",
  "tokio",
 ]
