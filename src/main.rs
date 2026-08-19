@@ -578,8 +578,9 @@ fn visible_indices(notes: &[vault::Note], folder: Option<&str>) -> Vec<usize> {
         .collect()
 }
 
-/// ノートを開いていないときのエディタの中身。
-const WELCOME: &str = "左の一覧からノートを選ぶか、Cmd+P で検索すると、ここに本文が出ます。";
+/// ノートが 1 件も無いときに出す案内（ADR-0022）。**エディタの中身ではない** —
+/// 未選択のときはエディタそのものを画面に出さない（`empty_pane`）。
+const EMPTY_VAULT: &str = "ノートがまだありません。Cmd+N で最初のノートを作ります。";
 
 /// `$HOME`。**`.app` から起動しても launchd が渡すので、ここは環境変数で足りる**
 /// （シェルの設定に依存する `VAULT` とは事情が違う）。
@@ -614,7 +615,7 @@ fn boot(root: PathBuf, load: vault::Load, load_ms: f64) -> App {
     let error = load_warning(&load);
     let notes = load.notes;
 
-    App {
+    let mut app = App {
         root,
         setup: None,
         config_file: config::config_file(&home_dir()),
@@ -623,7 +624,7 @@ fn boot(root: PathBuf, load: vault::Load, load_ms: f64) -> App {
         selected_folder: None,
         visible,
         selected: None,
-        content: text_editor::Content::with_text(WELCOME),
+        content: text_editor::Content::new(),
         palette: None,
         rename: None,
         preview: None,
@@ -644,7 +645,11 @@ fn boot(root: PathBuf, load: vault::Load, load_ms: f64) -> App {
         last_view_us: Cell::new(0),
         saving: None,
         pending: None,
-    }
+    };
+
+    // 読み込み直後から「開いているノートがある」状態にする（ADR-0022）。
+    open_newest(&mut app);
+    app
 }
 
 /// 保存先が決まっていないときの起動（ADR-0015）。
@@ -715,11 +720,11 @@ fn adopt_vault(app: &mut App, root: PathBuf) {
     let warning = load_warning(&load);
 
     app.root = root;
-    app.selected = None;
     app.selected_folder = None;
     app.notes = load.notes;
     refresh_derived(app);
-    replace_content(app, WELCOME);
+    // 起動時と同じ規則で開く（ADR-0022）。
+    open_newest(app);
     app.setup = None;
     // **読めなかった件数も、記憶できなかった件も、どちらも黙らない。**
     // 常駐エラーは 1 行なので繋げて出す（片方だけ出すと、もう片方が消える）。
@@ -1093,6 +1098,22 @@ fn open_note(app: &mut App, index: usize) {
     app.rename = None;
 }
 
+/// 読み込み直後に「開いているノートが必ずある」状態にする（ADR-0022）。
+///
+/// 一覧は `vault::sort_notes` が mtime 降順で固定しているので、**先頭が直近に更新された
+/// ノート**。ここは選択を動かすだけで、`begin_save` は `contents == raw` で抜けるため
+/// **ディスクには書かない**（無編集で mtime を動かさない規律）。
+///
+/// 空 vault のときだけ未選択のままにする。そのときエディタは画面に出ない（`empty_pane`）。
+fn open_newest(app: &mut App) {
+    if app.notes.is_empty() {
+        app.selected = None;
+        replace_content(app, "");
+        return;
+    }
+    open_note(app, 0);
+}
+
 /// 新規ノートを作って `notes` の先頭に差し込む。返り値は挿入した位置（常に 0）。
 ///
 /// 置き場所は**いま絞り込んでいるフォルダ**。絞り込んでいなければ開いているノートと
@@ -1226,12 +1247,19 @@ fn delete_note(app: &mut App) -> Result<(), String> {
     let path = app.notes[index].path.clone();
     vault::move_to_trash(&app.root, &path).map_err(|e| format!("削除に失敗: {e}"))?;
 
-    // 取り除くと後ろのインデックスが繰り上がる。開いていたのは消したノート自身なので
-    // 選択を外し、エディタを空にする（繰り上げの計算そのものを不要にする）。
+    // 取り除くと後ろのインデックスが繰り上がる。**消した位置に居続ける**ので、
+    // 同じ index を開き直す（末尾を消したときだけ 1 つ前）。ADR-0022 の
+    // 「未選択 ⟺ ノートが 0 件」を保つため、最後の 1 件を消したときだけ選択を外す。
+    //
+    // どちらの枝も `replace_content` を通る。消したノートの履歴を残すと、
+    // 次に開いたノートで `Cmd+Z` が消したはずの本文を蘇らせる。
     app.notes.remove(index);
-    app.selected = None;
-    // 消したノートの履歴を残すと、次に開いたノートで `Cmd+Z` が消したはずの本文を蘇らせる。
-    replace_content(app, "");
+    if app.notes.is_empty() {
+        app.selected = None;
+        replace_content(app, "");
+    } else {
+        open_note(app, index.min(app.notes.len() - 1));
+    }
     clear_dirty(app);
     refresh_derived(app);
     Ok(())
@@ -1996,6 +2024,12 @@ fn macos_control_binding(key: &keyboard::Key) -> Option<text_editor::Binding<Mes
 }
 
 fn editor_pane(app: &App) -> Element<'_, Message> {
+    // **未選択でエディタを出さない**（ADR-0022）。出すと、打てるのに `mark_edited` が
+    // dirty を立てず、ノートを開いた瞬間に無警告で消える（ADR-0002 で廃止した経路と同型）。
+    // 選択が無いのは vault が 0 件のときだけ。
+    if app.selected.is_none() {
+        return empty_pane();
+    }
     if let Some(preview) = &app.preview {
         return preview_pane(preview);
     }
@@ -2010,6 +2044,17 @@ fn editor_pane(app: &App) -> Element<'_, Message> {
         .highlight_with::<highlight::MarkdownHighlighter>((), markdown_format)
         .style(editor_style)
         .height(Fill)
+        .into()
+}
+
+/// ノートが 1 件も無いときの面。エディタと同じ淡墨に、`Cmd+N` の案内だけを置く。
+///
+/// **ここに編集できるものを置かない。** 置いた瞬間に「打てるのに保存されない」経路が戻る。
+fn empty_pane() -> Element<'static, Message> {
+    container(text(EMPTY_VAULT).size(13).color(KASUMI))
+        .center_x(Fill)
+        .center_y(Fill)
+        .style(|_theme: &iced::Theme| container::background(TANBOKU))
         .into()
 }
 
@@ -3412,7 +3457,12 @@ mod tests {
 
         assert_eq!(app.notes.len(), 1, "一覧から消えていない");
         assert_eq!(app.notes[0].title, "残るほう");
-        assert_eq!(app.selected, None, "消したノートが開いたままになっている");
+        // ADR-0022: 消した位置に選択が残り、繰り上がったノートが開く。
+        assert_eq!(app.selected, Some(0), "消したあとに残ったノートを開いていない");
+        assert!(
+            app.content.text().contains("残るほう"),
+            "残ったノートを開き直していない"
+        );
         assert_eq!(
             app.folders.iter().find(|(n, _)| n == "topics").unwrap().1,
             1,
@@ -3422,6 +3472,99 @@ mod tests {
         // ファイルとしては .trash に残っている（Finder で戻せる）。
         let trashed: Vec<_> = std::fs::read_dir(dir.join(".trash")).unwrap().collect();
         assert_eq!(trashed.len(), 1, ".trash に退避されていない");
+    }
+
+    /// 削除しても選択は**消した位置に居続ける**こと。末尾を消したときだけ 1 つ前へ寄る
+    /// （ADR-0022）。`Cmd+Delete` を連打したときに視点が飛ばないための規則。
+    #[test]
+    fn deleting_keeps_the_selection_at_the_same_position() {
+        let (_dir, mut app) =
+            app_with_folders("delete-keeps", &[("", "一"), ("", "二"), ("", "三")]);
+        let below = app.notes[2].title.clone();
+
+        send(&mut app, Message::NoteSelected(1));
+        send(&mut app, Message::DeleteNote);
+
+        assert_eq!(app.selected, Some(1), "消した位置に選択が残っていない");
+        assert_eq!(
+            app.notes[1].title, below,
+            "繰り上がってきたノートを開いていない"
+        );
+        assert!(
+            app.content.text().contains(below.as_str()),
+            "エディタが空のまま（開き直していない）"
+        );
+
+        // 末尾（残り 2 件の index 1）を消したら 1 つ前へ寄る。
+        send(&mut app, Message::NoteSelected(1));
+        send(&mut app, Message::DeleteNote);
+
+        assert_eq!(app.selected, Some(0), "末尾を消したのに 1 つ前へ寄っていない");
+    }
+
+    /// 最後の 1 件を消したときだけ未選択に戻ること（ADR-0022 の不変条件
+    /// 「未選択 ⟺ ノートが 0 件」の片側）。エディタには前の本文を残さない。
+    #[test]
+    fn deleting_the_last_note_leaves_nothing_selected() {
+        let (_dir, mut app) = app_with_folders("delete-last", &[("", "ひとつ")]);
+        assert_eq!(app.selected, Some(0), "起動時に開いていない");
+
+        send(&mut app, Message::DeleteNote);
+
+        assert!(app.notes.is_empty(), "一覧から消えていない");
+        assert_eq!(app.selected, None, "0 件なのに選択が残っている");
+        assert_eq!(app.content.text(), "", "消したノートの本文がエディタに残っている");
+    }
+
+    /// **起動したら直近に更新されたノートが開いていること**（ADR-0022 の柱 1）。
+    ///
+    /// これが無いと、未選択のエディタに打った本文がノートを開いた瞬間に無警告で消える
+    /// （ADR-0002 が廃止した「打てるのに保存されない」経路と同型）。
+    #[test]
+    fn booting_opens_the_newest_note() {
+        let (_dir, app) = app_with_vault("boot-newest");
+
+        assert_eq!(app.selected, Some(0), "起動直後にノートが開いていない");
+        assert_eq!(app.notes[0].title, "新しい", "一覧の先頭が直近のノートでない");
+        assert!(
+            app.content.text().contains("新しい"),
+            "エディタに先頭ノートの本文が入っていない"
+        );
+    }
+
+    /// **起動時に開いてもディスクには書かないこと。** Done の定義に明記された禁止事項で、
+    /// ここが破れると起動しただけで vault 全体の mtime が動きうる。
+    #[test]
+    fn booting_does_not_write_the_note_it_opens() {
+        let (_dir, mut app) = app_with_vault("boot-no-write");
+        let before = mtime(&app.notes[0].path);
+
+        // デバウンスを跨いでも、開いただけなら書かない。
+        send(&mut app, Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
+        flush_saves(&mut app);
+
+        assert_eq!(app.saves, 0, "起動時に開いただけで書き込んでいる");
+        assert_eq!(mtime(&app.notes[0].path), before, "開いただけで mtime が動いた");
+    }
+
+    /// 0 件の vault では未選択のままで、エディタの中身も空であること（ADR-0022）。
+    /// このときだけ画面にエディタが出ない（`empty_pane`）。
+    #[test]
+    fn booting_an_empty_vault_selects_nothing() {
+        let dir = TempDir::new("boot-empty");
+        let app = boot(dir.to_path_buf(), vault::load_dir(&dir), 0.0);
+
+        assert!(app.notes.is_empty(), "空の vault を作れていない");
+        assert_eq!(app.selected, None, "0 件なのに選択がある");
+        assert_eq!(
+            app.content.text(),
+            "",
+            "空 vault なのにエディタへ文字が入っている（打てば消える経路）"
+        );
+
+        // `empty_pane` の枝を実際に通す。**画面に何が出ているかはテストから見えない**ので、
+        // ここで確かめられるのは「エディタを出さない枝が組み立つ」ことだけ（目視は別途）。
+        drop(view(&app));
     }
 
     /// **実データで `view()` の構築時間を測る。** Done の定義は打鍵時 1ms 未満。
