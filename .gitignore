@@ -13,9 +13,8 @@
 /docs/decisions/
 /docs/spec.md
 /docs/lessons.md
-/docs/review-2026-08-11-release-readiness.md
-/docs/review-2026-08-17-public-release.md
-/docs/research-2026-08-15-boostnote-legacy-comparison.md
+/docs/review-*
+/docs/research-*
 
 # macOS
 .DS_Store
