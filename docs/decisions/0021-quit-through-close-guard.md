@@ -1,7 +1,7 @@
 # ADR-0021: 終了操作を保存ガードに乗せる — Quit は `performClose:` へ付け替え、Cmd+W は Rust で受ける
 
 - 日付: 2026-08-18
-- ステータス: 採用（設計合意済み・**実装は未着手**。実装の TODO は `docs/implementation-notes.md` の「次の一歩」）
+- ステータス: 採用・**実装済み**（2026-08-19。受け入れ条件はすべて満たした — 下の「実装の結果」）
 - 関連: ADR-0007（終了時の保存）、ADR-0012（2 段階クローズと退避）、ADR-0014（`PendingAction::Close`）、
   `docs/review-2026-08-17-public-release.md` のブロッカー B-1（この ADR はその解消方針）
 
@@ -86,6 +86,36 @@ Cmd+W はメニューに食われず**普通のキーイベントとしてアプ
 - **実機ドライバ 3 経路（Cmd+Q / Cmd+W / ✕）すべてで「プロセス終了 + ノートが 2 bytes」**
 - docs 更新: `src/main.rs:450-455` のコメント / `docs/spec.md:53` の終了行 /
   README のキー表（`Cmd+W` 追記）/ レビュー B-1 に解消の追記
+
+### 実装の結果（2026-08-19）
+
+満たした:
+
+- `cargo test` 112 passed / 0 failed、`cargo clippy --all-targets` 警告なし。
+  写像のユニットテストは 4 本（`cmd_w_asks_to_close_the_window` /
+  `a_held_down_cmd_w_does_not_close_twice` / `a_bare_w_is_still_typed` /
+  `cmd_shift_w_does_not_close_the_window`）+ ADR-0010 の回帰 1 本
+- 実機ドライバ 3 経路。**設計時に「終了 + 2 bytes」だけを条件にしていたのは不十分だった**ので、
+  終了までの経過時間を足した（下記）
+- docs: `src/main.rs` の `CloseRequested` の doc / `docs/spec.md` の終了行 /
+  README のキー表と「前提と割り切り」/ レビュー B-1 に追記
+
+| 経路 | プロセス | 終了まで | ノート |
+|---|---|---|---|
+| 放置（煙試験） | 生存 | — | 2 bytes（自動保存。計器の正当性確認） |
+| Cmd+Q | **終了** | 0.12s | **2 bytes**（`0a0a`） |
+| Cmd+W | **終了** | 0.12s | **2 bytes** |
+| ✕ ボタン | **終了** | 0.14s | **2 bytes** |
+
+**時間を測ったのは、「2 bytes」だけでは書いた主体を特定できないから。** 終了が遅ければ
+デバウンス（1 秒）が先に満期を迎え、保存ガードが素通りでも自動保存が同じ 2 bytes を残す。
+実測 0.12〜0.14 秒（最後の編集からでも約 0.45 秒）はどちらの満期よりも手前なので、
+書いたのは閉じる要求の保存ガードだと分離できる。**受け入れ条件を「終了 + 2 bytes」と
+書いた時点では、この偽陽性に気づいていなかった。**
+
+`objc2` / `objc2-app-kit` の追加で **Cargo.lock に増えた `[[package]]` はゼロ**。動いたのは
+haboku 自身の依存欄の 2 行だけで、crate はどちらも winit 経由で既にツリーにいたものを
+名指ししただけ。「新しい依存ではない」の裏取り。
 
 実機ドライバの手順（再構築できる粒度で）: 使い捨て vault + release ビルドを起動し、
 Swift の `CGEvent.postToPid`（AX trusted 必須。System Events は同名プロセス誤解決の罠が
