@@ -661,9 +661,19 @@ Codex の敵対的レビューを「本番公開できる品質か」で走ら�
 | **エディタを上書き／破棄する全経路に保存ガード** | 切替・パレット・作成・リネーム・削除・**終了**をテストで固定 |
 | 日本語・コードブロックが欠けない | 実データ 約 1200 件を目視 + 往復バイト一致テスト。**等幅（桁揃え）は `BIZ UDGothic` で ADR-0013 が担保**（実測 ASCII 1024 : CJK 2048。実機の目視も済み — 2026-08-11、40 桁 ASCII 行と 20 文字 CJK 行の右端一致をスクリーンショットで確認） |
 | 保存が UI を止めない | `update()` の中でディスクへ書かないことをテストで固定（ADR-0014） |
-| `cargo test` / `cargo clippy --all-targets` | 84 passed + 1 ignored / 警告なし |
+| `cargo test` / `cargo clippy --all-targets` | 150 passed + 3 ignored / 警告なし |
 
 ## 次の一歩
+
+**最優先: 公開ブロッカーの実装（ADR-0021。設計は合意済み・未実装）。**
+Cmd+Q が保存ガードを素通りして編集が消える（実機再現済み）。やることは 2 つ:
+(1) 起動時に Quit メニュー項目の action を `terminate:` → `performClose:` へ付け替える
+（objc2。boot の `(App, Task)` で `RetargetQuitMenu` を 1 回流し、update() 内でパッチ）、
+(2) Cmd+W を `listen_with` の写像関数で `Message::CloseRequested(window)` へ
+（COMMAND 完全一致・repeat 無視）。**完了条件**: cargo test / clippy 通過 +
+実機ドライバ 3 経路（Cmd+Q / Cmd+W / ✕）すべて「プロセス終了 + ノート 2 bytes」+
+`main.rs:450` コメント・`spec.md:53`・README キー表・公開可否レビュー B-1 の更新。
+設計の全文と却下案は ADR-0021、経緯は `docs/review-2026-08-17-public-release.md` の B-1。
 
 決まっていないことが 2 つ残っている。どちらも `Cmd+N` の使い勝手に関わる（M5 で先送りした）:
 
