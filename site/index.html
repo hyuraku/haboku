@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>haboku：ローカル Markdown のメモアプリ</title>
+    <meta name="description" content="haboku は、ディスクにある Markdown ファイルをそのまま開いて書く macOS 向けのメモアプリです。約 1200 件の vault を 30.2ms で読み込み、編集していないノートには書き込みません。">
+    <meta name="theme-color" content="#18161A">
+    <meta property="og:title" content="haboku：ローカル Markdown のメモアプリ">
+    <meta property="og:description" content="ディスクにある Markdown ファイルをそのまま開いて書く、macOS 向けのメモアプリ。">
+    <meta property="og:type" content="website">
+    <meta property="og:image" content="icon-1024.png">
+    <link rel="icon" href="icon-1024.png">
+    <link rel="apple-touch-icon" href="icon-1024.png">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="grain" aria-hidden="true"></div>
+    <div class="sumi" aria-hidden="true"></div>
+
+    <header class="masthead">
+      <a class="wordmark" href="#top">
+        <img src="icon-1024.png" alt="" width="28" height="28">
+        <span>haboku</span>
+      </a>
+      <nav aria-label="ページ内ナビゲーション">
+        <a href="#keys">キー</a>
+        <a href="#install">導入</a>
+        <a class="external" href="https://github.com/hyuraku/haboku">GitHub<span aria-hidden="true">↗</span></a>
+      </nav>
+    </header>
+
+    <span class="rakkan" aria-hidden="true">幽玄</span>
+
+    <main id="top">
+      <section class="hero">
+        <div class="hero-mark reveal" style="--d:0ms">
+          <img src="icon-1024.png" alt="haboku のアイコン。濃墨の地に生成りの一筆。" width="220" height="220">
+        </div>
+
+        <p class="kicker reveal" style="--d:60ms"><span>Mac用Markdownメモアプリ</span></p>
+        <h1 class="reveal" style="--d:120ms">
+          <em>Markdown</em> を<br>
+          開いて、探して、書く
+        </h1>
+        <p class="lead reveal" style="--d:200ms">
+          haboku は macOS 向けのメモアプリです。
+          ノートはディスクにある普通の <code>.md</code> のままなので、アプリを消しても一つも失われません。
+        </p>
+
+        <div class="actions reveal" style="--d:280ms">
+          <a class="btn primary" href="#install">はじめる</a>
+          <a class="btn ghost" href="https://github.com/hyuraku/haboku">ソースを読む</a>
+        </div>
+
+      </section>
+
+      <section class="keys" id="keys">
+        <div class="section-head">
+          <h2>キーバインドの一覧</h2>
+        </div>
+        <table>
+          <caption>キーバインドの一覧</caption>
+          <tbody>
+            <tr>
+              <th scope="row"><kbd>⌘</kbd><kbd>P</kbd></th>
+              <td>ノートを探す。<kbd>⌃</kbd><kbd>N</kbd> と <kbd>⌃</kbd><kbd>P</kbd> で候補を移動し、<kbd>return</kbd> で開き、<kbd>esc</kbd> で閉じる</td>
+            </tr>
+            <tr>
+              <th scope="row"><kbd>⌘</kbd><kbd>N</kbd></th>
+              <td>新しいノートを作る</td>
+            </tr>
+            <tr>
+              <th scope="row"><kbd>⌘</kbd><kbd>R</kbd></th>
+              <td>ファイル名を変える</td>
+            </tr>
+            <tr>
+              <th scope="row"><kbd>⌘</kbd><kbd>delete</kbd></th>
+              <td>vault の中の <code>.trash/</code> へ退避する。即時には削除しない</td>
+            </tr>
+            <tr>
+              <th scope="row"><kbd>⌘</kbd><kbd>⇧</kbd><kbd>V</kbd></th>
+              <td>編集と Markdown プレビューを切り替える</td>
+            </tr>
+            <tr>
+              <th scope="row"><kbd>⌘</kbd><kbd>Z</kbd></th>
+              <td>取り消す。<kbd>⌘</kbd><kbd>⇧</kbd><kbd>Z</kbd> でやり直す</td>
+            </tr>
+            <tr>
+              <th scope="row"><kbd>⌘</kbd><kbd>W</kbd></th>
+              <td>保存を待ってから閉じる。<kbd>⌘</kbd><kbd>Q</kbd> は同じ手順で終了する</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="note">
+          保存に失敗した状態で閉じようとすると、最初の操作は中断されます。
+          もう一度閉じると、本文を <code>.rescue</code> ファイルへ退避してから終了します。
+          退避にも失敗した場合は閉じません。
+        </p>
+      </section>
+
+      <section class="install" id="install">
+        <div class="section-head">
+          <h2>ソースから動かす手順</h2>
+          <p>配布しているのは macOS 向けのソースです。stable の Rust ツールチェイン（edition 2024）が要ります。</p>
+        </div>
+        <pre><code><span class="p">$</span> git clone https://github.com/hyuraku/haboku.git
+<span class="p">$</span> cd haboku
+<span class="p">$</span> cargo run --release</code></pre>
+        <p class="note">
+          初回の起動でノートの置き場所を選びます。既定の候補は <code>~/Documents/haboku</code> です。
+          すでにある Markdown のフォルダを選んだ場合は、それをそのまま vault として開きます。
+        </p>
+      </section>
+
+    </main>
+
+    <footer>
+      <p class="foot-mark"><img src="icon-1024.png" alt="" width="24" height="24"><strong>haboku</strong></p>
+      <p class="foot-meta">
+        <a href="https://github.com/hyuraku/haboku">GitHub</a>
+        <span>MIT License</span>
+        <span>Rust 2024</span>
+        <span>iced 0.14</span>
+      </p>
+    </footer>
+  </body>
+</html>
