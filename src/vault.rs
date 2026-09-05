@@ -21,7 +21,7 @@ pub struct Note {
     /// 直下に置かれたノートは [`ROOT_FOLDER`]。
     /// 実データは tags をほぼ持たず、分類はフォルダが担っていた。
     pub folder: String,
-    /// 一覧に出す1行。frontmatter の `summary` があればそれ、無ければ本文の先頭行。
+    /// 一覧に出す1行。summary が無ければ、タイトルに使った行より後の本文から取る。
     pub preview: String,
     /// frontmatter を含むファイル全文。エディタにはこれをそのまま渡す。
     pub raw: String,
@@ -332,16 +332,19 @@ pub fn move_to_trash(root: &Path, path: &Path) -> std::io::Result<PathBuf> {
 /// 読み込み時（`walk`）と、保存・リネーム後の取り直しの両方から呼ぶ。
 pub fn parse_note(root: &Path, path: PathBuf, raw: String, modified: SystemTime) -> Note {
     let (fm, body) = split_frontmatter(&raw);
+    let (directive_title, directive_tags, body) = split_directives(body);
+    let mut preview_body = body;
 
-    // タイトルの決め方は frontmatter > 最初の見出し > ファイル名 の順。
-    // wiki 系のファイルは frontmatter を持ち、雑メモは持たないので両対応が要る。
+    // frontmatter > 先頭ディレクティブ > 本文の先頭行 > ファイル名。
     let title = fm
         .as_ref()
         .and_then(|f| scalar(f, "title"))
+        .or_else(|| directive_title.map(str::to_string))
         .or_else(|| {
-            body.lines()
-                .find(|l| l.starts_with("# "))
-                .map(|l| l[2..].trim().to_string())
+            title_from_body(body).map(|(title, end)| {
+                preview_body = &body[end..];
+                title
+            })
         })
         .unwrap_or_else(|| {
             path.file_stem()
@@ -349,7 +352,21 @@ pub fn parse_note(root: &Path, path: PathBuf, raw: String, modified: SystemTime)
                 .unwrap_or_default()
         });
 
-    let tags = fm.as_ref().map(|f| tags(f)).unwrap_or_default();
+    // 空の tags: も明示指定。キーが無いときだけディレクティブへ進む。
+    let tags = fm
+        .filter(|f| f.lines().any(|line| line.starts_with("tags:")))
+        .map(tags)
+        .unwrap_or_else(|| {
+            directive_tags
+                .filter(|value| !value.starts_with('#'))
+                .map(|value| {
+                    strip_comment(value)
+                        .split(',')
+                        .filter_map(clean_tag)
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
 
     // 実データの vault は tags をほぼ持たず、sources / topics / notes …
     // というルート直下のフォルダが分類を担っていた。サイドバーはそれに合わせる。
@@ -361,14 +378,14 @@ pub fn parse_note(root: &Path, path: PathBuf, raw: String, modified: SystemTime)
         .map(|c| c.as_os_str().to_string_lossy().to_string())
         .unwrap_or_else(|| ROOT_FOLDER.to_string());
 
-    // プレビューは frontmatter の summary を最優先。これが無い雑メモは本文の先頭行。
-    // raw から取ると frontmatter の `date: "..."` を拾ってしまう（実際に拾っていた）。
+    // summary が無ければ、ディレクティブとタイトルに消費した行を除いた本文を使う。
     let preview = fm
         .as_ref()
         .and_then(|f| scalar(f, "summary"))
         .unwrap_or_else(|| {
-            body.lines()
-                .find(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            preview_body
+                .lines()
+                .find(|l| !l.trim().is_empty())
                 .unwrap_or_default()
                 .to_string()
         })
@@ -385,6 +402,48 @@ pub fn parse_note(root: &Path, path: PathBuf, raw: String, modified: SystemTime)
         raw,
         modified,
     }
+}
+
+/// 先頭の空行と既知のディレクティブだけを消費し、値と残りの本文を借用で返す。
+/// 普通の行で打ち切るため、本文やコードブロック内の記法はメタ情報にならない。
+fn split_directives(body: &str) -> (Option<&str>, Option<&str>, &str) {
+    let mut title = None;
+    let mut tags = None;
+    let mut end = 0;
+    for line in body.split_inclusive('\n') {
+        if let Some(value) = line.strip_prefix("#title:") {
+            title.get_or_insert(value.trim());
+        } else if let Some(value) = line.strip_prefix("#tags:") {
+            tags.get_or_insert(value.trim());
+        } else if !line.trim().is_empty() {
+            break;
+        }
+        end += line.len();
+    }
+    (title.filter(|value| !value.is_empty()), tags, &body[end..])
+}
+
+/// 本文の 1 行目からタイトルを取る。frontmatter も `#title:` も無いノート用。
+///
+/// `body` は frontmatter と先頭ディレクティブブロックを除いた残り。
+/// 返すのは「タイトルとして採用する文字列」と「消費した行の終端バイト位置」。
+/// preview はその位置より後ろから取る。
+/// タイトルは最大 80 文字とし、長い行も行末まで消費する。
+fn title_from_body(body: &str) -> Option<(String, usize)> {
+    let mut end = 0;
+    for line in body.split_inclusive('\n') {
+        end += line.len();
+        let line = line.trim_start();
+        let title = line
+            .strip_prefix("## ")
+            .or_else(|| line.strip_prefix("# "))
+            .unwrap_or(line)
+            .trim();
+        if !title.is_empty() {
+            return Some((title.chars().take(80).collect(), end));
+        }
+    }
+    None
 }
 
 /// `---` で挟まれた frontmatter を切り出す。無ければ `None`。
@@ -602,8 +661,8 @@ mod tests {
 
         let load = load_dir(&dir);
 
-        let titles: Vec<&str> = load.notes.iter().map(|n| n.title.as_str()).collect();
-        assert_eq!(titles, ["中"], "symlink の先を読んでいる");
+        let paths: Vec<&Path> = load.notes.iter().map(|n| n.path.as_path()).collect();
+        assert_eq!(paths, [dir.join("中.md")], "symlink の先を読んでいる");
         assert_eq!(
             load.failed, 0,
             "仕様どおりの除外を失敗に数えている（毎回警告が出てしまう）"
@@ -834,16 +893,143 @@ mod tests {
         assert_eq!(note.preview, "本文の先頭。");
     }
 
-    /// frontmatter が無いノートは今までどおり本文だけで解釈すること。
+    /// 本文の最初の空でない行をタイトルに使い、その次から preview を取る。
     #[test]
-    fn notes_without_frontmatter_fall_back_to_the_heading() {
-        let note = parsed("# 見出し\n\n本文。\n");
-        assert_eq!(note.title, "見出し");
-        assert_eq!(note.preview, "本文。");
-        assert!(note.tags.is_empty());
+    fn notes_without_metadata_use_the_first_nonempty_line() {
+        for first in ["見出し", "# 見出し", "## 見出し"] {
+            let note = parsed(&format!("\n \n{first}\n\n本文。\n"));
+            assert_eq!(note.title, "見出し");
+            assert_eq!(note.preview, "本文。");
+            assert!(note.tags.is_empty());
+        }
+        let note = parsed("ただの本文。\n# 後の見出し\n");
+        assert_eq!(note.title, "ただの本文。");
+        assert_eq!(note.preview, "# 後の見出し");
+    }
 
-        // 見出しも無ければファイル名。
-        let note = parsed("ただの本文。\n");
-        assert_eq!(note.title, "n");
+    #[test]
+    fn empty_notes_fall_back_to_the_filename() {
+        for raw in ["", " \r\n\n", "#title: \n#tags:\n"] {
+            let note = parsed(raw);
+            assert_eq!(note.title, "n");
+            assert!(note.preview.is_empty());
+            assert!(note.tags.is_empty());
+        }
+    }
+
+    #[test]
+    fn leading_directives_supply_title_and_tags_without_changing_raw() {
+        let raw = "\n#tags: 'rust', \"iced\", , 日本語 # 整理, 後日\n\n#title: 明示タイトル\n\n本文。\n";
+        let note = parsed(raw);
+        assert_eq!(note.title, "明示タイトル");
+        assert_eq!(note.tags, ["rust", "iced", "日本語"]);
+        assert_eq!(note.preview, "本文。");
+        assert_eq!(note.raw, raw);
+
+        let note = parsed("#tags: rust\n# 見出し\n次の行");
+        assert_eq!(note.title, "見出し");
+        assert_eq!(note.tags, ["rust"]);
+        assert_eq!(note.preview, "次の行");
+
+        assert!(parsed("#tags: # 後日, 整理\n本文").tags.is_empty());
+        let note = parsed("#title: 最初\n#title: 後\n#tags: rust\n#tags: iced");
+        assert_eq!(note.title, "最初");
+        assert_eq!(note.tags, ["rust"]);
+        assert!(note.preview.is_empty());
+    }
+
+    #[test]
+    fn directives_stop_at_the_first_ordinary_line() {
+        for body in [
+            "本文\n#title: 偽\n#tags: rust",
+            "```c\n#define X 1\n#title: 偽\n#tags: rust\n```",
+            "    #title: コード\n#tags: rust",
+            "#unknown: value\n#tags: rust",
+        ] {
+            assert_eq!(split_directives(body), (None, None, body));
+            assert!(parsed(body).tags.is_empty());
+        }
+    }
+
+    #[test]
+    fn frontmatter_precedence_is_per_field() {
+        let directives = "#title: 指定\n#tags: rust\n本文\n次の行";
+        let note = parsed(&format!(
+            "---\ntitle: 既存\ntags: [old]\nsummary: 要約\n---\n{directives}"
+        ));
+        assert_eq!(note.title, "既存");
+        assert_eq!(note.tags, ["old"]);
+        assert_eq!(note.preview, "要約");
+
+        let note = parsed(&format!("---\ntitle: 既存\n---\n{directives}"));
+        assert_eq!(note.title, "既存");
+        assert_eq!(note.tags, ["rust"]);
+        assert_eq!(note.preview, "本文");
+
+        for empty_tags in ["tags:", "tags: []", "tags: # 空"] {
+            let note = parsed(&format!("---\n{empty_tags}\n---\n{directives}"));
+            assert_eq!(note.title, "指定");
+            assert!(note.tags.is_empty());
+        }
+
+        let note = parsed("---\ntitle: ''\nsummary: 要約\n---\n本文タイトル\n次の行");
+        assert_eq!(note.title, "本文タイトル");
+        assert_eq!(note.preview, "要約");
+    }
+
+    #[test]
+    fn crlf_directives_and_body_titles_preserve_byte_offsets() {
+        let note = parsed("\r\n#title: 指定\r\n#tags: rust, iced\r\n\r\n本文\r\n");
+        assert_eq!(note.title, "指定");
+        assert_eq!(note.tags, ["rust", "iced"]);
+        assert_eq!(note.preview, "本文");
+
+        let body = "\r\n## 日本語\r\n\r\n次の行\r\n";
+        let (title, end) = title_from_body(body).unwrap();
+        assert_eq!(title, "日本語");
+        assert_eq!(&body[end..], "\r\n次の行\r\n");
+        let note = parsed(&format!("#tags: rust\r\n{body}"));
+        assert_eq!(note.title, "日本語");
+        assert_eq!(note.preview, "次の行");
+    }
+
+    #[test]
+    fn long_body_titles_are_unicode_safe_and_consume_the_whole_line() {
+        let long = "あいうえお".repeat(20);
+        for suffix in ["", "\n", "\r\n\r\n次の行"] {
+            let note = parsed(&format!("{long}{suffix}"));
+            assert_eq!(note.title, "あいうえお".repeat(16));
+            assert_eq!(
+                note.preview,
+                if suffix.contains('次') { "次の行" } else { "" }
+            );
+        }
+        let note = parsed(&format!("#title: {long}\n本文"));
+        assert_eq!(note.title, long);
+        assert_eq!(note.preview, "本文");
+    }
+
+    #[test]
+    #[ignore = "実データの vault が要る。VAULT を指定して release で走らせる"]
+    fn measure_load_dir_with_real_vault() {
+        let root = PathBuf::from(std::env::var_os("VAULT").expect("VAULT を指定する"));
+        let warmup = load_dir(&root);
+        assert_eq!(warmup.failed, 0);
+        assert!(!warmup.notes.is_empty());
+        let count = warmup.notes.len();
+        drop(warmup);
+
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            let load = load_dir(&root);
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("vault load: {} notes / {ms:.2}ms", load.notes.len());
+            assert_eq!(load.failed, 0);
+            assert_eq!(load.notes.len(), count);
+            assert!(
+                ms <= 50.0,
+                "暖機後の vault 読み込みが 50ms を超えた: {ms:.2}ms"
+            );
+        }
     }
 }
