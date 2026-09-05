@@ -2047,6 +2047,11 @@ fn note_pane(app: &App) -> Element<'_, Message> {
 /// あわせて **macOS の Control 系編集操作（`Ctrl+A` / `Ctrl+E` など）を補う**（ADR-0016）。
 /// iced 0.14.2 の既定はこれを取りこぼす。**既定が答えを出せなかったときだけ**補うので、
 /// 既定が正しく処理している組み合わせ（`Ctrl+H` = Backspace、Linux の `Ctrl+A` = 全選択）は触らない。
+///
+/// `Ctrl+Shift+<移動系>` は選択の拡張（ADR-0023）。ADR-0016 は `Ctrl+Shift+A` を意図的に
+/// 弾いていたが、それは「未定義のまま拾う」ことへの用心であって「選択には使わない」という
+/// 決定ではなかった。iced 既定の矢印キーが shift で `Move` と `Select` を切り替えるのと
+/// 揃えて、`macos_control_binding` 側で同じ切り替えを行う。
 fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
     let command = kp.modifiers.command();
     // **フォーカスが無いときは補わない。** `key_binding` はフォーカスの有無に関わらず
@@ -2054,15 +2059,17 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
     // `Ctrl+N` で裏のカーソルが動いたり、`Ctrl+D` で**見ていない本文が消える**のを防ぐ。
     // これでパレットの `ctrl-n` / `ctrl-p`（一覧移動）とも衝突しない。
     let focused = matches!(kp.status, text_editor::Status::Focused { .. });
-    // **`Modifiers::CTRL` との完全一致で見る。** `control()` だと `Cmd+Ctrl+A` や
-    // `Ctrl+Shift+A` まで拾ってしまう（iced の `convert_macos_shortcut` も完全一致）。
+    // **`Modifiers::CTRL` または `Ctrl+Shift` との完全一致で見る。** `control()` だと
+    // `Cmd+Ctrl+A` まで拾ってしまう（iced の `convert_macos_shortcut` も完全一致）。
     let control_only = kp.modifiers == keyboard::Modifiers::CTRL;
+    let control_shift = kp.modifiers == keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
     let key = kp.key.clone();
 
     match text_editor::Binding::from_key_press(kp) {
         Some(text_editor::Binding::Insert(_)) if command => None,
         Some(other) => Some(other),
-        None if focused && control_only => macos_control_binding(&key),
+        None if focused && control_only => macos_control_binding(&key, false),
+        None if focused && control_shift => macos_control_binding(&key, true),
         None => None,
     }
 }
@@ -2077,7 +2084,13 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
 /// `Ctrl+K`（行末まで切り取り）だけは `Binding` を組み合わせず**メッセージにして
 /// `update()` で処理する**（ADR-0016）。`Sequence` の中では `Select` の結果を
 /// `Cut` が見られないため（`Message::CutToLineEnd` の分岐に理由を書いた）。
-fn macos_control_binding(key: &keyboard::Key) -> Option<text_editor::Binding<Message>> {
+/// `select` は `Ctrl+Shift+<key>` かどうか。移動系（a/e/b/f/n/p）だけが対応し、
+/// `d`（削除）・`k`（切り取り）は shift 版の意味を定義していないので `None` で見送る
+/// （ADR-0023）。
+fn macos_control_binding(
+    key: &keyboard::Key,
+    select: bool,
+) -> Option<text_editor::Binding<Message>> {
     use iced::advanced::text::editor::Motion;
 
     let motion = match key.as_ref() {
@@ -2088,14 +2101,18 @@ fn macos_control_binding(key: &keyboard::Key) -> Option<text_editor::Binding<Mes
         keyboard::Key::Character("n") => Motion::Down,
         keyboard::Key::Character("p") => Motion::Up,
         // 後ろを 1 文字消す。`Ctrl+H`（前を 1 文字）は既定が処理できているので触らない。
-        keyboard::Key::Character("d") => return Some(text_editor::Binding::Delete),
+        keyboard::Key::Character("d") if !select => return Some(text_editor::Binding::Delete),
         // 行末まで切り取る。行を繋げたいときは続けて `Ctrl+D` を押す（doc 参照）。
-        keyboard::Key::Character("k") => {
+        keyboard::Key::Character("k") if !select => {
             return Some(text_editor::Binding::Custom(Message::CutToLineEnd));
         }
         _ => return None,
     };
-    Some(text_editor::Binding::Move(motion))
+    Some(if select {
+        text_editor::Binding::Select(motion)
+    } else {
+        text_editor::Binding::Move(motion)
+    })
 }
 
 fn editor_pane(app: &App) -> Element<'_, Message> {
@@ -4139,6 +4156,12 @@ mod tests {
         press(c, keyboard::Modifiers::CTRL, text)
     }
 
+    /// `Ctrl+Shift` の打鍵を組み立てる。`text` は `ctrl_press` と同じ理由（Shift を足しても
+    /// macOS が返すのは Ctrl 由来の制御文字のまま）で制御文字を使う。
+    fn ctrl_shift_press(c: &str, text: Option<&str>) -> text_editor::KeyPress {
+        press(c, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, text)
+    }
+
     /// **macOS の Control 系編集操作が本文で効くこと。**
     ///
     /// `text` が制御文字のとき（macOS の実機）と `None` のとき（他の経路）の両方で固定する。
@@ -4428,13 +4451,52 @@ mod tests {
     /// **既定が答えを出しているものは触らない**のがこの関数の約束（ADR-0016）。
     #[test]
     fn control_bindings_require_control_alone() {
-        for extra in [keyboard::Modifiers::SHIFT, keyboard::Modifiers::ALT] {
-            let mut kp = ctrl_press("a", Some("\u{1}"));
-            kp.modifiers = keyboard::Modifiers::CTRL | extra;
+        // `Shift` は ADR-0023 で選択の拡張として意味を持たせたので、ここでは弾かない
+        // （下の `macos_control_shift_selects_in_the_body` が Shift 側を固定する）。
+        let mut kp = ctrl_press("a", Some("\u{1}"));
+        kp.modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT;
+        assert!(
+            editor_key_binding(kp).is_none(),
+            "Ctrl+Alt+A まで拾っている",
+        );
+    }
+
+    /// **`Ctrl+Shift+<移動系>` は選択を拡張すること（ADR-0023）。**
+    ///
+    /// ADR-0016 は `Ctrl+Shift+A` を意図的に弾いていたが、それは「未定義のまま拾わない」
+    /// という用心であって「選択には使わない」という決定ではなかった。iced 既定の矢印キーが
+    /// Shift で `Move` と `Select` を切り替えるのと同じ形に揃える。
+    #[test]
+    fn macos_control_shift_selects_in_the_body() {
+        use iced::advanced::text::editor::Motion;
+
+        let expected = [
+            ("a", '\u{1}', Motion::Home),
+            ("e", '\u{5}', Motion::End),
+            ("b", '\u{2}', Motion::Left),
+            ("f", '\u{6}', Motion::Right),
+            ("n", '\u{e}', Motion::Down),
+            ("p", '\u{10}', Motion::Up),
+        ];
+
+        for (c, control, motion) in expected {
+            let binding = editor_key_binding(ctrl_shift_press(c, Some(&control.to_string())));
             assert!(
-                editor_key_binding(kp).is_none(),
-                "Ctrl+{extra:?}+A まで拾っている",
+                matches!(binding, Some(text_editor::Binding::Select(m)) if m == motion),
+                "Ctrl+Shift+{c} が {motion:?} の選択にならない: {binding:?}",
             );
+        }
+    }
+
+    /// **`Ctrl+Shift+D` / `Ctrl+Shift+K` は何もしないこと。**
+    ///
+    /// 削除・切り取り系は shift 版の意味を定義していない（ADR-0023）。ここを拾うと、
+    /// 選択したつもりで `Ctrl+D` / `Ctrl+K` と同じ削除が走り、本文が消える事故になる。
+    #[test]
+    fn macos_control_shift_delete_keys_stay_undefined() {
+        for (c, control) in [("d", '\u{4}'), ("k", '\u{b}')] {
+            let binding = editor_key_binding(ctrl_shift_press(c, Some(&control.to_string())));
+            assert!(binding.is_none(), "Ctrl+Shift+{c} が拾われている: {binding:?}");
         }
     }
 
