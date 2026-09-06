@@ -12,10 +12,18 @@ use std::time::SystemTime;
 /// サブフォルダに属さない（vault ルート直下に置かれた）ノートのフォルダ名。
 pub const ROOT_FOLDER: &str = "/";
 
+/// タイトルにできる内容が無いノートの表示名。
+///
+/// ファイル名は保存先の識別子に過ぎない。時刻ベースのファイル名を
+/// 画面のタイトルに漏らさず、空であること自体を表示する。
+pub const EMPTY_NOTE_TITLE: &str = "empty note";
+
 #[derive(Debug, Clone)]
 pub struct Note {
     pub path: PathBuf,
     pub title: String,
+    /// `title` が本文やメタデータではなく、空ノート用の仮表示か。
+    pub title_is_placeholder: bool,
     pub tags: Vec<String>,
     /// vault ルート直下のディレクトリ名（`sources` / `topics` など）。
     /// 直下に置かれたノートは [`ROOT_FOLDER`]。
@@ -335,8 +343,9 @@ pub fn parse_note(root: &Path, path: PathBuf, raw: String, modified: SystemTime)
     let (directive_title, directive_tags, body) = split_directives(body);
     let mut preview_body = body;
 
-    // frontmatter > 先頭ディレクティブ > 本文の先頭行 > ファイル名。
-    let title = fm
+    // frontmatter > 先頭ディレクティブ > 本文の先頭行 > 空ノート用表示。
+    // ファイル名は保存上の識別子なので、表示タイトルには使わない。
+    let parsed_title = fm
         .as_ref()
         .and_then(|f| scalar(f, "title"))
         .or_else(|| directive_title.map(str::to_string))
@@ -345,12 +354,9 @@ pub fn parse_note(root: &Path, path: PathBuf, raw: String, modified: SystemTime)
                 preview_body = &body[end..];
                 title
             })
-        })
-        .unwrap_or_else(|| {
-            path.file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default()
         });
+    let title_is_placeholder = parsed_title.is_none();
+    let title = parsed_title.unwrap_or_else(|| EMPTY_NOTE_TITLE.to_string());
 
     // 空の tags: も明示指定。キーが無いときだけディレクティブへ進む。
     let tags = fm
@@ -396,6 +402,7 @@ pub fn parse_note(root: &Path, path: PathBuf, raw: String, modified: SystemTime)
     Note {
         path,
         title,
+        title_is_placeholder,
         tags,
         folder,
         preview,
@@ -551,6 +558,7 @@ mod tests {
         Note {
             path: PathBuf::from(format!("{title}.md")),
             title: title.to_string(),
+            title_is_placeholder: false,
             tags: Vec::new(),
             folder: "/".to_string(),
             preview: String::new(),
@@ -908,10 +916,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_notes_fall_back_to_the_filename() {
+    fn empty_notes_use_a_placeholder_instead_of_the_filename() {
         for raw in ["", " \r\n\n", "#title: \n#tags:\n"] {
             let note = parsed(raw);
-            assert_eq!(note.title, "n");
+            assert_eq!(note.title, EMPTY_NOTE_TITLE);
+            assert!(note.title_is_placeholder);
             assert!(note.preview.is_empty());
             assert!(note.tags.is_empty());
         }

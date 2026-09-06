@@ -2003,6 +2003,20 @@ fn tag_label(tags: &[String]) -> String {
         .join(" ")
 }
 
+/// 空ノートの仮タイトルは選択中でも強調しない。
+///
+/// 本文から得た本物のタイトルと同じ色にすると、`empty note` が
+/// 実際に入力されたように見える。副文字と同じ霞色まで引かせる。
+fn note_title_color(note: &vault::Note, selected: bool) -> Color {
+    if note.title_is_placeholder {
+        KASUMI
+    } else if selected {
+        KOHAKU_SOFT
+    } else {
+        KINARI
+    }
+}
+
 fn note_pane(app: &App) -> Element<'_, Message> {
     // 全件（約 1200 件）をそのまま並べる。仮想リストは要らないと spike で実測済み
     // （打鍵時の `view()` 構築 0.13ms）。無い機能を先回りで作らない。
@@ -2013,7 +2027,7 @@ fn note_pane(app: &App) -> Element<'_, Message> {
         let mut body = column![
             text(&note.title)
                 .size(13)
-                .color(if selected { KOHAKU_SOFT } else { KINARI }),
+                .color(note_title_color(note, selected)),
             text(&note.preview).size(10).color(KASUMI),
         ]
         .spacing(2);
@@ -2326,8 +2340,16 @@ fn palette_overlay(app: &App, palette: &Palette) -> Element<'static, Message> {
                 };
 
             container(
-                iced::widget::column![hit_text(&note.title, title_ranges, KINARI, 13.0), second]
-                    .spacing(1),
+                iced::widget::column![
+                    hit_text(
+                        &note.title,
+                        title_ranges,
+                        note_title_color(note, is_selected),
+                        13.0,
+                    ),
+                    second
+                ]
+                .spacing(1),
             )
             .padding(6)
             .width(Fill)
@@ -3226,6 +3248,13 @@ mod tests {
         let created = app.selected.expect("作ったノートが開かれていない");
         assert_eq!(created, 0, "新規ノートが一覧の先頭に来ていない");
         assert_eq!(app.notes[0].folder, "notes", "開いていたノートと別のフォルダに作られた");
+        assert_eq!(app.notes[0].title, vault::EMPTY_NOTE_TITLE);
+        assert!(app.notes[0].title_is_placeholder);
+        assert_eq!(
+            note_title_color(&app.notes[0], true),
+            KASUMI,
+            "空ノートの仮タイトルが選択色で強調されている"
+        );
         assert!(app.notes[0].path.exists(), "ファイルが作られていない");
         assert!(app.visible.contains(&0), "作ったノートが一覧に見えていない");
     }
@@ -3249,6 +3278,9 @@ mod tests {
         send(&mut app, Message::Tick(Instant::now() + AUTOSAVE_DEBOUNCE));
         flush_saves(&mut app);
         assert_eq!(app.saves, 1, "保存されていない");
+        assert_eq!(app.notes[0].title, "秘");
+        assert!(!app.notes[0].title_is_placeholder);
+        assert_eq!(note_title_color(&app.notes[0], true), KOHAKU_SOFT);
 
         let saved = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(saved, 0o600, "保存で新規ノートの権限が緩んだ");
@@ -3869,6 +3901,7 @@ mod tests {
         vault::Note {
             path: PathBuf::from(format!("{title}.md")),
             title: title.to_string(),
+            title_is_placeholder: false,
             tags: Vec::new(),
             folder: "/".to_string(),
             preview: String::new(),
