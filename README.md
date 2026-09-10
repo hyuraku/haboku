@@ -42,3 +42,6 @@ cargo run --release
 ## ライセンス
 
 [MIT](LICENSE)
+
+エディタの書体として [Firge](https://github.com/yuru7/Firge)（Fira Mono ＋ 源真ゴシック）を同梱しています。
+Firge とその元になった書体は SIL Open Font License 1.1 で配布されており、ライセンス文は [`assets/fonts/`](assets/fonts/) にあります。

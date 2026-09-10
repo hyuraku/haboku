@@ -28,6 +28,11 @@ else
 	echo "警告: assets/haboku.icns が無いので Dock のアイコンは白紙になります" >&2
 fi
 
+# 同梱フォント（Firge）のライセンス文。フォント本体は `include_bytes!` でバイナリに入っているが、
+# SIL OFL 1.1 は同梱するなら著作権表示とライセンス文を一緒に配ることを求める（ADR-0025）。
+mkdir -p "$APP/Contents/Resources/fonts"
+cp assets/fonts/LICENSE-*.txt "$APP/Contents/Resources/fonts/"
+
 # ad-hoc 署名。`--deep` は使わない（Apple が非推奨。同梱バイナリも無い）。
 codesign --force --sign - --identifier com.github.hyuraku.haboku "$APP"
 codesign --verify --strict --verbose=1 "$APP"
