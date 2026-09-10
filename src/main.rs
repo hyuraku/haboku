@@ -510,24 +510,35 @@ fn save_retry_delay(failures: u32) -> Duration {
         .min(SAVE_RETRY_MAX)
 }
 
-/// 等幅フォント。**`Font::MONOSPACE` は使わない**（漢字が消える。ADR-0003）。
+/// エディタとプレビューの等幅フォント。**同梱した Firge を名指しする**（ADR-0025）。
 ///
-/// 「等幅なら何でもいい」を意味する `Font::MONOSPACE` を渡すと、cosmic-text が漢字に
-/// macOS の `GB18030 Bitmap` を選び、Swash がラスタライズに失敗してグリフごと捨てる。
-/// 等幅は必ず**名指し**する。
+/// **`Font::MONOSPACE` は使わない**（漢字が消える。ADR-0003）。「等幅なら何でもいい」を渡すと、
+/// cosmic-text が漢字に macOS の `GB18030 Bitmap` を選び、Swash がラスタライズに失敗して
+/// グリフごと捨てる。等幅は必ず**名指し**する。
 ///
-/// **`"Osaka-Mono"` から乗り換えた**（ADR-0003 追記 2）。あれは PostScript 名で、fontdb が
-/// 照合するファミリ名ではない。しかもファミリ名 `"Osaka"` には比例の `Osaka.ttf` と等幅の
-/// `OsakaMono.ttf` が**同じ weight・同じ幅で同居している**ので、`"Osaka"` に直しても
-/// 等幅 face を選べる保証がない。**名前で face を選び分けられないフォントは名指しの対象外**。
+/// **英字専用の等幅（Menlo・JetBrains Mono・Fira Code）も名指ししない。** 日本語はフォールバック
+/// 任せになり、cosmic-text は漢字の行き先をロケールの**完全一致**で選ぶ（`"ja"` なら Hiragino Sans）。
+/// macOS が返すのは `"ja-JP"` なので一致せず、**漢字だけ PingFang SC（中国語の字形）**に落ちる
+/// （かなは Hiragino Sans のまま）。日本語グリフを自分で持つ書体なら、この経路を一度も通らない。
 ///
-/// `BIZ UDGothic` を選んだ理由は 3 つとも実測できる:
+/// `Firge`（Fira Mono ＋ 源真ゴシック）を選んだ理由は実測できる:
 ///
-/// - ファミリ名が一意（比例版は `BIZ UDPGothic` という**別ファミリ**）
-/// - Regular が `usWeightClass = 400` ちょうど。cosmic-text は weight 完全一致でしか
+/// - ファミリ名（`name` id 1）が `"Firge"`
+/// - Regular が `usWeightClass = 400`、Bold が 700 ちょうど。cosmic-text は weight 完全一致でしか
 ///   名指しファミリを採らない（`font_weight_diff == 0`。ADR-0009 の帰結）
-/// - ASCII が 1024、漢字・かな・約物が 2048（upem 2048）。**ちょうど 1:2**
-const EDITOR_FONT: Font = Font::with_name("BIZ UDGothic");
+/// - ASCII が 540、漢字・かな・約物が 1080（upem 1024）。**ちょうど 1:2**
+///
+/// どれか 1 つでも崩れると、画面には**それらしい文字が出たまま**静かに別の書体へ落ちる。
+/// `editor_font_draws_every_glyph_with_bundled_firge` が face 単位で固定している。
+const EDITOR_FONT: Font = Font::with_name("Firge");
+
+/// [`EDITOR_FONT`] の実体。SIL OFL 1.1（`assets/fonts/LICENSE-Firge.txt`）。
+/// `iced::application(..).font(..)` で最初のフレームより前に読み込む。
+///
+/// **Bold も同梱する。** プレビューの `**強調**` は iced の markdown が `Weight::Bold` で描く。
+/// Regular だけだと強調した範囲だけ weight 完全一致に外れ、漢字が PingFang SC に落ちる。
+const FIRGE_REGULAR: &[u8] = include_bytes!("../assets/fonts/Firge-Regular.ttf");
+const FIRGE_BOLD: &[u8] = include_bytes!("../assets/fonts/Firge-Bold.ttf");
 
 /// 見出し用の明朝。ADR-0003 と同じく**名指しでバンドルしない**。
 ///
@@ -2189,9 +2200,10 @@ fn preview_pane(preview: &markdown::Content) -> Element<'_, Message> {
 ///
 /// - **書体は本文もコードも `EDITOR_FONT` を名指しする。** コードの既定
 ///   `Font::MONOSPACE` は cosmic-text が漢字に GB18030 Bitmap を選んで**漢字だけ消える**
-///   （ADR-0003 / ADR-0013 の罠）。本文も `Font::DEFAULT` のままだと**イタリック span の
+///   （ADR-0003 の罠）。本文も `Font::DEFAULT` のままだと**イタリック span の
 ///   漢字が豆腐になる**（`*斜体*` の 2 文字が横縞グリフに化けるのを実測）。CJK に
-///   italic face は無く、名指しのファミリなら立体のまま描かれて文字は消えない
+///   italic face は無く、名指しのファミリなら立体のまま描かれて文字は消えない。
+///   `**強調**` は同梱の Firge Bold で描かれる（ADR-0025）
 /// - 色は幽玄の値に置き換える（既定は白文字 + `#111111` の地で、淡墨の面では浮く。
 ///   リンクは琥珀 = 「押せる」合図の色に寄せる。ADR-0009）
 fn preview_settings() -> markdown::Settings {
@@ -2599,6 +2611,9 @@ fn main() -> ExitCode {
 
     let result = iced::application(boot_app, update, view)
     .title("haboku")
+    // エディタの書体（`EDITOR_FONT`）。名指しより前に読み込まれていないと、既定フォントへ静かに落ちる。
+    .font(FIRGE_REGULAR)
+    .font(FIRGE_BOLD)
     .theme(move |_app: &App| theme.clone())
     .subscription(subscription)
     // **既定（true）だと、閉じる要求はアプリに届く前にプロセスを終わらせる。**
@@ -5032,5 +5047,55 @@ mod tests {
         );
 
         assert!(matches!(message, Some(Message::WindowUnfocused)), "{message:?}");
+    }
+
+    /// **同梱した Firge が、名指しどおりに全部の文字を描くこと**（ADR-0025）。
+    ///
+    /// 名前違い・weight 不一致・フォールバックのどれで壊れても、画面には**それらしい文字が
+    /// 出たまま**になる。だから見た目ではなく、実際に使われた face を cosmic-text に問い合わせる。
+    /// Font → cosmic-text の変換は iced と同じ `to_attributes` を通し、システムフォントも
+    /// 読み込んだ状態（= 逃げ先がある状態）で確かめる。
+    ///
+    /// - regular: エディタ本文
+    /// - bold: プレビューの `**強調**`（Bold を同梱しないと漢字が PingFang SC に落ちる）
+    /// - italic: プレビューの `*斜体*`（italic face は無いので立体の Regular で描かれる）
+    #[test]
+    fn editor_font_draws_every_glyph_with_bundled_firge() {
+        use iced::advanced::graphics::text::{cosmic_text as ct, to_attributes};
+
+        let mut fs = ct::FontSystem::new();
+        fs.db_mut().load_font_data(FIRGE_REGULAR.to_vec());
+        fs.db_mut().load_font_data(FIRGE_BOLD.to_vec());
+
+        // 漢字（日中で字形が違う「直」「骨」を含む）・かな・約物・英数字（幅が両極の i と W、
+        // 紛らわしい 0O1lI）。
+        let text = "漢字の直骨 かなカナ、。 abc iW 0O1lI";
+        let bold = Font { weight: iced::font::Weight::Bold, ..EDITOR_FONT };
+        let italic = Font { style: iced::font::Style::Italic, ..EDITOR_FONT };
+
+        for (label, font, expected) in [
+            ("regular", EDITOR_FONT, "Firge-Regular"),
+            ("bold", bold, "Firge-Bold"),
+            ("italic", italic, "Firge-Regular"),
+        ] {
+            let mut buffer = ct::Buffer::new(&mut fs, ct::Metrics::new(16.0, 20.0));
+            buffer.set_text(&mut fs, text, &to_attributes(font), ct::Shaping::Advanced, None);
+            buffer.shape_until_scroll(&mut fs, false);
+            let glyphs: Vec<ct::LayoutGlyph> =
+                buffer.layout_runs().flat_map(|run| run.glyphs.to_vec()).collect();
+
+            assert_eq!(glyphs.len(), text.chars().count(), "{label}: グリフ数が文字数と合わない");
+            for glyph in &glyphs {
+                let ch = &text[glyph.start..glyph.end];
+                let face = fs.db().face(glyph.font_id).map(|f| f.post_script_name.clone());
+                assert_eq!(face.as_deref(), Some(expected), "{label}: {ch:?} が別の書体に落ちた");
+                assert_ne!(glyph.glyph_id, 0, "{label}: {ch:?} が .notdef（豆腐）になった");
+            }
+
+            // 等幅の定義: 英字 1 : 漢字 2（コードブロックの桁が揃う条件）。
+            let advance = |c: &str| glyphs.iter().find(|g| &text[g.start..g.end] == c).unwrap().w;
+            assert_eq!(advance("漢"), advance("a") * 2.0, "{label}: 英字と漢字が 1:2 でない");
+            assert_eq!(advance("i"), advance("W"), "{label}: 英字が等幅でない");
+        }
     }
 }
