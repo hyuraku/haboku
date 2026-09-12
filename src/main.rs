@@ -1,4 +1,4 @@
-//! haboku 本体。3 ペイン（フォルダ / 一覧 / エディタ）+ デバウンス自動保存。
+//! haboku 本体。2 ペイン（統合サイドバー / エディタ）+ デバウンス自動保存。
 //!
 //! 実行: `VAULT="$HOME/Documents/haboku" cargo run --release`
 //!
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use iced::keyboard;
 use iced::widget::{
-    button, column, container, markdown, mouse_area, rich_text, row, scrollable, span, stack,
+    button, column, container, markdown, mouse_area, pick_list, rich_text, row, scrollable, span, stack, tooltip,
     text, text_editor, text_input,
 };
 use iced::{Color, Element, Fill, Font, Length, Subscription, Task};
@@ -181,10 +181,8 @@ const PALETTE_MAX_RESULTS: usize = 50;
 /// 1 文字目を通る。ここが打鍵あたりで最も頻度の高い無駄になる（ADR-0018）。
 const BODY_MIN_QUERY_CHARS: usize = 2;
 
-/// サイドバー（フォルダ）の幅。
-const SIDEBAR_WIDTH: f32 = 180.0;
-/// ノート一覧の幅。
-const LIST_WIDTH: f32 = 320.0;
+/// 検索・フォルダ選択・一覧をまとめたサイドバーの幅（ADR-0026）。
+const SIDEBAR_WIDTH: f32 = 300.0;
 
 /// 開いているパレットの状態。閉じているときは `None`。
 struct Palette {
@@ -417,6 +415,8 @@ enum Message {
     /// `Cmd+Tab` で抜けて向こうで離すと、離した通知が来ずに `modifiers` が
     /// 立ちっぱなしになり、戻ってきたとき入力欄が無反応になる（ADR-0010）。
     WindowUnfocused,
+    /// 検索ボタンと Cmd+P の共通入口。
+    PaletteOpen,
     PaletteQueryChanged(String),
     /// パレットを閉じる。✕ ボタンと背景クリックから飛ぶ。
     PaletteClose,
@@ -1606,6 +1606,18 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
     }
 
     match message {
+        Message::PaletteOpen => {
+            if app.palette.is_none() {
+                // リネームと検索は同時に開かない。再押下ではクエリを消さない。
+                app.rename = None;
+                app.palette = Some(Palette {
+                    query: String::new(),
+                    matches: refilter(&app.notes, ""),
+                    selected: 0,
+                });
+            }
+            return iced::widget::operation::focus(iced::widget::Id::new(PALETTE_INPUT_ID));
+        }
         Message::FolderSelected(folder) => set_folder(app, folder),
         Message::NoteSelected(index) => {
             // **保存に失敗したら遷移しない。** ここで進むと未保存の本文が
@@ -1812,17 +1824,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 && matches!(&key, keyboard::Key::Character(c) if c == "p")
                 && app.palette.is_none()
             {
-                // リネーム欄が開いていたら畳む（`RenameStarted` がパレットを畳むのと対称）。
-                // 両方開いたままだと、下の `app.rename.is_some()` の分岐が Enter を先に拾い、
-                // パレットで選んだつもりの Enter が `RenameCommit` として走る。
-                app.rename = None;
-                app.palette = Some(Palette {
-                    query: String::new(),
-                    matches: refilter(&app.notes, ""),
-                    selected: 0,
-                });
-                // 開いた瞬間に入力欄へフォーカスを飛ばす。これが無いと「開いたのに打てない」。
-                return iced::widget::operation::focus(iced::widget::Id::new(PALETTE_INPUT_ID));
+                return update(app, Message::PaletteOpen);
             }
 
             // ⌘ のショートカットは 1 つの表にまとめる。`if` を並べると
@@ -1969,37 +1971,141 @@ fn subscription(app: &App) -> Subscription<Message> {
     }
 }
 
-fn folder_pane(app: &App) -> Element<'_, Message> {
-    // フォルダ名は副文字（霞）。選ばれている行だけ生成りに持ち上げ、件数は常に霞のまま。
-    let row_for = |label: &str, count: usize, selected: bool| {
-        button(
-            row![
-                text(label.to_string())
-                    .size(12)
-                    .color(if selected { KINARI } else { KASUMI })
-                    .width(Fill),
-                text(count.to_string()).size(12).color(KASUMI),
-            ]
-            .padding(2),
+/// 表示名ではなくパスで選択する。「すべて」という実フォルダとも区別できる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FolderChoice {
+    path: Option<String>,
+    count: usize,
+}
+
+impl std::fmt::Display for FolderChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}  {}",
+            self.path.as_deref().unwrap_or("すべて"),
+            self.count
         )
-        .width(Fill)
-        .style(if selected { selected_row } else { button::text })
+    }
+}
+
+fn sidebar_button(_theme: &iced::Theme, status: button::Status) -> button::Style {
+    button::Style {
+        background: match status {
+            button::Status::Hovered | button::Status::Pressed => Some(KOHAKU_WASH.into()),
+            _ => None,
+        },
+        text_color: KASUMI,
+        border: iced::Border {
+            color: HAIRLINE_STRONG,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        ..button::Style::default()
+    }
+}
+
+fn sidebar(app: &App) -> Element<'_, Message> {
+    let actions = row![
+        button(text("検索  ⌘P").size(13))
+            .padding([8, 12])
+            .width(Fill)
+            .style(sidebar_button)
+            .on_press(Message::PaletteOpen),
+        button(text("新規  ⌘N").size(13))
+            .padding([8, 12])
+            .width(Fill)
+            .style(sidebar_button)
+            .on_press(Message::NewNote),
+    ]
+    .spacing(8);
+
+    let choices: Vec<_> = std::iter::once(FolderChoice {
+        path: None,
+        count: app.notes.len(),
+    })
+    .chain(app.folders.iter().map(|(name, count)| FolderChoice {
+        path: Some(name.clone()),
+        count: *count,
+    }))
+    .collect();
+    let selected = FolderChoice {
+        path: app.selected_folder.clone(),
+        count: app.visible.len(),
     };
-
-    let all_selected = app.selected_folder.is_none();
-    let all = row_for("すべて", app.notes.len(), all_selected)
-        .on_press(Message::FolderSelected(None));
-
-    let items = app.folders.iter().map(|(name, count)| {
-        let selected = app.selected_folder.as_deref() == Some(name.as_str());
-        row_for(name, *count, selected)
-            .on_press(Message::FolderSelected(Some(name.clone())))
-            .into()
+    let folders = pick_list(choices, Some(selected), |choice| {
+        Message::FolderSelected(choice.path)
+    })
+    .width(Fill)
+    .text_size(13)
+    .padding([8, 12])
+    .style(|_, _| pick_list::Style {
+        text_color: KINARI,
+        placeholder_color: KASUMI,
+        handle_color: KASUMI,
+        background: KOHAKU_WASH.into(),
+        border: iced::border::rounded(4),
+    })
+    .menu_style(|_| iced::widget::overlay::menu::Style {
+        text_color: KINARI,
+        background: TANBOKU.into(),
+        border: iced::Border {
+            color: HAIRLINE_STRONG,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        selected_text_color: KOHAKU_SOFT,
+        selected_background: KOHAKU_WASH.into(),
+        shadow: iced::Shadow::default(),
     });
 
-    scrollable(column(std::iter::once(all.into()).chain(items)).spacing(1))
-        .height(Fill)
-        .into()
+    let (state_label, state_color) = if app.show_marker {
+        ("未保存", KARACHA)
+    } else if is_dirty(app) {
+        ("編集中", KARACHA)
+    } else if app.saving.is_some() {
+        ("保存中", KASUMI)
+    } else if app.saved_flash_until.is_some() {
+        ("保存しました", KOHAKU_SOFT)
+    } else if app.selected.is_some() {
+        ("保存済み", KASUMI)
+    } else {
+        ("―", KASUMI)
+    };
+    // 診断値は計測を残し、件数のツールチップへ移す。
+    let count = tooltip(
+        text(format!("{} notes", app.visible.len()))
+            .size(11)
+            .color(KASUMI),
+        container(
+            text(format!(
+                "load {:.1}ms · view {:.2}ms · saves {}",
+                app.load_ms,
+                app.last_view_us.get() as f64 / 1000.0,
+                app.saves
+            ))
+            .size(11),
+        )
+        .padding(8)
+        .style(panel_style),
+        tooltip::Position::Top,
+    );
+    let status = row![
+        count,
+        iced::widget::space::horizontal(),
+        text(state_label).size(11).color(state_color)
+    ]
+    .align_y(iced::Alignment::Center);
+
+    column![
+        actions,
+        folders,
+        note_pane(app),
+        container(status).padding([12, 8]).height(42),
+    ]
+    .spacing(8)
+    .height(Fill)
+    .into()
 }
 
 /// frontmatter のタグを 1 行の文字列にする。
@@ -2036,10 +2142,24 @@ fn note_pane(app: &App) -> Element<'_, Message> {
         let selected = app.selected == Some(index);
         // タイトルは生成り、選択中だけ琥珀の明るい側へ。プレビューは常に霞。
         let mut body = column![
-            text(&note.title)
-                .size(13)
-                .color(note_title_color(note, selected)),
-            text(&note.preview).size(10).color(KASUMI),
+            row![
+                text(&note.title)
+                    .size(14)
+                    .wrapping(iced::advanced::text::Wrapping::None)
+                    .width(Fill)
+                    .color(note_title_color(note, selected)),
+                text(&note.folder)
+                    .size(11)
+                    .color(KASUMI)
+                    .wrapping(iced::advanced::text::Wrapping::None)
+                    .width(Length::Fixed(64.0)),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+            text(&note.preview)
+                .size(12)
+                .color(KASUMI)
+                .wrapping(iced::advanced::text::Wrapping::None),
         ]
         .spacing(2);
 
@@ -2050,6 +2170,7 @@ fn note_pane(app: &App) -> Element<'_, Message> {
         }
 
         button(body)
+            .padding([10, 12])
             .on_press(Message::NoteSelected(index))
             .width(Fill)
             .style(if selected { selected_row } else { button::text })
@@ -2155,6 +2276,8 @@ fn editor_pane(app: &App) -> Element<'_, Message> {
         .on_action(Message::Edit)
         .key_binding(editor_key_binding)
         .font(EDITOR_FONT)
+        .size(18)
+        .padding([12, 22])
         // 日本語には単語境界がほぼ無く、既定の `Word` だと長い段落が 1 つの巨大な単語になる。
         .wrapping(iced::advanced::text::Wrapping::WordOrGlyph)
         // syntect の既製テーマではなく自前の Markdown ハイライタ（`highlight.rs` の doc 参照）。
@@ -2484,7 +2607,7 @@ fn setup_view(setup: &Setup) -> Element<'_, Message> {
 fn view(app: &App) -> Element<'_, Message> {
     let t0 = Instant::now();
 
-    // 保存先が決まるまでは 3 ペインを組まない（そもそも見せるノートが無い）。
+    // 保存先が決まるまでは 2 ペインを組まない（そもそも見せるノートが無い）。
     if let Some(setup) = &app.setup {
         let element = setup_view(setup);
         app.last_view_us.set(t0.elapsed().as_micros());
@@ -2492,48 +2615,17 @@ fn view(app: &App) -> Element<'_, Message> {
     }
 
     let panes = row![
-        container(folder_pane(app)).width(Length::Fixed(SIDEBAR_WIDTH)),
-        container(note_pane(app)).width(Length::Fixed(LIST_WIDTH)),
+        container(sidebar(app)).width(Length::Fixed(SIDEBAR_WIDTH)),
         container(editor_pane(app)).width(Fill),
     ]
     .spacing(8)
     .height(Fill);
 
-    // 保存状態は色でも語る。未保存・編集中は枯茶（警告の色）、保存済みは琥珀の明るい側。
-    let (state_label, state_color) = if app.show_marker {
-        ("● 未保存", KARACHA)
-    } else if is_dirty(app) {
-        ("… 編集中", KARACHA)
-    } else if app.saved_flash_until.is_some() {
-        ("保存しました", KOHAKU_SOFT)
-    } else {
-        ("―", KASUMI)
-    };
-
-    let status = row![
-        text(format!("{} notes", app.visible.len())).size(11).color(KASUMI),
-        text(format!("load {:.1}ms", app.load_ms)).size(11).color(KASUMI),
-        // Done の定義は 1ms 未満。ここが太りだしたら `view()` に重い処理が入った合図。
-        text(format!(
-            "view {:.2}ms",
-            app.last_view_us.get() as f64 / 1000.0
-        ))
-        .size(11)
-        .color(KASUMI),
-        // 編集していないのに増えるなら「無編集でも書いている」ということ。
-        text(format!("saves {}", app.saves)).size(11).color(KASUMI),
-        text(state_label).size(11).color(state_color),
-    ]
-    .spacing(16);
-
-    let error = error_line(app.error.as_ref());
-
-    // **高さを固定する。** 可変にすると表示の桁数が変わるたびに下段の高さが動き、
-    // 「打った文字が1つ上の行に入った」ように見える（`Fill` の隣に可変長を置く罠）。
+    // 保存エラーは幅の狭いサイドバーへ閉じ込めず、常時見える全幅の行に残す。
+    // 高さは固定し、エラーの有無で本文が動かないようにする。
     let base: Element<'_, Message> = column![
         panes,
-        container(status).height(Length::Fixed(18.0)),
-        container(error).height(Length::Fixed(16.0)),
+        container(error_line(app.error.as_ref())).height(Length::Fixed(16.0)),
     ]
     .spacing(6)
     .padding(8)
@@ -3571,6 +3663,50 @@ mod tests {
         assert!(app.palette.is_none(), "Enter でパレットから開けていない");
         let after: Vec<_> = app.notes.iter().map(|n| n.path.clone()).collect();
         assert_eq!(after, before, "パレットからの選択でリネームが走った");
+    }
+
+    /// マウスの検索入口でも、編集内容を捨てずにリネームを畳む。
+    #[test]
+    fn search_button_preserves_edits_and_existing_query() {
+        let (_dir, mut app) = app_with_vault("search-button");
+        send(&mut app, insert('墨'));
+        let before = app.content.text();
+        send(&mut app, Message::RenameStarted);
+        send(&mut app, Message::PaletteOpen);
+        assert!(app.rename.is_none());
+        assert!(app.palette.is_some());
+        assert_eq!(app.content.text(), before);
+        assert!(is_dirty(&app));
+        assert!(app.saving.is_none(), "検索を開いただけで保存している");
+        send(&mut app, Message::PaletteQueryChanged("墨".into()));
+        send(&mut app, Message::PaletteOpen);
+        assert_eq!(app.palette.as_ref().unwrap().query, "墨");
+    }
+
+    /// 表示構造を変えても、大きい vault の打鍵時に 1ms の予算を超えないこと。
+    #[test]
+    #[ignore = "時間を測る。--release --ignored で実行する"]
+    fn measure_sidebar_view_with_synthetic_vault() {
+        let notes = synthetic_notes(1200);
+        let mut app = boot(PathBuf::from("/tmp/haboku-view-benchmark"), vault::Load {
+            notes,
+            ..vault::Load::default()
+        }, 0.0);
+        for search in [false, true] {
+            if search {
+                send(&mut app, Message::PaletteOpen);
+            }
+            drop(view(&app));
+            let mut worst = 0.0_f64;
+            for _ in 0..20 {
+                let start = Instant::now();
+                let element = view(&app);
+                worst = worst.max(start.elapsed().as_secs_f64() * 1000.0);
+                drop(element);
+            }
+            println!("1200 notes / search={search}: worst view {worst:.3}ms");
+            assert!(worst < 1.0, "view construction exceeded 1ms: {worst:.3}ms");
+        }
     }
 
     /// サブフォルダが無い vault では `/` の行を出さないこと。
