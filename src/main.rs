@@ -402,6 +402,10 @@ enum Message {
     ///
     /// **`Binding::Sequence` では書けないのでメッセージにしてある。** 理由は `update()` 側の doc。
     CutToLineEnd,
+    /// `Option+⌫`。手前の単語を消す。選択があれば選択だけを消す（issue 01）。
+    ///
+    /// **`Binding::Sequence` では書けないのでメッセージにしてある。** 理由は `update()` 側。
+    DeleteWordBackward,
     /// `Cmd+Z` / `Cmd+Shift+Z`（ADR-0017）。
     Undo,
     Redo,
@@ -1010,6 +1014,9 @@ enum EditKind {
     Enter,
     Backspace,
     Delete,
+    /// `Option+⌫`（issue 01）。`Backspace` と分け、押したキーの単位で戻せるようにする。
+    /// 日本語は 1 文字ずつ消えるので、連打はまとめる。
+    DeleteWord,
     /// 貼り付けは 1 回で 1 ステップ。連続しても混ぜない意味はないのでまとめる。
     Paste,
     /// インデント操作（このアプリからは出ないが、`Edit` の網羅性のために持つ）。
@@ -1057,6 +1064,17 @@ fn replace_content(app: &mut App, text: &str) {
     app.edit_group = None;
 }
 
+/// 本文へアクションを当てる。**編集なら dirty を立てる**（カーソル移動・クリックでは立てない）。
+///
+/// undo の区切りは呼ぶ側が先に決めておく（`remember_for_undo` / `begin_edit_group`）。
+fn perform(app: &mut App, action: text_editor::Action) {
+    let is_edit = matches!(action, iced::advanced::text::editor::Action::Edit(_));
+    app.content.perform(action);
+    if is_edit {
+        mark_edited(app);
+    }
+}
+
 /// 編集が起きたことを dirty へ記録する。**`Message::Edit` と undo / redo で共有する。**
 fn mark_edited(app: &mut App) {
     if app.selected.is_some() {
@@ -1088,7 +1106,11 @@ fn remember_for_undo(app: &mut App, action: &text_editor::Action) {
             return;
         }
     };
+    begin_edit_group(app, kind);
+}
 
+/// `kind` の編集が始まる。まとまりが変わるなら、**今の状態**を undo へ積む（ADR-0017）。
+fn begin_edit_group(app: &mut App, kind: EditKind) {
     if app.edit_group == Some(kind) {
         return;
     }
@@ -1633,14 +1655,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             );
         }
         Message::Edit(action) => {
-            // カーソル移動やクリックで dirty を立てない。編集だけを拾う。
-            let is_edit = matches!(action, iced::advanced::text::editor::Action::Edit(_));
             // **編集が起きる前に**区切りを判定して積む（ADR-0017）。
             remember_for_undo(app, &action);
-            app.content.perform(action);
-            if is_edit {
-                mark_edited(app);
-            }
+            perform(app, action);
         }
         // 元に戻す / やり直す（ADR-0017）。**戻した状態は反対側のスタックへ積む。**
         Message::Undo => {
@@ -1681,6 +1698,30 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let edited = update(app, Message::Edit(Action::Edit(Edit::Delete)));
             // Undo が無いので、切り取った分の戻し道はクリップボードだけ（ADR-0016）。
             return Task::batch([iced::clipboard::write(cut), edited]);
+        }
+        // `Option+⌫`（issue 01）。**選択があれば選択だけを消し、無ければ手前の単語まで選んで消す。**
+        //
+        // `Sequence[Select(WordLeft), Backspace]` にしない理由は 2 つ。選択があると `Select` が
+        // それを手前へ伸ばし、**選んだより多く消える**（Cocoa は選択だけを消す）。`KeyPress` から
+        // 選択は読めないので binding の段では分岐できない。もう 1 つは文書先頭で、`Backspace` は
+        // 何も消さないのに `Message::Edit` が dirty を立てる。
+        //
+        // **`Message::Edit` を通さない。** 通すと `Backspace` のまとまりに入り、直前の `⌫` と
+        // 一緒に戻ってしまう。undo へは**単語を選ぶ前に**積む。後で積むと、戻したときに
+        // カーソルが単語の頭へ行く。
+        Message::DeleteWordBackward => {
+            use iced::advanced::text::editor::{Action, Edit, Motion, Position};
+
+            let has_selection = app.content.selection().is_some_and(|s| !s.is_empty());
+            // 文書先頭では消すものが無い。**ここで返すので dirty も立たず、undo も積まない。**
+            if !has_selection && app.content.cursor().position == (Position { line: 0, column: 0 }) {
+                return Task::none();
+            }
+            begin_edit_group(app, EditKind::DeleteWord);
+            if !has_selection {
+                app.content.perform(Action::Select(Motion::WordLeft));
+            }
+            perform(app, Action::Edit(Edit::Backspace));
         }
         Message::Tick(now) => {
             if app.saved_flash_until.is_some_and(|until| now >= until) {
@@ -2210,6 +2251,14 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
     let control_only = kp.modifiers == keyboard::Modifiers::CTRL;
     let control_shift = kp.modifiers == keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
     let key = kp.key.clone();
+
+    // `Option+⌫`。既定は修飾を見ずに `Backspace` を返すので、**既定より先に**見る（issue 01）。
+    if focused
+        && kp.modifiers == keyboard::Modifiers::ALT
+        && key == keyboard::Key::Named(keyboard::key::Named::Backspace)
+    {
+        return Some(text_editor::Binding::Custom(Message::DeleteWordBackward));
+    }
 
     match text_editor::Binding::from_key_press(kp) {
         Some(text_editor::Binding::Insert(_)) if command => None,
@@ -4609,6 +4658,167 @@ mod tests {
             assert_eq!(app.content.text(), text, "{where_} で本文が変わった");
             assert!(!is_dirty(&app), "{where_} で dirty が立った（無編集で保存が走る）");
         }
+    }
+
+    /// `Option+⌫` の打鍵を組み立てる。macOS の実機は `text` に DEL（`"\u{7f}"`）を載せる。
+    fn option_backspace(text: Option<&str>) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key: named(keyboard::key::Named::Backspace),
+            modified_key: named(keyboard::key::Named::Backspace),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers: keyboard::Modifiers::ALT,
+            text: text.map(Into::into),
+            status: text_editor::Status::Focused { is_hovered: false },
+        }
+    }
+
+    /// **`Option+⌫` は `update()` へ回すこと。** 既定は修飾を見ずに `Backspace` を返すので、
+    /// 補わないと 1 文字しか消えない（issue 01）。
+    #[test]
+    fn option_backspace_is_handled_by_the_update_loop() {
+        for text in [Some("\u{7f}"), None] {
+            let binding = editor_key_binding(option_backspace(text));
+            assert!(
+                matches!(
+                    binding,
+                    Some(text_editor::Binding::Custom(Message::DeleteWordBackward))
+                ),
+                "Option+⌫（text: {text:?}）が単語削除にならない: {binding:?}",
+            );
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（見ていない本文から単語が消える）。
+    #[test]
+    fn option_backspace_does_nothing_while_the_editor_is_unfocused() {
+        let mut kp = option_backspace(Some("\u{7f}"));
+        kp.status = text_editor::Status::Active;
+        assert!(editor_key_binding(kp).is_none());
+    }
+
+    /// **カーソル手前の単語が消えること。** 効果は本文の文字列で見る（Ctrl+K の教訓）。
+    #[test]
+    fn option_backspace_deletes_the_previous_word() {
+        use iced::advanced::text::editor::{Action, Motion};
+
+        let (_dir, mut app) = app_with_vault("option-backspace-word");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo bar");
+        app.content.perform(Action::Move(Motion::DocumentEnd));
+
+        send(&mut app, Message::DeleteWordBackward);
+
+        assert_eq!(app.content.text(), "foo ", "手前の単語が消えていない");
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+    }
+
+    /// 行頭で押すと前の行と繋がる（改行 1 文字を消す）。
+    #[test]
+    fn option_backspace_at_a_line_start_joins_the_previous_line() {
+        use iced::advanced::text::editor::{Action, Motion};
+
+        let (_dir, mut app) = app_with_vault("option-backspace-line-start");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "一行目\n二行目");
+        app.content.perform(Action::Move(Motion::Down));
+        app.content.perform(Action::Move(Motion::Home));
+
+        send(&mut app, Message::DeleteWordBackward);
+
+        assert_eq!(app.content.text(), "一行目二行目");
+    }
+
+    /// **選択があれば選択だけを消すこと**（Cocoa と同じ）。手前の単語まで巻き込まない。
+    #[test]
+    fn option_backspace_deletes_only_the_selection() {
+        use iced::advanced::text::editor::{Action, Motion};
+
+        let (_dir, mut app) = app_with_vault("option-backspace-selection");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "今日は 晴れ です");
+        for _ in 0..4 {
+            app.content.perform(Action::Move(Motion::Right));
+        }
+        for _ in 0..2 {
+            app.content.perform(Action::Select(Motion::Right));
+        }
+        assert_eq!(app.content.selection().as_deref(), Some("晴れ"), "前提: 選択がずれている");
+
+        send(&mut app, Message::DeleteWordBackward);
+
+        assert_eq!(app.content.text(), "今日は  です", "選択より多く消えた");
+    }
+
+    /// 打鍵から binding を経て `update()` まで、本番と同じ経路で `Option+⌫` を押す。
+    fn press_option_backspace(app: &mut App) {
+        let Some(text_editor::Binding::Custom(message)) =
+            editor_key_binding(option_backspace(Some("\u{7f}")))
+        else {
+            panic!("Option+⌫ が Custom メッセージにならない");
+        };
+        send(app, message);
+    }
+
+    /// **直前の `⌫` とは別の undo ステップになり、戻したらカーソルも押した位置へ戻ること。**
+    ///
+    /// 単語の選択を `remember_for_undo` の外で行うと、`⌫` のまとまりに混ざって 1 回の
+    /// `Cmd+Z` で両方戻るうえ、積まれる状態が「単語を選んだ後」になりカーソルが単語の頭へ行く
+    /// （Codex レビューの指摘）。
+    #[test]
+    fn option_backspace_is_its_own_undo_step() {
+        use iced::advanced::text::editor::{Action, Edit, Motion};
+
+        let (_dir, mut app) = app_with_vault("option-backspace-undo");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo barX");
+        app.content.perform(Action::Move(Motion::DocumentEnd));
+
+        send(&mut app, Message::Edit(Action::Edit(Edit::Backspace)));
+        let before = app.content.cursor();
+        press_option_backspace(&mut app);
+        assert_eq!(app.content.text(), "foo ");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "foo bar", "⌫ の分まで一緒に戻った");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
+    }
+
+    /// **`Option+⌫` の連打は 1 回の `Cmd+Z` で戻ること。** 日本語は 1 文字ずつ消えるので、
+    /// 押した回数だけ戻させると使えない。
+    #[test]
+    fn repeated_option_backspace_undoes_at_once() {
+        use iced::advanced::text::editor::{Action, Motion};
+
+        let (_dir, mut app) = app_with_vault("option-backspace-undo-run");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "日本語の文章");
+        app.content.perform(Action::Move(Motion::DocumentEnd));
+
+        for _ in 0..3 {
+            press_option_backspace(&mut app);
+        }
+        assert_ne!(app.content.text(), "日本語の文章", "前提: 何も消えていない");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "日本語の文章", "連打の分がまとめて戻っていない");
+    }
+
+    /// **文書先頭では本文も dirty も変えないこと。** 立てると無編集なのに「編集中」になる。
+    #[test]
+    fn option_backspace_does_nothing_at_the_start_of_the_document() {
+        let (_dir, mut app) = app_with_vault("option-backspace-doc-start");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo");
+        app.dirty_since = None;
+
+        send(&mut app, Message::DeleteWordBackward);
+
+        assert_eq!(app.content.text(), "foo");
+        assert!(!is_dirty(&app), "文書先頭で dirty が立った");
     }
 
     /// **フォーカスが無いエディタでは Control 系を効かせないこと。**
