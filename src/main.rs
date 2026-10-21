@@ -2665,6 +2665,10 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
     // `Cmd+Ctrl+A` まで拾ってしまう（iced の `convert_macos_shortcut` も完全一致）。
     let control_only = kp.modifiers == keyboard::Modifiers::CTRL;
     let control_shift = kp.modifiers == keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+    // `Ctrl+Option` / `Ctrl+Option+Shift` も完全一致（issue 18）。`Cmd+Ctrl+Option+B` などは拾わない。
+    let control_alt = kp.modifiers == keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT;
+    let control_alt_shift = kp.modifiers
+        == keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT;
     let key = kp.key.clone();
 
     // `Option+⌫`。既定は修飾を見ずに `Backspace` を返すので、**既定より先に**見る（issue 01）。
@@ -2819,6 +2823,8 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
         Some(other) => Some(other),
         None if focused && control_only => macos_control_binding(&key, false),
         None if focused && control_shift => macos_control_binding(&key, true),
+        None if focused && control_alt => macos_control_alt_binding(&key, false),
+        None if focused && control_alt_shift => macos_control_alt_binding(&key, true),
         None => None,
     }
 }
@@ -2859,6 +2865,32 @@ fn macos_control_binding(
         keyboard::Key::Character("o") if !select => {
             return Some(text_editor::Binding::Custom(Message::OpenLine));
         }
+        _ => return None,
+    };
+    Some(if select {
+        text_editor::Binding::Select(motion)
+    } else {
+        text_editor::Binding::Move(motion)
+    })
+}
+
+/// macOS の `Ctrl+Option+B` / `F`（Emacs の `M-b` / `M-f`）で単語単位に動く（issue 18）。
+///
+/// 既定は `text`（macOS では `"\u{2}"` などの制御文字）を見て `None` を返すので、後ろで補う
+/// （ADR-0016）。`select` は `Shift` 付きかどうかで、`Move` と `Select` を切り替える（ADR-0023）。
+/// `macos_control_binding` は `b` / `f` を 1 文字移動に使っているので、引数を増やさず分けた。
+///
+/// **キーは大文字小文字の両方を受ける。** macOS の winit は Ctrl 付きのとき Shift の効いた文字を
+/// `key` にする（Option は無視される）ので、`Ctrl+Option+Shift+B` の実機は `"B"` になる。
+fn macos_control_alt_binding(
+    key: &keyboard::Key,
+    select: bool,
+) -> Option<text_editor::Binding<Message>> {
+    use iced::advanced::text::editor::Motion;
+
+    let motion = match key.as_ref() {
+        keyboard::Key::Character(c) if c.eq_ignore_ascii_case("b") => Motion::WordLeft,
+        keyboard::Key::Character(c) if c.eq_ignore_ascii_case("f") => Motion::WordRight,
         _ => return None,
     };
     Some(if select {
@@ -7231,6 +7263,127 @@ mod tests {
             let binding = editor_key_binding(ctrl_shift_press(c, Some(&control.to_string())));
             assert!(binding.is_none(), "Ctrl+Shift+{c} が拾われている: {binding:?}");
         }
+    }
+
+    /// `Ctrl+Option` の打鍵を組み立てる（issue 18）。`shift` で `Ctrl+Option+Shift` にする。`text` は
+    /// `ctrl_press` と同じ理由で制御文字を使う（Option を足しても Ctrl 由来の制御文字が来る見込み。実機は未計測）。
+    fn ctrl_option_press(c: &str, shift: bool, text: Option<&str>) -> text_editor::KeyPress {
+        let mut modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT;
+        if shift {
+            modifiers |= keyboard::Modifiers::SHIFT;
+        }
+        press(c, modifiers, text)
+    }
+
+    /// **`Ctrl+Option+B` / `F` は単語単位で動き、`Shift` を足すと選択すること（issue 18）。**
+    ///
+    /// 既定は `text`（macOS では `"\u{2}"`）が制御文字なので `None` を返し、後ろで補う（ADR-0016）。
+    /// **`key` は大文字も受ける。** macOS の winit は Ctrl 付きのとき Shift の効いた文字を `key` に
+    /// するので、`Ctrl+Option+Shift+B` の実機は `"B"` になる。
+    #[test]
+    fn macos_control_option_keys_move_and_select_by_word() {
+        use iced::advanced::text::editor::Motion;
+
+        let expected = [
+            ("b", '\u{2}', Motion::WordLeft),
+            ("f", '\u{6}', Motion::WordRight),
+        ];
+
+        for (c, control, motion) in expected {
+            for key in [c.to_string(), c.to_ascii_uppercase()] {
+                for text in [Some(control.to_string()), None] {
+                    let binding =
+                        editor_key_binding(ctrl_option_press(&key, false, text.as_deref()));
+                    assert!(
+                        matches!(binding, Some(text_editor::Binding::Move(m)) if m == motion),
+                        "Ctrl+Option+{key}（text: {text:?}）が {motion:?} にならない: {binding:?}",
+                    );
+                    let binding =
+                        editor_key_binding(ctrl_option_press(&key, true, text.as_deref()));
+                    assert!(
+                        matches!(binding, Some(text_editor::Binding::Select(m)) if m == motion),
+                        "Ctrl+Option+Shift+{key}（text: {text:?}）が {motion:?} の選択にならない: {binding:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// **`Ctrl+Option` は `b` / `f` 以外を拾わず、他の修飾が乗っても拾わないこと（issue 18）。**
+    ///
+    /// `Ctrl+Option+A` を行頭移動にしたり、`Ctrl+Option+D` で本文を消したりしない。修飾は完全一致で、
+    /// `Cmd+Ctrl+Option+B` は拾わない。
+    #[test]
+    fn control_option_bindings_cover_only_b_and_f() {
+        for (c, control) in [
+            ("a", '\u{1}'),
+            ("e", '\u{5}'),
+            ("n", '\u{e}'),
+            ("p", '\u{10}'),
+            ("d", '\u{4}'),
+            ("k", '\u{b}'),
+            ("o", '\u{f}'),
+        ] {
+            for shift in [false, true] {
+                for text in [Some(control.to_string()), None] {
+                    let binding = editor_key_binding(ctrl_option_press(c, shift, text.as_deref()));
+                    assert!(
+                        binding.is_none(),
+                        "Ctrl+Option+{c}（shift: {shift}, text: {text:?}）が拾われている: {binding:?}",
+                    );
+                }
+            }
+        }
+
+        for shift in [false, true] {
+            for text in [Some("\u{2}"), None] {
+                let mut kp = ctrl_option_press("b", shift, text);
+                kp.modifiers |= keyboard::Modifiers::COMMAND;
+                let binding = editor_key_binding(kp);
+                assert!(
+                    binding.is_none(),
+                    "Cmd+Ctrl+Option+B（shift: {shift}, text: {text:?}）が拾われている: {binding:?}",
+                );
+            }
+        }
+    }
+
+    /// **フォーカスが無いエディタでは `Ctrl+Option+B` / `F` を効かせないこと（issue 18）。**
+    /// 理由は `control_keys_do_nothing_while_the_editor_is_unfocused` と同じ。
+    #[test]
+    fn control_option_keys_do_nothing_while_the_editor_is_unfocused() {
+        for (c, control) in [("b", "\u{2}"), ("f", "\u{6}")] {
+            for shift in [false, true] {
+                let mut kp = ctrl_option_press(c, shift, Some(control));
+                kp.status = text_editor::Status::Active;
+                assert!(
+                    editor_key_binding(kp).is_none(),
+                    "フォーカスの無いエディタが Ctrl+Option+{c}（shift: {shift}）に反応している",
+                );
+            }
+        }
+    }
+
+    /// **`Ctrl+Option+B` で本文のカーソルが 1 単語左へ動くこと（issue 18）。** binding の答えを
+    /// 本番と同じ `Message::Edit` で流し、`"foo bar"` の末尾から `"bar"` の頭へ移ることを見る。
+    #[test]
+    fn ctrl_option_b_moves_one_word_left_in_the_body() {
+        use iced::advanced::text::editor::{Action, Position};
+
+        let (_dir, mut app) = app_with_vault("ctrl-option-b-word-left");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo bar");
+        put_cursor_at(&mut app, 0, "foo bar".len());
+
+        let Some(text_editor::Binding::Move(motion)) =
+            editor_key_binding(ctrl_option_press("b", false, Some("\u{2}")))
+        else {
+            panic!("Ctrl+Option+B が Move にならない");
+        };
+        send(&mut app, Message::Edit(Action::Move(motion)));
+
+        assert_eq!(app.content.text(), "foo bar", "移動で本文が変わっている");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "foo ".len() });
     }
 
     /// 修飾なしの打鍵はそのまま入ること（塞ぎすぎていないことの裏取り）。
