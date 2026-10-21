@@ -440,6 +440,12 @@ enum Message {
     /// **`Binding` では書けないのでメッセージにしてある。** 囲むか外すかは選択の中身で決まり、
     /// `KeyPress` からは読めない。
     Wrap(&'static str),
+    /// `Cmd+K`。選択を `[選択]()` にしてカーソルを `()` の中へ置く。選択が無ければ `[]()` を入れて
+    /// カーソルを `[]` の中に置く（issue 14）。外す（トグル）は無い。
+    ///
+    /// **`Binding` では書けないのでメッセージにしてある。** 包む文字列は選択の中身から作り、
+    /// `KeyPress` からは読めない。
+    WrapLink,
     /// `Cmd+Z` / `Cmd+Shift+Z`（ADR-0017）。
     Undo,
     Redo,
@@ -2035,6 +2041,28 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.content.move_to(Cursor { position: end, selection: Some(start) });
             return task;
         }
+        // `Cmd+K` でリンクを挿入する（issue 14）。置き換えは `Message::Edit(Paste)` に通す
+        // （`Paste` は選択を置き換える。undo は `EditKind::Paste` の 1 ステップ、dirty は共有）。
+        Message::WrapLink => {
+            use iced::advanced::text::editor::{Action, Edit, Position};
+
+            let paste =
+                |text: String| Message::Edit(Action::Edit(Edit::Paste(std::sync::Arc::new(text))));
+            let Some(selected) = app.content.selection().filter(|s| !s.is_empty()) else {
+                let Position { line, column } = app.content.cursor().position;
+                let task = update(app, paste("[]()".to_string()));
+                // `[` と `]` の間。列はバイト位置で、`[` は 1 バイト。
+                put_cursor_at(app, line, column + 1);
+                return task;
+            };
+            // 括弧の中は、貼った後のカーソル（貼った文字列の末尾 = `)` の後ろ）の 1 バイト手前。
+            // 複数行の選択でも `)` は最終行の末尾にあるので同じ式で済む。**貼る前の `cursor()` は
+            // 使わない。** ダブルクリック・トリプルクリックの選択では範囲の端を指さない（issue 06）。
+            let task = update(app, paste(format!("[{selected}]()")));
+            let end = app.content.cursor().position;
+            put_cursor_at(app, end.line, end.column - 1);
+            return task;
+        }
         Message::Tick(now) => {
             if app.saved_flash_until.is_some_and(|until| now >= until) {
                 app.saved_flash_until = None;
@@ -2664,6 +2692,18 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
         && let Some(marker) = wrap_marker
     {
         return Some(text_editor::Binding::Custom(Message::Wrap(marker)));
+    }
+
+    // `Cmd+K` でリンクを挿入する（issue 14）。issue 06 と同じ ADR-0010 の例外で、本文へ入るのは
+    // `[` `]` `(` `)` だけで "k" は入らない。既定は `text`（`"k"`）から `Insert` を返し、それは下の
+    // ⌘ ガードで捨てられる。捨てたあとでは何を押したかが分からないので、**既定より先に**見る。
+    // 修飾は完全一致で、`Shift+Cmd+K`（issue 04、行削除）・`Ctrl+K`（ADR-0016、行末まで切り取り）は
+    // 拾わない。アプリ側の ⌘ ショートカット（subscription）は `k` を使っていない。
+    if focused
+        && kp.modifiers == keyboard::Modifiers::COMMAND
+        && matches!(key.as_ref(), keyboard::Key::Character(c) if c.eq_ignore_ascii_case("k"))
+    {
+        return Some(text_editor::Binding::Custom(Message::WrapLink));
     }
 
     // `Cmd+D` / `Cmd+L` で単語・行を選択する（issue 09）。既定は `text`（`"d"` / `"l"`）から `Insert` を
@@ -6547,6 +6587,134 @@ mod tests {
 
         assert_eq!(app.content.text(), "foo bar baz", "1 回の Cmd+Z で戻っていない");
         assert_eq!(app.content.cursor(), before, "選択が囲む前へ戻っていない");
+    }
+
+    /// **`Cmd+K` は `update()` へ回すこと。** 既定は `text` から `Insert('k')` を返し、
+    /// ⌘ 付きなので捨てられる（ADR-0010）。補わないと何も起きない（issue 14）。
+    #[test]
+    fn cmd_k_is_handled_by_the_update_loop() {
+        for c in ["k", "K"] {
+            for text in [Some("k"), None] {
+                let binding = editor_key_binding(press(c, keyboard::Modifiers::COMMAND, text));
+                assert!(
+                    matches!(binding, Some(text_editor::Binding::Custom(Message::WrapLink))),
+                    "Cmd+{c}（text: {text:?}）がリンクの挿入にならない: {binding:?}",
+                );
+            }
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット・リネーム中に見ていない本文へ `[]()` が入る）。
+    #[test]
+    fn cmd_k_does_nothing_while_the_editor_is_unfocused() {
+        for text in [Some("k"), None] {
+            let mut kp = press("k", keyboard::Modifiers::COMMAND, text);
+            kp.status = text_editor::Status::Active;
+            assert!(
+                editor_key_binding(kp).is_none(),
+                "フォーカスの無いエディタが Cmd+K（text: {text:?}）に反応している",
+            );
+        }
+    }
+
+    /// **`see [here]` で `Cmd+K` → `see [here](|)`（カーソルが括弧の中、選択なし）。**
+    #[test]
+    fn cmd_k_wraps_the_selection_in_a_link() {
+        use iced::advanced::text::editor::{Cursor, Position};
+
+        let (_dir, mut app) = note_with_selection("link", "see here", (0, 4), (0, 8));
+
+        press_cmd(&mut app, "k");
+
+        assert_eq!(app.content.text(), "see [here]()", "選択がリンクになっていない");
+        assert_eq!(
+            app.content.cursor(),
+            Cursor { position: Position { line: 0, column: "see [here](".len() }, selection: None },
+            "カーソルが括弧の中にない",
+        );
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+    }
+
+    /// **選択なしで `Cmd+K` → `[|]()`（カーソルが角括弧の中）。**
+    #[test]
+    fn cmd_k_without_a_selection_puts_the_cursor_between_the_brackets() {
+        use iced::advanced::text::editor::{Cursor, Position};
+
+        let (_dir, mut app) = app_with_vault("link-empty");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "");
+
+        press_cmd(&mut app, "k");
+
+        assert_eq!(app.content.text(), "[]()");
+        assert_eq!(
+            app.content.cursor(),
+            Cursor { position: Position { line: 0, column: 1 }, selection: None },
+        );
+    }
+
+    /// **ダブルクリックで選んだ単語でも、カーソルが括弧の中へ行くこと。** 単語選択の `cursor()` は
+    /// 両端ともクリックした位置を指すので、貼る前の選択から位置を出すとずれる（issue 06）。
+    #[test]
+    fn cmd_k_wraps_a_double_clicked_word() {
+        use iced::advanced::text::editor::{Action, Position};
+
+        let (_dir, mut app) = app_with_vault("link-word");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo bar baz");
+        put_cursor_at(&mut app, 0, 5);
+        app.content.perform(Action::SelectWord);
+        assert_eq!(app.content.selection().as_deref(), Some("bar"), "前提: 単語が選ばれていない");
+
+        press_cmd(&mut app, "k");
+
+        assert_eq!(app.content.text(), "foo [bar]() baz");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "foo [bar](".len() });
+        assert_eq!(app.content.selection(), None, "選択が残っている");
+    }
+
+    /// **日本語の選択（`[晴れ]`）もリンクにでき、カーソルが括弧の中へ行くこと。** 列はバイト位置。
+    #[test]
+    fn cmd_k_wraps_japanese_text() {
+        use iced::advanced::text::editor::Position;
+
+        let text = "今日は晴れ";
+        let (_dir, mut app) =
+            note_with_selection("link-japanese", text, (0, "今日は".len()), (0, text.len()));
+
+        press_cmd(&mut app, "k");
+
+        assert_eq!(app.content.text(), "今日は[晴れ]()", "日本語の選択がリンクになっていない");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "今日は[晴れ](".len() });
+    }
+
+    /// **複数行の選択でも `)` は最終行にあるので、同じ式で括弧の中へ行くこと。** 選択は後ろから
+    /// 前へ張る（カーソルが先頭側）。
+    #[test]
+    fn cmd_k_wraps_a_multiline_selection() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = note_with_selection("link-multiline", "ab\ncd\nef", (2, 1), (0, 1));
+
+        press_cmd(&mut app, "k");
+
+        assert_eq!(app.content.text(), "a[b\ncd\ne]()f", "複数行の選択がリンクになっていない");
+        assert_eq!(app.content.cursor().position, Position { line: 2, column: "e](".len() });
+    }
+
+    /// **1 回の `Cmd+Z` でリンクにする前に戻り、選択も元どおりになること。**
+    #[test]
+    fn cmd_k_undoes_in_one_step() {
+        let (_dir, mut app) = note_with_selection("link-undo", "see here", (0, 4), (0, 8));
+        let before = app.content.cursor();
+
+        press_cmd(&mut app, "k");
+        assert_eq!(app.content.text(), "see [here]()", "前提: リンクになっていない");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "see here", "1 回の Cmd+Z で戻っていない");
+        assert_eq!(app.content.cursor(), before, "選択がリンクにする前へ戻っていない");
     }
 
     /// **`Cmd+D` は単語選択、`Cmd+L` は行選択になること。** 既定は `text` から `Insert('d')` を返し、
