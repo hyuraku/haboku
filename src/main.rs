@@ -434,6 +434,12 @@ enum Message {
     /// `KeyPress` からは読めない。
     InsertLineBelow,
     InsertLineAbove,
+    /// `Ctrl+O`。カーソル位置に改行を入れ、カーソルは改行の手前に残す。選択があれば選択を改行に
+    /// 置き換える（issue 17）。
+    ///
+    /// **`Binding::Sequence` では書けないのでメッセージにしてある。** `Sequence[Enter, Move(Left)]` の
+    /// `Motion::Left` は画面方向で、RTL 行では逆へ動く。
+    OpenLine,
     /// `Cmd+B` / `Cmd+I`。選択を `**` / `*` で囲む。既に囲まれていれば外す。選択が無ければ
     /// 記号を 2 つ入れてカーソルを中に置く（issue 06）。中身は囲む記号。
     ///
@@ -2001,6 +2007,26 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 put_cursor_at(app, line, 0);
             }
         }
+        // `Ctrl+O`（issue 17）。**改行を入れ、カーソルは改行の手前に残す**（Cocoa の
+        // `insertNewlineIgnoringFieldEditor:` → `moveBackward:`）。選択があれば `Edit::Enter` が選択を
+        // 改行に置き換える（Cocoa の `insertNewline` と同じ）ので、そのまま置き換える。リスト記号は
+        // 継がない（issue 05 の `NewlineInList` を通らない）。
+        //
+        // **`Sequence[Enter, Move(Left)]` にしない。** `Motion::Left` は画面方向で、RTL 行では逆へ動く。
+        // 改行の直前＝改行後のカーソル行の 1 つ上の行末を、論理行のバイト長から `put_cursor_at` で合わせる。
+        //
+        // **`Message::Edit` を通さない**（issue 08 と同じ型）。undo へは改行を入れる前に積む。まとまりは
+        // 素の `Enter` と同じ。
+        Message::OpenLine => {
+            use iced::advanced::text::editor::{Action, Edit};
+
+            begin_edit_group(app, EditKind::Enter);
+            perform(app, Action::Edit(Edit::Enter));
+            // 改行のあとのカーソルは新しい行の頭 `(line, 0)`。戻す先は `(line - 1, その行の長さ)`。
+            let line = app.content.cursor().position.line - 1;
+            let column = app.content.line(line).map_or(0, |l| l.text.len());
+            put_cursor_at(app, line, column);
+        }
         // `Cmd+B` / `Cmd+I`（issue 06）。**選択があれば `{m}選択{m}` に置き換え、既に `{m}…{m}` なら
         // 剥がす。** `*` だけは、選択が `**` で始まるときは剥がさず重ねる（太字の上に斜体で
         // `***bar***`。剥がすと `*bar*` で太字が斜体に化ける）。`***bar***` にもう一度 `Cmd+I` を
@@ -2808,8 +2834,8 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
 /// `update()` で処理する**（ADR-0016）。`Sequence` の中では `Select` の結果を
 /// `Cut` が見られないため（`Message::CutToLineEnd` の分岐に理由を書いた）。
 /// `select` は `Ctrl+Shift+<key>` かどうか。移動系（a/e/b/f/n/p）だけが対応し、
-/// `d`（削除）・`k`（切り取り）は shift 版の意味を定義していないので `None` で見送る
-/// （ADR-0023）。
+/// `d`（削除）・`k`（切り取り）・`o`（行を開く）は shift 版の意味を定義していないので `None` で
+/// 見送る（ADR-0023）。
 fn macos_control_binding(
     key: &keyboard::Key,
     select: bool,
@@ -2828,6 +2854,10 @@ fn macos_control_binding(
         // 行末まで切り取る。行を繋げたいときは続けて `Ctrl+D` を押す（doc 参照）。
         keyboard::Key::Character("k") if !select => {
             return Some(text_editor::Binding::Custom(Message::CutToLineEnd));
+        }
+        // カーソル位置に改行を入れ、カーソルは動かさない（issue 17。`Message::OpenLine` の分岐に理由）。
+        keyboard::Key::Character("o") if !select => {
+            return Some(text_editor::Binding::Custom(Message::OpenLine));
         }
         _ => return None,
     };
@@ -6998,6 +7028,126 @@ mod tests {
         assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
     }
 
+    /// 打鍵から binding を経て `update()` まで、本番と同じ経路で `Ctrl+O` を押す。実機の `text` は
+    /// 制御文字 `"\u{f}"`。
+    fn press_ctrl_o(app: &mut App) {
+        let Some(text_editor::Binding::Custom(message)) =
+            editor_key_binding(ctrl_press("o", Some("\u{f}")))
+        else {
+            panic!("Ctrl+O が Custom メッセージにならない");
+        };
+        send(app, message);
+    }
+
+    /// `text` を本文にして、`line` 行目の `column` バイト目で `Ctrl+O` を押す。
+    fn ctrl_o_at(name: &str, text: &str, line: usize, column: usize) -> (TempDir, App) {
+        let (dir, mut app) = app_with_vault(name);
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, text);
+        put_cursor_at(&mut app, line, column);
+        press_ctrl_o(&mut app);
+        (dir, app)
+    }
+
+    /// **`Ctrl+O` は `update()` へ回すこと。** 既定は `text`（macOS では `"\u{f}"`）が制御文字なので
+    /// `None` を返す（issue 17）。`Sequence[Enter, Move(Left)]` にしないのは、`Motion::Left` が画面方向で
+    /// RTL 行では逆へ動くため。
+    #[test]
+    fn ctrl_o_is_handled_by_the_update_loop() {
+        for text in [Some("\u{f}"), None] {
+            let binding = editor_key_binding(ctrl_press("o", text));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Custom(Message::OpenLine))),
+                "Ctrl+O（text: {text:?}）が行を開く操作にならない: {binding:?}",
+            );
+        }
+    }
+
+    /// **`Ctrl+Shift+O` は何もしないこと。** 移動系ではないので shift 版の意味を定義していない
+    /// （ADR-0023）。
+    #[test]
+    fn ctrl_shift_o_stays_undefined() {
+        for text in [Some("\u{f}"), None] {
+            let binding = editor_key_binding(ctrl_shift_press("o", text));
+            assert!(binding.is_none(), "Ctrl+Shift+O（text: {text:?}）が拾われている: {binding:?}");
+        }
+    }
+
+    /// **`fo|o` で `Ctrl+O` → `fo|\no`。** 改行を入れ、カーソルは改行の手前に残る。
+    #[test]
+    fn ctrl_o_inserts_a_newline_and_keeps_the_cursor() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = ctrl_o_at("ctrl-o", "foo", 0, "fo".len());
+
+        assert_eq!(app.content.text(), "fo\no", "カーソル位置に改行が入っていない");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "fo".len() });
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+    }
+
+    /// **2 行目以降・日本語の行でも、押した位置に改行が入りカーソルが残ること。** 列はバイト位置。
+    #[test]
+    fn ctrl_o_keeps_the_cursor_on_a_later_japanese_line() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = ctrl_o_at("ctrl-o-japanese", "a\n日本語\nb", 1, "日本".len());
+
+        assert_eq!(app.content.text(), "a\n日本\n語\nb");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: "日本".len() });
+    }
+
+    /// **リスト行でも `Ctrl+O` は記号を継がない素の改行**（`- foo|` → `- foo|\n`）。issue 05 の
+    /// `NewlineInList` を通らない。
+    #[test]
+    fn ctrl_o_does_not_continue_a_list() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = ctrl_o_at("ctrl-o-list", "- foo", 0, "- foo".len());
+
+        assert_eq!(app.content.text(), "- foo\n", "記号が継がれている");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "- foo".len() });
+    }
+
+    /// **選択があれば選択が改行に置き換わり、カーソルは改行の直前に残ること**（Cocoa の
+    /// `insertNewline` と同じ）。選択が複数行にまたがっても、向きが逆でも同じ。
+    #[test]
+    fn ctrl_o_replaces_the_selection_with_a_newline() {
+        use iced::advanced::text::editor::Position;
+
+        for (text, anchor, head, after, cursor) in [
+            ("foo bar", (0, 2), (0, 5), "fo\nar", (0, 2)),
+            ("foo bar", (0, 5), (0, 2), "fo\nar", (0, 2)),
+            ("一行目\n二行目", (0, "一".len()), (1, "二".len()), "一\n行目", (0, "一".len())),
+        ] {
+            let (_dir, mut app) = note_with_selection("ctrl-o-selection", text, anchor, head);
+
+            press_ctrl_o(&mut app);
+
+            assert_eq!(app.content.text(), after, "{text:?} の選択 {anchor:?}..{head:?} が改行にならない");
+            assert_eq!(
+                app.content.cursor().position,
+                Position { line: cursor.0, column: cursor.1 },
+                "{text:?} の選択 {anchor:?}..{head:?}: カーソルが改行の直前にない",
+            );
+        }
+    }
+
+    /// **1 回の `Cmd+Z` で戻り、カーソル（選択込み）も押した位置へ戻ること。** undo は改行を入れる
+    /// 前に積む。
+    #[test]
+    fn ctrl_o_undoes_in_one_step() {
+        let (_dir, mut app) = note_with_selection("ctrl-o-undo", "foo bar", (0, 1), (0, "foo".len()));
+        let before = app.content.cursor();
+
+        press_ctrl_o(&mut app);
+        assert_ne!(app.content.text(), "foo bar", "前提: Ctrl+O で改行が入っていない");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "foo bar", "Ctrl+O が 1 回で戻らない");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
+    }
+
     /// **フォーカスが無いエディタでは Control 系を効かせないこと。**
     ///
     /// `key_binding` はフォーカスの有無に関わらず呼ばれる。パレットを開いている間に
@@ -7005,7 +7155,7 @@ mod tests {
     /// `Ctrl+D` に至っては、見ていない本文から 1 文字消える。
     #[test]
     fn control_keys_do_nothing_while_the_editor_is_unfocused() {
-        for c in ["a", "e", "n", "p", "d", "k"] {
+        for c in ["a", "e", "n", "p", "d", "k", "o"] {
             let mut kp = ctrl_press(c, Some("\u{1}"));
             kp.status = text_editor::Status::Active;
             assert!(
