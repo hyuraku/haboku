@@ -423,6 +423,12 @@ enum Message {
     /// **`Binding` では書けないのでメッセージにしてある。** 継ぐ記号はカーソル行の本文から読む必要があり、
     /// `KeyPress` からは読めない。
     NewlineInList,
+    /// `Cmd+B` / `Cmd+I`。選択を `**` / `*` で囲む。既に囲まれていれば外す。選択が無ければ
+    /// 記号を 2 つ入れてカーソルを中に置く（issue 06）。中身は囲む記号。
+    ///
+    /// **`Binding` では書けないのでメッセージにしてある。** 囲むか外すかは選択の中身で決まり、
+    /// `KeyPress` からは読めない。
+    Wrap(&'static str),
     /// `Cmd+Z` / `Cmd+Shift+Z`（ADR-0017）。
     Undo,
     Redo,
@@ -1918,6 +1924,55 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 perform(app, Action::Edit(Edit::Paste(std::sync::Arc::new(next))));
             }
         }
+        // `Cmd+B` / `Cmd+I`（issue 06）。**選択があれば `{m}選択{m}` に置き換え、既に `{m}…{m}` なら
+        // 剥がす。** `*` だけは、選択が `**` で始まるときは剥がさず重ねる（太字の上に斜体で
+        // `***bar***`。剥がすと `*bar*` で太字が斜体に化ける）。`***bar***` にもう一度 `Cmd+I` を
+        // 押したときの挙動は決めていない。
+        //
+        // 置き換えは `Message::Edit(Paste)` に通す（`Paste` は選択を置き換える。cosmic-text の
+        // `insert_string` が先に選択を消す）。undo は `EditKind::Paste` の 1 ステップ、dirty は共有。
+        // **置き換えた後に結果を選び直す。** 選択が残らないと、もう一度押したときに外れず
+        // `****` の挿入になる。選択はバイト位置で直接張る（issue 03 / 04 と同じ型）。
+        Message::Wrap(marker) => {
+            use iced::advanced::text::editor::{Action, Cursor, Edit, Position};
+
+            let paste =
+                |text: String| Message::Edit(Action::Edit(Edit::Paste(std::sync::Arc::new(text))));
+            let Some(selected) = app.content.selection().filter(|s| !s.is_empty()) else {
+                let Position { line, column } = app.content.cursor().position;
+                let task = update(app, paste(format!("{marker}{marker}")));
+                // 列はバイト位置。記号は ASCII なので足し算で合う。
+                put_cursor_at(app, line, column + marker.len());
+                return task;
+            };
+            let wrapped = selected.len() >= 2 * marker.len()
+                && selected.starts_with(marker)
+                && selected.ends_with(marker)
+                && !(marker == "*" && selected.starts_with("**"));
+            let replaced = if wrapped {
+                selected[marker.len()..selected.len() - marker.len()].to_string()
+            } else {
+                format!("{marker}{selected}{marker}")
+            };
+            // 選び直す先頭は、貼った後のカーソル（貼った文字列の末尾）から文字列の長さで逆算する。
+            // **貼る前の `cursor()` からは取れない。** ダブルクリック（単語選択）・トリプルクリック
+            // （行選択）では `cursor()` の `position` も `selection` もクリックした位置を指し、
+            // 範囲の端にならない（iced_graphics は cosmic の `Selection::Word` / `Line` の起点を
+            // そのまま返す）。そこから張ると `*bar**` が選ばれ、もう一度押すと `****bar****` になる。
+            let rows = replaced.matches('\n').count();
+            let first = replaced.lines().next().map_or(0, str::len);
+            let task = update(app, paste(replaced));
+            let end = app.content.cursor().position;
+            let line = end.line - rows;
+            let column = if rows == 0 {
+                end.column - first
+            } else {
+                app.content.line(line).map_or(0, |l| l.text.len()) - first
+            };
+            let start = Position { line, column };
+            app.content.move_to(Cursor { position: end, selection: Some(start) });
+            return task;
+        }
         Message::Tick(now) => {
             if app.saved_flash_until.is_some_and(|until| now >= until) {
                 app.saved_flash_until = None;
@@ -2508,6 +2563,23 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
         && matches!(key.as_ref(), keyboard::Key::Character(c) if c.eq_ignore_ascii_case("k"))
     {
         return Some(text_editor::Binding::Custom(Message::DeleteLine));
+    }
+
+    // `Cmd+B` / `Cmd+I` で太字・斜体を付け外しする（issue 06）。**ADR-0010 の帰結にある「⌘ 付きで
+    // 文字を入れる機能」の最初の例外。** 既定は `text`（`"b"` / `"i"`）から `Insert` を返し、それは下の
+    // ⌘ ガードで捨てられる。捨てたあとでは何を押したかが分からないので、**既定より先に**見る。
+    // 本文へ入るのは `**` / `*` だけで、"b" / "i" は入らない。修飾は完全一致で、`Shift+Cmd+B` などは
+    // 拾わない。アプリ側の ⌘ ショートカット（subscription）は `b` / `i` を使っていない。
+    let wrap_marker = match key.as_ref() {
+        keyboard::Key::Character(c) if c.eq_ignore_ascii_case("b") => Some("**"),
+        keyboard::Key::Character(c) if c.eq_ignore_ascii_case("i") => Some("*"),
+        _ => None,
+    };
+    if focused
+        && kp.modifiers == keyboard::Modifiers::COMMAND
+        && let Some(marker) = wrap_marker
+    {
+        return Some(text_editor::Binding::Custom(Message::Wrap(marker)));
     }
 
     match text_editor::Binding::from_key_press(kp) {
@@ -5793,6 +5865,204 @@ mod tests {
 
         assert_eq!(app.content.text(), "- foo", "改行と記号がまとめて戻っていない");
         assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
+    }
+
+    /// **`Cmd+B` / `Cmd+I` は `update()` へ回すこと。** 既定は `text` から `Insert('b')` を返し、
+    /// ⌘ 付きなので捨てられる（ADR-0010）。補わないと何も起きない（issue 06）。
+    #[test]
+    fn cmd_b_and_cmd_i_are_handled_by_the_update_loop() {
+        for (c, marker) in [("b", "**"), ("i", "*")] {
+            for text in [Some(c), None] {
+                let binding = editor_key_binding(press(c, keyboard::Modifiers::COMMAND, text));
+                assert!(
+                    matches!(binding, Some(text_editor::Binding::Custom(Message::Wrap(m))) if m == marker),
+                    "Cmd+{c}（text: {text:?}）が {marker:?} で囲む操作にならない: {binding:?}",
+                );
+            }
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット・リネーム中に見ていない本文へ記号が入る）。
+    #[test]
+    fn cmd_b_and_cmd_i_do_nothing_while_the_editor_is_unfocused() {
+        for c in ["b", "i"] {
+            for text in [Some(c), None] {
+                let mut kp = press(c, keyboard::Modifiers::COMMAND, text);
+                kp.status = text_editor::Status::Active;
+                assert!(
+                    editor_key_binding(kp).is_none(),
+                    "フォーカスの無いエディタが Cmd+{c}（text: {text:?}）に反応している",
+                );
+            }
+        }
+    }
+
+    /// 打鍵から binding を経て `update()` まで、本番と同じ経路で `Cmd+<c>` を押す。
+    fn press_cmd(app: &mut App, c: &str) {
+        let Some(text_editor::Binding::Custom(message)) =
+            editor_key_binding(key_press(c, keyboard::Modifiers::COMMAND))
+        else {
+            panic!("Cmd+{c} が Custom メッセージにならない");
+        };
+        send(app, message);
+    }
+
+    /// `text` を本文にして、`anchor` から `head`（どちらも `(行, バイト位置)`）までを選ぶ。
+    fn note_with_selection(
+        name: &str,
+        text: &str,
+        anchor: (usize, usize),
+        head: (usize, usize),
+    ) -> (TempDir, App) {
+        use iced::advanced::text::editor::{Cursor, Position};
+
+        let (dir, mut app) = app_with_vault(name);
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, text);
+        app.content.move_to(Cursor {
+            position: Position { line: head.0, column: head.1 },
+            selection: Some(Position { line: anchor.0, column: anchor.1 }),
+        });
+        (dir, app)
+    }
+
+    /// **`foo [bar] baz` で `Cmd+B` → `foo **bar** baz`、`**bar**` は選ばれたまま。もう一度で戻る。**
+    /// 選択が残らないと 2 回目は `****` の挿入になり、「もう一度押すと戻る」が成立しない。
+    #[test]
+    fn cmd_b_toggles_bold_around_the_selection() {
+        let (_dir, mut app) = note_with_selection("wrap-bold", "foo bar baz", (0, 4), (0, 7));
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), "foo **bar** baz", "選択が太字で囲まれていない");
+        assert_eq!(app.content.selection().as_deref(), Some("**bar**"), "囲んだ結果が選ばれていない");
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), "foo bar baz", "もう一度押しても太字が外れない");
+        assert_eq!(app.content.selection().as_deref(), Some("bar"));
+    }
+
+    /// **選択なしで `Cmd+B` → `**|**`（カーソルが記号の中）。**
+    #[test]
+    fn cmd_b_without_a_selection_puts_the_cursor_between_the_markers() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("wrap-bold-empty");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "");
+
+        press_cmd(&mut app, "b");
+
+        assert_eq!(app.content.text(), "****");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: 2 });
+    }
+
+    /// **`Cmd+I` は `*` 版。** 囲んで選び直し、もう一度で外す。
+    #[test]
+    fn cmd_i_toggles_italics_around_the_selection() {
+        let (_dir, mut app) = note_with_selection("wrap-italic", "foo bar baz", (0, 4), (0, 7));
+
+        press_cmd(&mut app, "i");
+        assert_eq!(app.content.text(), "foo *bar* baz", "選択が斜体で囲まれていない");
+        assert_eq!(app.content.selection().as_deref(), Some("*bar*"));
+
+        press_cmd(&mut app, "i");
+        assert_eq!(app.content.text(), "foo bar baz", "もう一度押しても斜体が外れない");
+        assert_eq!(app.content.selection().as_deref(), Some("bar"));
+    }
+
+    /// 選択なしで `Cmd+I` → `*|*`。
+    #[test]
+    fn cmd_i_without_a_selection_puts_the_cursor_between_the_markers() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("wrap-italic-empty");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo");
+        put_cursor_at(&mut app, 0, 3);
+
+        press_cmd(&mut app, "i");
+
+        assert_eq!(app.content.text(), "foo**");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: 4 });
+    }
+
+    /// **太字の選択 `**bar**` に `Cmd+I` → `***bar***`。** `*` で始まって終わるが、剥がすと
+    /// `*bar*` になって太字が斜体に化ける。`**` で始まるときは剥がさず重ねる（Obsidian と同じ）。
+    #[test]
+    fn cmd_i_on_a_bold_selection_adds_italics() {
+        let (_dir, mut app) =
+            note_with_selection("wrap-bold-italic", "foo **bar** baz", (0, 4), (0, 11));
+
+        press_cmd(&mut app, "i");
+
+        assert_eq!(app.content.text(), "foo ***bar*** baz");
+        assert_eq!(app.content.selection().as_deref(), Some("***bar***"));
+    }
+
+    /// **複数行の選択も同じ式で囲み、選び直し、外せること。** 選択は後ろから前へ張る
+    /// （カーソルが先頭側）ので、先頭を `position` と `selection` の小さい方で取れているかも見る。
+    #[test]
+    fn cmd_b_toggles_bold_around_a_multiline_selection() {
+        let (_dir, mut app) = note_with_selection("wrap-multiline", "ab\ncd\nef", (2, 1), (0, 1));
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), "a**b\ncd\ne**f", "複数行の選択が囲まれていない");
+        assert_eq!(app.content.selection().as_deref(), Some("**b\ncd\ne**"));
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), "ab\ncd\nef", "もう一度押しても太字が外れない");
+    }
+
+    /// **日本語の選択（`[晴れ]`）を囲み、外せること。** 列はバイト位置。
+    #[test]
+    fn cmd_b_toggles_bold_around_japanese_text() {
+        let text = "今日は晴れ";
+        let (_dir, mut app) =
+            note_with_selection("wrap-japanese", text, (0, "今日は".len()), (0, text.len()));
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), "今日は**晴れ**", "日本語の選択が囲まれていない");
+        assert_eq!(app.content.selection().as_deref(), Some("**晴れ**"));
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), text, "もう一度押しても太字が外れない");
+    }
+
+    /// **ダブルクリックで選んだ単語でも、囲んだ結果が選ばれ、もう一度で戻ること。** 単語選択の
+    /// `cursor()` は両端ともクリックした位置を指すので、そこから選び直すと `*bar**` が選ばれる。
+    #[test]
+    fn cmd_b_toggles_bold_around_a_double_clicked_word() {
+        use iced::advanced::text::editor::Action;
+
+        let (_dir, mut app) = app_with_vault("wrap-word");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo bar baz");
+        put_cursor_at(&mut app, 0, 5);
+        app.content.perform(Action::SelectWord);
+        assert_eq!(app.content.selection().as_deref(), Some("bar"), "前提: 単語が選ばれていない");
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), "foo **bar** baz");
+        assert_eq!(app.content.selection().as_deref(), Some("**bar**"), "囲んだ結果が選ばれていない");
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), "foo bar baz", "もう一度押しても太字が外れない");
+    }
+
+    /// **1 回の `Cmd+Z` で囲む前に戻り、選択も元どおりになること。**
+    #[test]
+    fn cmd_b_undoes_in_one_step() {
+        let (_dir, mut app) = note_with_selection("wrap-undo", "foo bar baz", (0, 4), (0, 7));
+        let before = app.content.cursor();
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), "foo **bar** baz", "前提: 囲まれていない");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "foo bar baz", "1 回の Cmd+Z で戻っていない");
+        assert_eq!(app.content.cursor(), before, "選択が囲む前へ戻っていない");
     }
 
     /// **フォーカスが無いエディタでは Control 系を効かせないこと。**
