@@ -446,6 +446,12 @@ enum Message {
     /// **`Binding` では書けないのでメッセージにしてある。** 包む文字列は選択の中身から作り、
     /// `KeyPress` からは読めない。
     WrapLink,
+    /// `Cmd+1`〜`Cmd+6`。カーソル行を `#` × N + 空白の見出しにする。既に見出しなら `#` の数を置き換え、
+    /// 同じレベルなら外す（issue 15）。中身は見出しのレベル（1〜6）。
+    ///
+    /// **`Binding` では書けないのでメッセージにしてある。** 置き換える接頭辞の長さはカーソル行の本文から
+    /// 読む必要があり、`KeyPress` からは読めない。カーソルを元の位置へ戻すのも同じ。
+    SetHeading(usize),
     /// `Cmd+Z` / `Cmd+Shift+Z`（ADR-0017）。
     Undo,
     Redo,
@@ -1067,6 +1073,9 @@ enum EditKind {
     Indent,
     /// `Shift+Cmd+K`（issue 04）。`Delete` と分け、連打は 1 回の `Cmd+Z` でまとめて戻る。
     DeleteLine,
+    /// `Cmd+1`〜`Cmd+6`（issue 15）。置き換えは `Edit::Paste` で流すが `Paste` とは分け、直前の
+    /// 貼り付けと 1 回の `Cmd+Z` で一緒に消えないようにする。連打はまとめる。
+    Heading,
 }
 
 /// undo に積める段数の上限。
@@ -2063,6 +2072,44 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             put_cursor_at(app, end.line, end.column - 1);
             return task;
         }
+        // `Cmd+1`〜`Cmd+6`（issue 15）。**カーソル行の行頭の `#` × 1〜6 + 半角スペースを、`#` × N + 空白に
+        // 置き換える。** 同じレベルなら外す。見出しでない行（`#foo` や `####### `）は接頭辞なしとして
+        // 行頭へ足す。選択があってもカーソル行だけに効く（行頭へ動かすので選択は解ける）。Setext
+        // 見出し（下線）は扱わない。
+        //
+        // **`Message::Edit` を通さない**（issue 03 と同じ型）。undo へは**行頭へ動かす前に**積む。後で積むと、
+        // 戻したときにカーソルが行頭へ行く。連打は `EditKind::Heading` で 1 つにまとまる。
+        Message::SetHeading(level) => {
+            use iced::advanced::text::editor::{Action, Cursor, Edit, Position};
+
+            let Position { line, column } = app.content.cursor().position;
+            // 今の接頭辞のバイト長（`#` の数 + 空白 1 つ）。見出しでなければ 0。
+            let old = app.content.line(line).map_or(0, |l| {
+                let hashes = l.text.bytes().take_while(|&b| b == b'#').count();
+                let spaced = l.text.as_bytes().get(hashes) == Some(&b' ');
+                if (1..=6).contains(&hashes) && spaced { hashes + 1 } else { 0 }
+            });
+            let new = if old == level + 1 { String::new() } else { "#".repeat(level) + " " };
+            begin_edit_group(app, EditKind::Heading);
+            move_to_line_start(app, line);
+            // **選択はモーションで作らず、バイト位置で直接張る**（issue 03 の RTL の罠）。接頭辞は
+            // ASCII なので `old` は必ず文字境界に当たる。`old == 0` なら選択を張らずに行頭へ貼る。
+            if old > 0 {
+                app.content.move_to(Cursor {
+                    position: Position { line, column: old },
+                    selection: Some(Position { line, column: 0 }),
+                });
+            }
+            // `Paste` は選択を置き換える（cosmic-text の `insert_string` が先に選択を消す）。
+            let edit = if new.is_empty() {
+                Edit::Delete
+            } else {
+                Edit::Paste(std::sync::Arc::new(new.clone()))
+            };
+            perform(app, Action::Edit(edit));
+            // カーソルが古い接頭辞の中にいたときは新しい接頭辞の直後で止める（引き算が桁あふれする）。
+            put_cursor_at(app, line, column.saturating_sub(old) + new.len());
+        }
         Message::Tick(now) => {
             if app.saved_flash_until.is_some_and(|until| now >= until) {
                 app.saved_flash_until = None;
@@ -2704,6 +2751,25 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
         && matches!(key.as_ref(), keyboard::Key::Character(c) if c.eq_ignore_ascii_case("k"))
     {
         return Some(text_editor::Binding::Custom(Message::WrapLink));
+    }
+
+    // `Cmd+1`〜`Cmd+6` で見出しレベルを付け外しする（issue 15）。issue 06 と同じ ADR-0010 の例外で、
+    // 本文へ入るのは `#` と空白だけで数字は入らない。既定は `text`（`"1"`）から `Insert('1')` を返し、
+    // それは下の ⌘ ガードで捨てられる。捨てたあとでは何を押したかが分からないので、**既定より先に**
+    // 見る（issue 04 / 06 と同じ理由）。修飾は完全一致で、`Shift+Cmd+1` などは拾わない。アプリ側の
+    // ⌘ ショートカット（subscription）は数字キーを使っていない。
+    let heading = match key.as_ref() {
+        keyboard::Key::Character(c) => match c.as_bytes() {
+            [digit @ b'1'..=b'6'] => Some(usize::from(digit - b'0')),
+            _ => None,
+        },
+        _ => None,
+    };
+    if focused
+        && kp.modifiers == keyboard::Modifiers::COMMAND
+        && let Some(level) = heading
+    {
+        return Some(text_editor::Binding::Custom(Message::SetHeading(level)));
     }
 
     // `Cmd+D` / `Cmd+L` で単語・行を選択する（issue 09）。既定は `text`（`"d"` / `"l"`）から `Insert` を
@@ -6781,6 +6847,155 @@ mod tests {
         assert_eq!(app.content.selection().as_deref(), Some("日本語のメモを書く"), "カーソル行が選ばれていない");
         assert_eq!(app.content.text(), "見出し\n日本語のメモを書く\n末尾", "選択で本文が変わった");
         assert!(!is_dirty(&app), "選んだだけで dirty が立った");
+    }
+
+    /// **`Cmd+1`〜`Cmd+6` は `update()` へ回すこと。** 既定は `text` から `Insert('1')` を返し、
+    /// ⌘ 付きなので捨てられる（ADR-0010）。補わないと何も起きない（issue 15）。`Cmd+0` / `Cmd+7` は
+    /// 見出しではないので、今までどおり捨てる。
+    #[test]
+    fn cmd_1_to_6_are_handled_by_the_update_loop() {
+        for (c, level) in [("1", 1), ("2", 2), ("3", 3), ("4", 4), ("5", 5), ("6", 6)] {
+            for text in [Some(c), None] {
+                let binding = editor_key_binding(press(c, keyboard::Modifiers::COMMAND, text));
+                assert!(
+                    matches!(binding, Some(text_editor::Binding::Custom(Message::SetHeading(n))) if n == level),
+                    "Cmd+{c}（text: {text:?}）が見出しにならない: {binding:?}",
+                );
+            }
+        }
+        for c in ["0", "7"] {
+            assert!(
+                editor_key_binding(key_press(c, keyboard::Modifiers::COMMAND)).is_none(),
+                "Cmd+{c} を拾っている",
+            );
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット・リネーム中に見ていない本文へ `#` が入る）。
+    #[test]
+    fn cmd_1_to_6_do_nothing_while_the_editor_is_unfocused() {
+        for c in ["1", "6"] {
+            for text in [Some(c), None] {
+                let mut kp = press(c, keyboard::Modifiers::COMMAND, text);
+                kp.status = text_editor::Status::Active;
+                assert!(
+                    editor_key_binding(kp).is_none(),
+                    "フォーカスの無いエディタが Cmd+{c}（text: {text:?}）に反応している",
+                );
+            }
+        }
+    }
+
+    /// **`foo|` で `Cmd+2` → `## foo|`、`Cmd+3` → `### foo|`、もう一度 `Cmd+3` → `foo|`。**
+    /// 既に見出しなら `#` の数を置き換え、同じレベルなら外す。カーソルは文字に対して同じ位置に残る。
+    #[test]
+    fn cmd_number_sets_replaces_and_removes_the_heading() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("heading");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo");
+        put_cursor_at(&mut app, 0, "foo".len());
+
+        press_cmd(&mut app, "2");
+        assert_eq!(app.content.text(), "## foo", "見出しになっていない");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "## foo".len() });
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+
+        press_cmd(&mut app, "3");
+        assert_eq!(app.content.text(), "### foo", "見出しのレベルが置き換わっていない");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "### foo".len() });
+
+        press_cmd(&mut app, "3");
+        assert_eq!(app.content.text(), "foo", "同じレベルをもう一度押しても見出しが外れない");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "foo".len() });
+    }
+
+    /// **カーソルが接頭辞の中にあっても落ちず、新しい接頭辞の直後に止まること。** 列を引き算で
+    /// 戻すので、古い接頭辞より手前にいると桁あふれする。
+    #[test]
+    fn cmd_number_with_the_cursor_inside_the_prefix_stops_after_the_new_prefix() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("heading-cursor-in-prefix");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "### foo");
+        put_cursor_at(&mut app, 0, 1);
+
+        press_cmd(&mut app, "1");
+
+        assert_eq!(app.content.text(), "# foo");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "# ".len() });
+    }
+
+    /// **日本語の行でもカーソルが文字に対して同じ位置へ戻ること。** 列はバイト位置。
+    #[test]
+    fn cmd_number_keeps_the_cursor_after_the_same_japanese_character() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("heading-japanese");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "# 日本語の見出し");
+        put_cursor_at(&mut app, 0, "# 日本語".len());
+
+        press_cmd(&mut app, "2");
+
+        assert_eq!(app.content.text(), "## 日本語の見出し", "日本語の行の見出しが置き換わっていない");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "## 日本語".len() });
+    }
+
+    /// **`#` の後ろに半角スペースが無い行・`#` が 7 つ以上の行は見出しではないこと。**
+    /// 接頭辞なしとして扱い、行頭へ新しい接頭辞を足す（消さない）。
+    #[test]
+    fn cmd_number_treats_hashes_without_a_space_as_text() {
+        let (_dir, mut app) = app_with_vault("heading-not-a-heading");
+        send(&mut app, Message::NoteSelected(0));
+
+        for (before, after) in [("#foo", "# #foo"), ("####### foo", "# ####### foo")] {
+            replace_content(&mut app, before);
+            put_cursor_at(&mut app, 0, before.len());
+
+            press_cmd(&mut app, "1");
+
+            assert_eq!(app.content.text(), after, "{before:?} を見出しとして扱った");
+        }
+    }
+
+    /// **カーソル行だけに効き、他の行は変わらないこと。**
+    #[test]
+    fn cmd_number_applies_to_the_cursor_line_only() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("heading-second-line");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "# 一行目\nfoo\n三行目");
+        put_cursor_at(&mut app, 1, "fo".len());
+
+        press_cmd(&mut app, "1");
+
+        assert_eq!(app.content.text(), "# 一行目\n# foo\n三行目", "カーソル行以外が変わった");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: "# fo".len() });
+    }
+
+    /// **連打は 1 回の `Cmd+Z` で戻り、カーソルも押した位置へ戻ること。**
+    ///
+    /// undo へは行頭へ動かす**前に**積む。後で積むと、戻したカーソルが行頭へ行く（issue 03 と同じ）。
+    #[test]
+    fn repeated_cmd_number_undoes_at_once_back_to_the_cursor() {
+        let (_dir, mut app) = app_with_vault("heading-undo");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo");
+        put_cursor_at(&mut app, 0, "fo".len());
+        let before = app.content.cursor();
+
+        press_cmd(&mut app, "1");
+        press_cmd(&mut app, "2");
+        assert_eq!(app.content.text(), "## foo", "前提: 見出しになっていない");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "foo", "連打の分がまとめて戻っていない");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
     }
 
     /// **フォーカスが無いエディタでは Control 系を効かせないこと。**
