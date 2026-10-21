@@ -1776,7 +1776,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         // `Shift+Tab`（issue 03）。**行頭のスペースを最大 2 つ消す。** 1 つしか無ければ 1 つだけ。
         // タブ文字は対象外（このアプリの `Tab` はタブ文字を入れない）。
         Message::Unindent => {
-            use iced::advanced::text::editor::{Action, Edit, Motion, Position};
+            use iced::advanced::text::editor::{Action, Cursor, Edit, Position};
 
             let Position { line, column } = app.content.cursor().position;
             let spaces = app.content.line(line).map_or(0, |l| {
@@ -1788,9 +1788,14 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             begin_edit_group(app, EditKind::Indent);
             move_to_line_start(app, line);
-            for _ in 0..spaces {
-                app.content.perform(Action::Select(Motion::Right));
-            }
+            // **選択はモーションで作らず、バイト位置で直接張る。** `Select(Right)` は画面の向きで、
+            // 右書き（RTL）の行では手前へ動く。列 0 からだと前の行末まで選び、改行が消えて行が繋がる
+            // （cosmic-text の `buffer.rs` の `Motion::Right`）。先頭のスペースは 1 バイトずつなので、
+            // `spaces` は必ず文字境界に当たる。
+            app.content.move_to(Cursor {
+                position: Position { line, column: spaces },
+                selection: Some(Position { line, column: 0 }),
+            });
             perform(app, Action::Edit(Edit::Delete));
             // カーソルが消したスペースの中にいたときは行頭で止める（引き算が桁あふれする）。
             put_cursor_at(app, line, column.saturating_sub(spaces));
@@ -5079,16 +5084,18 @@ mod tests {
     /// フォーカスが無いときは拾わない（パレット表示中に裏の本文がずれる）。
     #[test]
     fn tab_does_nothing_while_the_editor_is_unfocused() {
-        for (modifiers, text) in [
+        for (modifiers, control) in [
             (keyboard::Modifiers::empty(), "\t"),
             (keyboard::Modifiers::SHIFT, "\u{19}"),
         ] {
-            let mut kp = tab_press(modifiers, Some(text));
-            kp.status = text_editor::Status::Active;
-            assert!(
-                editor_key_binding(kp).is_none(),
-                "フォーカスの無いエディタが {modifiers:?}+Tab に反応している",
-            );
+            for text in [Some(control), None] {
+                let mut kp = tab_press(modifiers, text);
+                kp.status = text_editor::Status::Active;
+                assert!(
+                    editor_key_binding(kp).is_none(),
+                    "フォーカスの無いエディタが {modifiers:?}+Tab（text: {text:?}）に反応している",
+                );
+            }
         }
     }
 
@@ -5174,6 +5181,39 @@ mod tests {
         press_tab(&mut app, keyboard::Modifiers::SHIFT);
 
         assert_eq!(app.content.text(), "- item");
+    }
+
+    /// **日本語の行でもカーソルが文字に対して同じ位置へ戻ること。** 列はバイト位置なので、
+    /// 「項」の後ろ（バイト 7）は消した 2 つぶん手前のバイト 5 になる。
+    #[test]
+    fn shift_tab_keeps_the_cursor_after_the_same_character() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("shift-tab-japanese-cursor");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "  - 項目");
+        put_cursor_at(&mut app, 0, "  - 項".len());
+
+        press_tab(&mut app, keyboard::Modifiers::SHIFT);
+
+        assert_eq!(app.content.text(), "- 項目");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: 5 });
+    }
+
+    /// **右書き（RTL）の行でも行頭のスペースだけを消し、前の行と繋がらないこと。**
+    ///
+    /// cosmic-text の `Motion::Right` は画面の向きなので、RTL の行では手前（`Previous`）へ動く。
+    /// 列 0 から `Select(Right)` で選ぶと前の行末まで選び、改行が消えて行が繋がった（レビューで再現）。
+    #[test]
+    fn shift_tab_on_a_right_to_left_line_removes_only_the_leading_space() {
+        let (_dir, mut app) = app_with_vault("shift-tab-rtl");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "abc\n مرحبا");
+        put_cursor_at(&mut app, 1, " مرحبا".len());
+
+        press_tab(&mut app, keyboard::Modifiers::SHIFT);
+
+        assert_eq!(app.content.text(), "abc\nمرحبا", "行頭のスペース以外が消えた");
     }
 
     /// **カーソルがインデントの中にあっても落ちず、行頭に止まること。** 列を引き算で戻すので、
