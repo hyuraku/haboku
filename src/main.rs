@@ -2830,9 +2830,9 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
 /// iced 0.14.2 の既定は `Ctrl+A` を `Home` へ変換しておきながら、その後の分岐で
 /// **変換前のキーと `text`（macOS では制御文字が入る）を見てしまい `None` を返す**。
 ///
-/// `Ctrl+K`（行末まで切り取り）だけは `Binding` を組み合わせず**メッセージにして
-/// `update()` で処理する**（ADR-0016）。`Sequence` の中では `Select` の結果を
-/// `Cut` が見られないため（`Message::CutToLineEnd` の分岐に理由を書いた）。
+/// `Ctrl+K`（行末まで切り取り）と `Ctrl+O`（行を開く）は `Binding` を組み合わせず**メッセージにして
+/// `update()` で処理する**（ADR-0016）。理由はそれぞれ `Message::CutToLineEnd` /
+/// `Message::OpenLine` の分岐に書いた。
 /// `select` は `Ctrl+Shift+<key>` かどうか。移動系（a/e/b/f/n/p）だけが対応し、
 /// `d`（削除）・`k`（切り取り）・`o`（行を開く）は shift 版の意味を定義していないので `None` で
 /// 見送る（ADR-0023）。
@@ -7094,6 +7094,18 @@ mod tests {
 
         assert_eq!(app.content.text(), "a\n日本\n語\nb");
         assert_eq!(app.content.cursor().position, Position { line: 1, column: "日本".len() });
+    }
+
+    /// **RTL の行でもカーソルが改行の手前に残ること。** `Sequence[Enter, Move(Left)]` にしなかった
+    /// 理由の固定（`Motion::Left` は画面方向なので、RTL の行では改行の後ろ `(1, 1)` へ行く）。
+    #[test]
+    fn ctrl_o_keeps_the_cursor_on_an_rtl_line() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = ctrl_o_at("ctrl-o-rtl", "שלום עולם", 0, "שלום".len());
+
+        assert_eq!(app.content.text(), "שלום\n עולם");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "שלום".len() });
     }
 
     /// **リスト行でも `Ctrl+O` は記号を継がない素の改行**（`- foo|` → `- foo|\n`）。issue 05 の
