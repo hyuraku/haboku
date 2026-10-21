@@ -2666,6 +2666,22 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
         return Some(text_editor::Binding::Custom(Message::Wrap(marker)));
     }
 
+    // `Cmd+D` / `Cmd+L` で単語・行を選択する（issue 09）。既定は `text`（`"d"` / `"l"`）から `Insert` を
+    // 返し、それは下の ⌘ ガード（ADR-0010）で捨てられる。捨てたあとでは何を押したかが分からないので、
+    // **既定より先に**見る（issue 04 / 06 と同じ理由）。選択は widget が本文に当てるだけで本文を
+    // 変えない。修飾は完全一致で、`Shift+Cmd+D` などは拾わない。`Ctrl+D`（ADR-0016）とも衝突しない。
+    if focused && kp.modifiers == keyboard::Modifiers::COMMAND {
+        match key.as_ref() {
+            keyboard::Key::Character(c) if c.eq_ignore_ascii_case("d") => {
+                return Some(text_editor::Binding::SelectWord);
+            }
+            keyboard::Key::Character(c) if c.eq_ignore_ascii_case("l") => {
+                return Some(text_editor::Binding::SelectLine);
+            }
+            _ => {}
+        }
+    }
+
     match text_editor::Binding::from_key_press(kp) {
         Some(text_editor::Binding::Insert(_)) if command => None,
         Some(other) => Some(other),
@@ -6531,6 +6547,72 @@ mod tests {
 
         assert_eq!(app.content.text(), "foo bar baz", "1 回の Cmd+Z で戻っていない");
         assert_eq!(app.content.cursor(), before, "選択が囲む前へ戻っていない");
+    }
+
+    /// **`Cmd+D` は単語選択、`Cmd+L` は行選択になること。** 既定は `text` から `Insert('d')` を返し、
+    /// ⌘ 付きなので捨てられる（ADR-0010）。補わないと何も起きない（issue 09）。
+    #[test]
+    fn cmd_d_and_cmd_l_select_the_word_and_the_line() {
+        for c in ["d", "l"] {
+            for text in [Some(c), None] {
+                let binding = editor_key_binding(press(c, keyboard::Modifiers::COMMAND, text));
+                let selects = match c {
+                    "d" => matches!(binding, Some(text_editor::Binding::SelectWord)),
+                    _ => matches!(binding, Some(text_editor::Binding::SelectLine)),
+                };
+                assert!(selects, "Cmd+{c}（text: {text:?}）が選択にならない: {binding:?}");
+            }
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット・リネーム中に裏の本文の選択が動く）。
+    #[test]
+    fn cmd_d_and_cmd_l_do_nothing_while_the_editor_is_unfocused() {
+        for c in ["d", "l"] {
+            for text in [Some(c), None] {
+                let mut kp = press(c, keyboard::Modifiers::COMMAND, text);
+                kp.status = text_editor::Status::Active;
+                assert!(
+                    editor_key_binding(kp).is_none(),
+                    "フォーカスの無いエディタが Cmd+{c}（text: {text:?}）に反応している",
+                );
+            }
+        }
+    }
+
+    /// **`日本語のメ|モを書く` で `Cmd+D` → `メモ` が選ばれ、本文も dirty も変わらないこと。**
+    /// 選んだ範囲がそのまま `Cmd+C` でコピーされる（コピー自体は iced の既定）。列はバイト位置。
+    #[test]
+    fn cmd_d_selects_the_word_under_the_cursor() {
+        use iced::advanced::text::editor::Action;
+
+        let (_dir, mut app) = app_with_vault("select-word");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "見出し\n日本語のメモを書く\n末尾");
+        put_cursor_at(&mut app, 1, "日本語のメ".len());
+
+        send(&mut app, Message::Edit(Action::SelectWord));
+
+        assert_eq!(app.content.selection().as_deref(), Some("メモ"), "カーソル位置の単語が選ばれていない");
+        assert_eq!(app.content.text(), "見出し\n日本語のメモを書く\n末尾", "選択で本文が変わった");
+        assert!(!is_dirty(&app), "選んだだけで dirty が立った");
+    }
+
+    /// **`日本語の|メモを書く` で `Cmd+L` → その行だけが（改行を含まず）選ばれること。**
+    #[test]
+    fn cmd_l_selects_the_cursor_line() {
+        use iced::advanced::text::editor::Action;
+
+        let (_dir, mut app) = app_with_vault("select-line");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "見出し\n日本語のメモを書く\n末尾");
+        put_cursor_at(&mut app, 1, "日本語の".len());
+
+        send(&mut app, Message::Edit(Action::SelectLine));
+
+        assert_eq!(app.content.selection().as_deref(), Some("日本語のメモを書く"), "カーソル行が選ばれていない");
+        assert_eq!(app.content.text(), "見出し\n日本語のメモを書く\n末尾", "選択で本文が変わった");
+        assert!(!is_dirty(&app), "選んだだけで dirty が立った");
     }
 
     /// **フォーカスが無いエディタでは Control 系を効かせないこと。**
