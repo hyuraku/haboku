@@ -418,6 +418,11 @@ enum Message {
     /// **`Binding` では書けないのでメッセージにしてある。** 消す範囲は行の長さと選択から決まり、
     /// `KeyPress` からは読めない。
     DeleteLine,
+    /// `Enter`。Markdown のリスト行では次の行へ記号を継ぎ、記号だけの行ではリストを抜ける（issue 05）。
+    ///
+    /// **`Binding` では書けないのでメッセージにしてある。** 継ぐ記号はカーソル行の本文から読む必要があり、
+    /// `KeyPress` からは読めない。
+    NewlineInList,
     /// `Cmd+Z` / `Cmd+Shift+Z`（ADR-0017）。
     Undo,
     Redo,
@@ -1164,6 +1169,33 @@ fn put_cursor_at(app: &mut App, line: usize, column: usize) {
     });
 }
 
+/// Markdown のリスト行の接頭辞を読む（issue 05）。`(接頭辞のバイト長, 次の行に入れる接頭辞)` を返す。
+///
+/// 形は `空白*` + (`- ` | `* ` | `+ ` | `数字+. `) + (`[ ] ` | `[x] ` | `[X] `)?。番号は + 1、
+/// チェックボックスは常に未チェックで継ぐ。番号が `usize` に収まらなければリスト行とみなさない。
+fn list_prefix(line: &str) -> Option<(usize, String)> {
+    let rest = line.trim_start_matches([' ', '\t']);
+    let indent = &line[..line.len() - rest.len()];
+    let (marker_len, marker) = if ["- ", "* ", "+ "].iter().any(|m| rest.starts_with(m)) {
+        (2, rest[..2].to_string())
+    } else {
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits == 0 || !rest[digits..].starts_with(". ") {
+            return None;
+        }
+        let number: usize = rest[..digits].parse().ok()?;
+        (digits + 2, format!("{}. ", number.checked_add(1)?))
+    };
+    let checkbox = ["[ ] ", "[x] ", "[X] "]
+        .iter()
+        .any(|c| rest[marker_len..].starts_with(c));
+    let (checkbox_len, checkbox) = if checkbox { (4, "[ ] ") } else { (0, "") };
+    Some((
+        indent.len() + marker_len + checkbox_len,
+        format!("{indent}{marker}{checkbox}"),
+    ))
+}
+
 fn open_note(app: &mut App, index: usize) {
     // frontmatter 込みの全文をエディタへ渡す。`.md` が唯一の真実なので、
     // 表示のために本文を加工しない。
@@ -1847,6 +1879,45 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.content.move_to(Cursor { position: to, selection: Some(from) });
             perform(app, Action::Edit(Edit::Delete));
         }
+        // `Enter`（issue 05）。**リスト行では次の行へ記号（インデント込み）を継ぎ、記号だけの行では
+        // 記号を消してリストを抜ける。** 選択がある・リストでない・カーソルが記号の途中、のときは
+        // 今までどおりの素の改行（`Message::Edit` へ流す）。
+        //
+        // **継ぐ・抜けるは `Message::Edit` を通さない。** 改行と貼り付けを 2 回通すと `Enter` と
+        // `Paste` の 2 ステップに割れ、1 回の `Cmd+Z` で記号だけが消える。`EditKind::Enter` を先に
+        // 1 回積み、`perform` を直接呼ぶ（dirty は `perform` が共有する。ADR-0017）。
+        Message::NewlineInList => {
+            use iced::advanced::text::editor::{Action, Cursor, Edit, Position};
+
+            let enter = Message::Edit(Action::Edit(Edit::Enter));
+            if app.content.selection().is_some_and(|s| !s.is_empty()) {
+                return update(app, enter);
+            }
+            let Position { line, column } = app.content.cursor().position;
+            let parsed = app
+                .content
+                .line(line)
+                .and_then(|l| Some((l.text.len(), list_prefix(&l.text)?)));
+            let Some((len, (prefix_len, next))) = parsed.filter(|(_, (p, _))| column >= *p) else {
+                return update(app, enter);
+            };
+
+            begin_edit_group(app, EditKind::Enter);
+            if len == prefix_len {
+                // **選択はモーションで作らず、バイト位置で直接張る**（issue 03 / 04 と同じ型）。
+                // インデントごと消して空行にする（1 段戻すアウトデントは作らない）。
+                app.content.move_to(Cursor {
+                    position: Position { line, column: len },
+                    selection: Some(Position { line, column: 0 }),
+                });
+                perform(app, Action::Edit(Edit::Delete));
+            } else {
+                // `Edit::Enter` は改行 1 文字しか入れない（cosmic-text の `auto_indent` は iced から
+                // 有効にならない）ので、インデントも接頭辞に含めて貼る。
+                perform(app, Action::Edit(Edit::Enter));
+                perform(app, Action::Edit(Edit::Paste(std::sync::Arc::new(next))));
+            }
+        }
         Message::Tick(now) => {
             if app.saved_flash_until.is_some_and(|until| now >= until) {
                 app.saved_flash_until = None;
@@ -2396,6 +2467,17 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
         if kp.modifiers == keyboard::Modifiers::SHIFT {
             return Some(text_editor::Binding::Custom(Message::Unindent));
         }
+    }
+
+    // 修飾なしの `Enter` でリスト記号を継ぐ（issue 05）。既定は `text`（macOS では `"\r"`）に関係なく
+    // `Binding::Enter` を返す＝答えを出すので、後ろでは補えない。**既定より先に**見る（ADR-0016 の
+    // 例外）。修飾は空との完全一致で、`Shift+Enter`（素の改行の抜け道）・`Cmd+Enter`（issue 08）は
+    // 既定に任せる。
+    if focused
+        && kp.modifiers.is_empty()
+        && key == keyboard::Key::Named(keyboard::key::Named::Enter)
+    {
+        return Some(text_editor::Binding::Custom(Message::NewlineInList));
     }
 
     // `Cmd+↑/↓` で文書の先頭・末尾へ（`Shift` 付きで選択）。既定は `Cmd` を見ても
@@ -5480,6 +5562,236 @@ mod tests {
         send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
 
         assert_eq!(app.content.text(), "a\nbc\nd\ne", "連打の分がまとめて戻っていない");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
+    }
+
+    /// `Enter` の打鍵を組み立てる。macOS の実機は `Enter` に `"\r"` を載せる。
+    fn enter_press(modifiers: keyboard::Modifiers, text: Option<&str>) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key: named(keyboard::key::Named::Enter),
+            modified_key: named(keyboard::key::Named::Enter),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers,
+            text: text.map(Into::into),
+            status: text_editor::Status::Focused { is_hovered: false },
+        }
+    }
+
+    /// **修飾なしの `Enter` は `update()` へ回すこと。** 既定は `Binding::Enter`（素の改行）を返すので、
+    /// 既定より先に拾わないとリスト記号を継げない（issue 05）。
+    #[test]
+    fn enter_is_handled_by_the_update_loop() {
+        for text in [Some("\r"), None] {
+            let binding = editor_key_binding(enter_press(keyboard::Modifiers::empty(), text));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Custom(Message::NewlineInList))),
+                "Enter（text: {text:?}）がリスト継続にならない: {binding:?}",
+            );
+        }
+    }
+
+    /// **`Shift+Enter` は既定の素の改行のままであること**（リストを継がない抜け道）。
+    #[test]
+    fn shift_enter_stays_a_plain_newline() {
+        for text in [Some("\r"), None] {
+            let binding = editor_key_binding(enter_press(keyboard::Modifiers::SHIFT, text));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Enter)),
+                "Shift+Enter（text: {text:?}）が素の改行でない: {binding:?}",
+            );
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット表示中に裏の本文へ改行が入る）。
+    #[test]
+    fn enter_does_nothing_while_the_editor_is_unfocused() {
+        for text in [Some("\r"), None] {
+            let mut kp = enter_press(keyboard::Modifiers::empty(), text);
+            kp.status = text_editor::Status::Active;
+            assert!(
+                editor_key_binding(kp).is_none(),
+                "フォーカスの無いエディタが Enter（text: {text:?}）に反応している",
+            );
+        }
+    }
+
+    /// 打鍵から binding を経て `update()` まで、本番と同じ経路で `Enter` を押す。
+    fn press_enter(app: &mut App) {
+        let Some(text_editor::Binding::Custom(message)) =
+            editor_key_binding(enter_press(keyboard::Modifiers::empty(), Some("\r")))
+        else {
+            panic!("Enter が Custom メッセージにならない");
+        };
+        send(app, message);
+    }
+
+    /// `text` を本文にして、`line` 行目の `column` バイト目で `Enter` を押す。
+    fn enter_at(name: &str, text: &str, line: usize, column: usize) -> (TempDir, App) {
+        let (dir, mut app) = app_with_vault(name);
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, text);
+        put_cursor_at(&mut app, line, column);
+        press_enter(&mut app);
+        (dir, app)
+    }
+
+    /// 接頭辞の読み取り。記号・番号・チェックボックス・インデントと、リストではない行。
+    #[test]
+    fn list_prefix_reads_markdown_list_markers() {
+        for (line, expected) in [
+            ("- a", Some((2, "- "))),
+            ("* a", Some((2, "* "))),
+            ("+ a", Some((2, "+ "))),
+            ("9. a", Some((3, "10. "))),
+            ("- [ ] a", Some((6, "- [ ] "))),
+            ("- [x] a", Some((6, "- [ ] "))),
+            ("- [X] a", Some((6, "- [ ] "))),
+            ("  1. [ ] a", Some((9, "  2. [ ] "))),
+            ("- ", Some((2, "- "))),
+            ("-a", None),
+            ("1.a", None),
+            (". a", None),
+            ("本文", None),
+            ("", None),
+            ("99999999999999999999. a", None),
+        ] {
+            assert_eq!(
+                list_prefix(line),
+                expected.map(|(len, next)| (len, next.to_string())),
+                "{line:?} の接頭辞",
+            );
+        }
+    }
+
+    /// **`- foo|` で `Enter` → `- foo\n- |`。** 効果は本文とカーソルで見る（ADR-0016 の教訓）。
+    #[test]
+    fn enter_continues_a_bullet_list() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = enter_at("enter-bullet", "- foo", 0, "- foo".len());
+
+        assert_eq!(app.content.text(), "- foo\n- ", "記号が継がれていない");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 2 });
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+    }
+
+    /// **`1. foo|` で `Enter` → `1. foo\n2. |`**（直前の番号 + 1）。
+    #[test]
+    fn enter_increments_an_ordered_list_number() {
+        let (_dir, app) = enter_at("enter-ordered", "1. foo", 0, "1. foo".len());
+
+        assert_eq!(app.content.text(), "1. foo\n2. ");
+    }
+
+    /// **`- [ ] foo|` で `Enter` → `- [ ] foo\n- [ ] |`。**
+    #[test]
+    fn enter_continues_a_task_list() {
+        let (_dir, app) = enter_at("enter-task", "- [ ] foo", 0, "- [ ] foo".len());
+
+        assert_eq!(app.content.text(), "- [ ] foo\n- [ ] ");
+    }
+
+    /// **記号だけの行（`- |`）で `Enter` → 記号を消して空行にする**（リストを抜ける）。
+    #[test]
+    fn enter_on_a_bare_marker_leaves_the_list() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = enter_at("enter-leave", "- foo\n- ", 1, "- ".len());
+
+        assert_eq!(app.content.text(), "- foo\n", "記号が消えていない");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 0 });
+    }
+
+    /// **インデントを引き継ぐこと。** `Edit::Enter` は改行 1 文字しか入れないので自前で貼る。
+    #[test]
+    fn enter_carries_the_indent_over() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = enter_at("enter-indent", "  - foo", 0, "  - foo".len());
+
+        assert_eq!(app.content.text(), "  - foo\n  - ");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 4 });
+    }
+
+    /// **日本語の項目でも継ぐこと。** 列はバイト位置なので、行末は文字数ではなくバイト数。
+    #[test]
+    fn enter_continues_a_japanese_list_item() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = enter_at("enter-japanese", "- 項目", 0, "- 項目".len());
+
+        assert_eq!(app.content.text(), "- 項目\n- ");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 2 });
+    }
+
+    /// **行の途中で押すと、残りは新しい項目の本文になること**（`- foo|bar` → `- foo\n- |bar`）。
+    #[test]
+    fn enter_mid_item_moves_the_rest_into_the_new_item() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = enter_at("enter-mid-item", "- foobar", 0, "- foo".len());
+
+        assert_eq!(app.content.text(), "- foo\n- bar");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 2 });
+    }
+
+    /// **リストでない行では今までどおりの素の改行。**
+    #[test]
+    fn enter_on_a_plain_line_is_a_plain_newline() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = enter_at("enter-plain", "本文", 0, "本文".len());
+
+        assert_eq!(app.content.text(), "本文\n");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 0 });
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+    }
+
+    /// **カーソルが記号の途中にあるときは素の改行。** 記号を割って継ぐと `-\n- foo` のように壊れる。
+    #[test]
+    fn enter_inside_the_marker_is_a_plain_newline() {
+        let (_dir, app) = enter_at("enter-in-marker", "- foo", 0, 1);
+
+        assert_eq!(app.content.text(), "-\n foo");
+    }
+
+    /// **選択があるときは選択を改行に置き換えるだけ**（既定の挙動のまま）。
+    #[test]
+    fn enter_with_a_selection_replaces_it_with_a_plain_newline() {
+        use iced::advanced::text::editor::{Cursor, Position};
+
+        let (_dir, mut app) = app_with_vault("enter-selection");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "- foo bar");
+        app.content.move_to(Cursor {
+            position: Position { line: 0, column: "- foo".len() },
+            selection: Some(Position { line: 0, column: 2 }),
+        });
+
+        press_enter(&mut app);
+
+        assert_eq!(app.content.text(), "- \n bar");
+    }
+
+    /// **1 回の `Cmd+Z` で改行と記号がまとめて戻り、カーソルも押した位置へ戻ること。**
+    ///
+    /// `Message::Edit` を 2 回通すと `Enter` と `Paste` の 2 ステップに割れ、記号だけが消える。
+    #[test]
+    fn enter_in_a_list_undoes_the_newline_and_marker_at_once() {
+        let (_dir, mut app) = app_with_vault("enter-undo");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "- foo");
+        put_cursor_at(&mut app, 0, "- foo".len());
+        let before = app.content.cursor();
+
+        press_enter(&mut app);
+        assert_eq!(app.content.text(), "- foo\n- ", "前提: 記号が継がれていない");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "- foo", "改行と記号がまとめて戻っていない");
         assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
     }
 
