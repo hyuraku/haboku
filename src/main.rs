@@ -2240,6 +2240,8 @@ fn note_pane(app: &App) -> Element<'_, Message> {
 /// 決定ではなかった。iced 既定の矢印キーが shift で `Move` と `Select` を切り替えるのと
 /// 揃えて、`macos_control_binding` 側で同じ切り替えを行う。
 fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
+    use iced::advanced::text::editor::Motion;
+
     let command = kp.modifiers.command();
     // **フォーカスが無いときは補わない。** `key_binding` はフォーカスの有無に関わらず
     // 呼ばれる（`Status::Active` で来る）。パレット・リネーム欄を開いている間に
@@ -2258,6 +2260,24 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
         && key == keyboard::Key::Named(keyboard::key::Named::Backspace)
     {
         return Some(text_editor::Binding::Custom(Message::DeleteWordBackward));
+    }
+
+    // `Cmd+↑/↓` で文書の先頭・末尾へ（`Shift` 付きで選択）。既定は `Cmd` を見ても
+    // `←/→` しか `Home/End` に変えず、`↑/↓` には `Move(Up/Down)` を返すので、**既定より先に**
+    // 見る（issue 02。ADR-0016 の「既定が答えを出せなかったときだけ補う」の例外）。
+    // 修飾は完全一致で、`Cmd+Option+↑/↓` などは既定に任せる。
+    let document_edge = match key.as_ref() {
+        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Some(Motion::DocumentStart),
+        keyboard::Key::Named(keyboard::key::Named::ArrowDown) => Some(Motion::DocumentEnd),
+        _ => None,
+    };
+    if focused && let Some(motion) = document_edge {
+        if kp.modifiers == keyboard::Modifiers::COMMAND {
+            return Some(text_editor::Binding::Move(motion));
+        }
+        if kp.modifiers == keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT {
+            return Some(text_editor::Binding::Select(motion));
+        }
     }
 
     match text_editor::Binding::from_key_press(kp) {
@@ -4819,6 +4839,123 @@ mod tests {
 
         assert_eq!(app.content.text(), "foo");
         assert!(!is_dirty(&app), "文書先頭で dirty が立った");
+    }
+
+    /// 矢印キーの打鍵を組み立てる。macOS の実機は矢印に `text` を載せないので `None`。
+    fn arrow_press(
+        k: keyboard::key::Named,
+        modifiers: keyboard::Modifiers,
+    ) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key: named(k),
+            modified_key: named(k),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers,
+            text: None,
+            status: text_editor::Status::Focused { is_hovered: false },
+        }
+    }
+
+    /// **`Cmd+↑/↓` で文書の先頭・末尾へ移動すること。** 既定は `Move(Up/Down)` を返すので、
+    /// 補わないと 1 行しか動かない（issue 02）。
+    ///
+    /// `text` は実機の `None` に加えて、想定外の `Some("")` でも同じ答えになることを見る。
+    #[test]
+    fn cmd_up_down_moves_to_the_document_edges() {
+        use iced::advanced::text::editor::Motion;
+        use keyboard::key::Named;
+
+        for (k, motion) in [
+            (Named::ArrowUp, Motion::DocumentStart),
+            (Named::ArrowDown, Motion::DocumentEnd),
+        ] {
+            for text in [None, Some("")] {
+                let mut kp = arrow_press(k, keyboard::Modifiers::COMMAND);
+                kp.text = text.map(Into::into);
+                let binding = editor_key_binding(kp);
+                assert!(
+                    matches!(binding, Some(text_editor::Binding::Move(m)) if m == motion),
+                    "Cmd+{k:?}（text: {text:?}）が {motion:?} にならない: {binding:?}",
+                );
+            }
+        }
+    }
+
+    /// **`Shift+Cmd+↑/↓` で文書の先頭・末尾まで選択すること。**
+    #[test]
+    fn shift_cmd_up_down_selects_to_the_document_edges() {
+        use iced::advanced::text::editor::Motion;
+        use keyboard::key::Named;
+
+        for (k, motion) in [
+            (Named::ArrowUp, Motion::DocumentStart),
+            (Named::ArrowDown, Motion::DocumentEnd),
+        ] {
+            let binding = editor_key_binding(arrow_press(
+                k,
+                keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+            ));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Select(m)) if m == motion),
+                "Shift+Cmd+{k:?} が {motion:?} の選択にならない: {binding:?}",
+            );
+        }
+    }
+
+    /// `Cmd+←/→` の行頭・行末は変わらないこと（既定が `Home/End` を返している）。
+    #[test]
+    fn cmd_left_right_still_move_to_the_line_edges() {
+        use iced::advanced::text::editor::Motion;
+        use keyboard::key::Named;
+
+        for (k, motion) in [
+            (Named::ArrowLeft, Motion::Home),
+            (Named::ArrowRight, Motion::End),
+        ] {
+            let binding = editor_key_binding(arrow_press(k, keyboard::Modifiers::COMMAND));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Move(m)) if m == motion),
+                "Cmd+{k:?} が {motion:?} にならない: {binding:?}",
+            );
+        }
+    }
+
+    /// **修飾キーは完全一致で見ること。** `Cmd+Option+↑/↓` は拾わず、既定（`Move(Up/Down)`）に任せる。
+    #[test]
+    fn cmd_option_up_down_is_left_to_the_default() {
+        use iced::advanced::text::editor::Motion;
+        use keyboard::key::Named;
+
+        for (k, motion) in [
+            (Named::ArrowUp, Motion::Up),
+            (Named::ArrowDown, Motion::Down),
+        ] {
+            let binding = editor_key_binding(arrow_press(
+                k,
+                keyboard::Modifiers::COMMAND | keyboard::Modifiers::ALT,
+            ));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Move(m)) if m == motion),
+                "Cmd+Option+{k:?} を既定以外で拾っている: {binding:?}",
+            );
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット表示中に裏の本文のカーソルが飛ぶ）。
+    #[test]
+    fn cmd_up_down_does_nothing_while_the_editor_is_unfocused() {
+        use keyboard::key::Named;
+
+        for k in [Named::ArrowUp, Named::ArrowDown] {
+            let mut kp = arrow_press(k, keyboard::Modifiers::COMMAND);
+            kp.status = text_editor::Status::Active;
+            assert!(
+                editor_key_binding(kp).is_none(),
+                "フォーカスの無いエディタが Cmd+{k:?} に反応している"
+            );
+        }
     }
 
     /// **フォーカスが無いエディタでは Control 系を効かせないこと。**
