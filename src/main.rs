@@ -406,6 +406,13 @@ enum Message {
     ///
     /// **`Binding::Sequence` では書けないのでメッセージにしてある。** 理由は `update()` 側。
     DeleteWordBackward,
+    /// `Tab` / `Shift+Tab`。カーソル行の行頭へ半角スペース 2 つを足す・行頭のスペースを
+    /// 最大 2 つ消す（issue 03）。
+    ///
+    /// **`Binding` では書けないのでメッセージにしてある。** `Shift+Tab` で消すスペースの数は
+    /// 本文から数える必要があり、`KeyPress` からは読めない。カーソルを元の位置へ戻すのも同じ。
+    Indent,
+    Unindent,
     /// `Cmd+Z` / `Cmd+Shift+Z`（ADR-0017）。
     Undo,
     Redo,
@@ -1019,7 +1026,8 @@ enum EditKind {
     DeleteWord,
     /// 貼り付けは 1 回で 1 ステップ。連続しても混ぜない意味はないのでまとめる。
     Paste,
-    /// インデント操作（このアプリからは出ないが、`Edit` の網羅性のために持つ）。
+    /// `Tab` / `Shift+Tab`（issue 03）。連打は 1 回の `Cmd+Z` でまとめて戻る。
+    /// `Edit::Indent` / `Edit::Unindent`（このアプリからは出ない）もここへ分類する。
     Indent,
 }
 
@@ -1123,6 +1131,30 @@ fn begin_edit_group(app: &mut App, kind: EditKind) {
     if app.undo.len() > UNDO_LIMIT {
         app.undo.remove(0);
     }
+}
+
+/// カーソルを `line` 行目（論理行）の先頭へ置き、選択を解く。`Tab` / `Shift+Tab` 用（issue 03）。
+///
+/// **`Move(Home)` だけでは足りない。** cosmic-text の `Home` は**折り返した見た目の行**の先頭へ
+/// 行く（`buffer.rs` の `Motion::Home` は layout 行の glyph 0）。本文は折り返す
+/// （`Wrapping::WordOrGlyph`）ので、長い行の 2 段目にカーソルがあると行の途中に字下げが入り、
+/// `Shift+Tab` は行頭ではない文字を消す。`Move(Home)` は選択を解くためだけに当て、
+/// 位置は `move_to` で論理行の先頭へ合わせる（`move_to` は選択を解かない）。
+fn move_to_line_start(app: &mut App, line: usize) {
+    use iced::advanced::text::editor::{Action, Motion};
+
+    app.content.perform(Action::Move(Motion::Home));
+    put_cursor_at(app, line, 0);
+}
+
+/// カーソルを `line` 行目の `column` バイト目へ置く（選択なし）。
+fn put_cursor_at(app: &mut App, line: usize, column: usize) {
+    use iced::advanced::text::editor::{Cursor, Position};
+
+    app.content.move_to(Cursor {
+        position: Position { line, column },
+        selection: None,
+    });
 }
 
 fn open_note(app: &mut App, index: usize) {
@@ -1723,6 +1755,46 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             perform(app, Action::Edit(Edit::Backspace));
         }
+        // `Tab`（issue 03）。**カーソル行の行頭へ半角スペース 2 つを入れ、カーソルは文字に対して
+        // 同じ位置へ戻す。** 選択があっても範囲の全行には効かせない（行頭へ動かすので選択は解ける）。
+        //
+        // cosmic-text の `Edit::Indent` は使わない。8 スペース入り、CommonMark では 4 桁以上の
+        // 字下げがコードブロックになるので Markdown のリストに合わない。
+        //
+        // **`Message::Edit` を通さない**（issue 01 と同じ型）。undo へは**行頭へ動かす前に**積む。
+        // 後で積むと、戻したときにカーソルが行頭へ行く。連打は `EditKind::Indent` で 1 つにまとまる。
+        Message::Indent => {
+            use iced::advanced::text::editor::{Action, Edit, Position};
+
+            let Position { line, column } = app.content.cursor().position;
+            begin_edit_group(app, EditKind::Indent);
+            move_to_line_start(app, line);
+            perform(app, Action::Edit(Edit::Paste(std::sync::Arc::new("  ".to_string()))));
+            // 列はバイト位置。スペースは 1 バイトなので足し算で合う。
+            put_cursor_at(app, line, column + 2);
+        }
+        // `Shift+Tab`（issue 03）。**行頭のスペースを最大 2 つ消す。** 1 つしか無ければ 1 つだけ。
+        // タブ文字は対象外（このアプリの `Tab` はタブ文字を入れない）。
+        Message::Unindent => {
+            use iced::advanced::text::editor::{Action, Edit, Motion, Position};
+
+            let Position { line, column } = app.content.cursor().position;
+            let spaces = app.content.line(line).map_or(0, |l| {
+                l.text.chars().take(2).take_while(|&c| c == ' ').count()
+            });
+            // 消すものが無い。**ここで返すので dirty も立たず、undo も積まない**（`Ctrl+K` の行末と同じ約束）。
+            if spaces == 0 {
+                return Task::none();
+            }
+            begin_edit_group(app, EditKind::Indent);
+            move_to_line_start(app, line);
+            for _ in 0..spaces {
+                app.content.perform(Action::Select(Motion::Right));
+            }
+            perform(app, Action::Edit(Edit::Delete));
+            // カーソルが消したスペースの中にいたときは行頭で止める（引き算が桁あふれする）。
+            put_cursor_at(app, line, column.saturating_sub(spaces));
+        }
         Message::Tick(now) => {
             if app.saved_flash_until.is_some_and(|until| now >= until) {
                 app.saved_flash_until = None;
@@ -2260,6 +2332,18 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
         && key == keyboard::Key::Named(keyboard::key::Named::Backspace)
     {
         return Some(text_editor::Binding::Custom(Message::DeleteWordBackward));
+    }
+
+    // `Tab` / `Shift+Tab` でインデント・アウトデント（issue 03）。既定は `text`（macOS では
+    // `"\t"` / `"\u{19}"`）が制御文字なので `None` を返し、後ろで補っても届く。それでも**既定より
+    // 先に**見るのは、答えを `text` に依存させないため。修飾は完全一致で、`Ctrl+Tab` などは拾わない。
+    if focused && key == keyboard::Key::Named(keyboard::key::Named::Tab) {
+        if kp.modifiers.is_empty() {
+            return Some(text_editor::Binding::Custom(Message::Indent));
+        }
+        if kp.modifiers == keyboard::Modifiers::SHIFT {
+            return Some(text_editor::Binding::Custom(Message::Unindent));
+        }
     }
 
     // `Cmd+↑/↓` で文書の先頭・末尾へ（`Shift` 付きで選択）。既定は `Cmd` を見ても
@@ -4956,6 +5040,178 @@ mod tests {
                 "フォーカスの無いエディタが Cmd+{k:?} に反応している"
             );
         }
+    }
+
+    /// `Tab` の打鍵を組み立てる。macOS の実機は `Tab` に `"\t"`、`Shift+Tab` に `"\u{19}"` を載せる。
+    fn tab_press(modifiers: keyboard::Modifiers, text: Option<&str>) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key: named(keyboard::key::Named::Tab),
+            modified_key: named(keyboard::key::Named::Tab),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers,
+            text: text.map(Into::into),
+            status: text_editor::Status::Focused { is_hovered: false },
+        }
+    }
+
+    /// **`Tab` / `Shift+Tab` は `update()` へ回すこと。** 既定は制御文字の `text` を捨てて
+    /// `None` を返すので、補わないと何も起きない（issue 03）。
+    #[test]
+    fn tab_and_shift_tab_are_handled_by_the_update_loop() {
+        for text in [Some("\t"), None] {
+            let binding = editor_key_binding(tab_press(keyboard::Modifiers::empty(), text));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Custom(Message::Indent))),
+                "Tab（text: {text:?}）がインデントにならない: {binding:?}",
+            );
+        }
+        for text in [Some("\u{19}"), None] {
+            let binding = editor_key_binding(tab_press(keyboard::Modifiers::SHIFT, text));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Custom(Message::Unindent))),
+                "Shift+Tab（text: {text:?}）がアウトデントにならない: {binding:?}",
+            );
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット表示中に裏の本文がずれる）。
+    #[test]
+    fn tab_does_nothing_while_the_editor_is_unfocused() {
+        for (modifiers, text) in [
+            (keyboard::Modifiers::empty(), "\t"),
+            (keyboard::Modifiers::SHIFT, "\u{19}"),
+        ] {
+            let mut kp = tab_press(modifiers, Some(text));
+            kp.status = text_editor::Status::Active;
+            assert!(
+                editor_key_binding(kp).is_none(),
+                "フォーカスの無いエディタが {modifiers:?}+Tab に反応している",
+            );
+        }
+    }
+
+    /// 打鍵から binding を経て `update()` まで、本番と同じ経路で `Tab` / `Shift+Tab` を押す。
+    fn press_tab(app: &mut App, modifiers: keyboard::Modifiers) {
+        let Some(text_editor::Binding::Custom(message)) =
+            editor_key_binding(tab_press(modifiers, None))
+        else {
+            panic!("{modifiers:?}+Tab が Custom メッセージにならない");
+        };
+        send(app, message);
+    }
+
+    /// **`- item|` で `Tab` → `  - item|`、`Shift+Tab` で戻ること。** カーソル行だけに効き、
+    /// カーソルは文字に対して同じ位置に残る。効果は本文とカーソルで見る（ADR-0016 の教訓）。
+    #[test]
+    fn tab_indents_the_line_and_shift_tab_unindents_it() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("tab-indent");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "見出し\n- item");
+        put_cursor_at(&mut app, 1, "- item".len());
+
+        press_tab(&mut app, keyboard::Modifiers::empty());
+
+        assert_eq!(app.content.text(), "見出し\n  - item", "行頭にインデントが入っていない");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 8 });
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+
+        press_tab(&mut app, keyboard::Modifiers::SHIFT);
+
+        assert_eq!(app.content.text(), "見出し\n- item", "インデントが戻っていない");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 6 });
+    }
+
+    /// **カーソルが行の途中にあっても行頭に入ること**（行頭固定）。列はバイト位置なので、
+    /// 日本語の途中でも 2 バイトずれた位置へ戻る。
+    #[test]
+    fn tab_indents_at_the_line_start_wherever_the_cursor_is() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("tab-indent-mid-line");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "- 項目");
+        put_cursor_at(&mut app, 0, "- 項".len());
+
+        press_tab(&mut app, keyboard::Modifiers::empty());
+
+        assert_eq!(app.content.text(), "  - 項目");
+        assert_eq!(
+            app.content.cursor().position,
+            Position { line: 0, column: "  - 項".len() },
+            "カーソルが元の文字の後ろへ戻っていない",
+        );
+    }
+
+    /// **戻すものが無い行の `Shift+Tab` は本文を変えず、dirty も立てず、undo も積まないこと。**
+    /// dirty が立つと無編集で自動保存が走って mtime が動く（`Ctrl+K` の行末と同じ約束）。
+    #[test]
+    fn shift_tab_does_nothing_without_leading_spaces() {
+        let (_dir, mut app) = app_with_vault("shift-tab-nothing");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "- item");
+        put_cursor_at(&mut app, 0, "- item".len());
+        app.dirty_since = None;
+
+        press_tab(&mut app, keyboard::Modifiers::SHIFT);
+
+        assert_eq!(app.content.text(), "- item");
+        assert!(!is_dirty(&app), "戻すものが無いのに dirty が立った");
+        assert!(app.undo.is_empty(), "戻すものが無いのに undo が積まれた");
+    }
+
+    /// 行頭のスペースが 1 つしか無ければ 1 つだけ消すこと。
+    #[test]
+    fn shift_tab_removes_a_single_leading_space() {
+        let (_dir, mut app) = app_with_vault("shift-tab-single-space");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, " - item");
+        put_cursor_at(&mut app, 0, " - item".len());
+
+        press_tab(&mut app, keyboard::Modifiers::SHIFT);
+
+        assert_eq!(app.content.text(), "- item");
+    }
+
+    /// **カーソルがインデントの中にあっても落ちず、行頭に止まること。** 列を引き算で戻すので、
+    /// 消した数より手前にいると桁あふれする。
+    #[test]
+    fn shift_tab_with_the_cursor_inside_the_indent_stops_at_the_line_start() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("shift-tab-cursor-in-indent");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "  - item");
+        put_cursor_at(&mut app, 0, 1);
+
+        press_tab(&mut app, keyboard::Modifiers::SHIFT);
+
+        assert_eq!(app.content.text(), "- item");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: 0 });
+    }
+
+    /// **`Tab` の連打は 1 回の `Cmd+Z` で戻り、カーソルも押した位置へ戻ること。**
+    ///
+    /// undo へは行頭へ動かす**前に**積む。後で積むと、戻したカーソルが行頭へ行く（issue 01 と同じ）。
+    #[test]
+    fn repeated_tab_undoes_at_once_back_to_the_cursor() {
+        let (_dir, mut app) = app_with_vault("tab-undo");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "- item");
+        put_cursor_at(&mut app, 0, "- it".len());
+        let before = app.content.cursor();
+
+        press_tab(&mut app, keyboard::Modifiers::empty());
+        press_tab(&mut app, keyboard::Modifiers::empty());
+        assert_eq!(app.content.text(), "    - item", "前提: 2 段入っていない");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "- item", "連打の分がまとめて戻っていない");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
     }
 
     /// **フォーカスが無いエディタでは Control 系を効かせないこと。**
