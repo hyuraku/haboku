@@ -2173,6 +2173,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let (Some(b), Some(a)) = (before.next(), before.next()) else {
                 return Task::none();
             };
+            // 同じ 2 文字（`aa|`）は入れ替えても本文が変わらないので、dirty も undo も触らずに返す。
+            if a == b {
+                return Task::none();
+            }
             let start = end - a.len_utf8() - b.len_utf8();
             begin_edit_group(app, EditKind::Transpose);
             // **選択はモーションで作らず、バイト位置で直接張る**（issue 03 の RTL の罠）。
@@ -7330,8 +7334,8 @@ mod tests {
     }
 
     /// **入れ替える 2 文字が無い位置では本文を変えず、dirty も立てず、undo も積まないこと。** 行頭
-    /// （前の行の改行とは入れ替えない）・空行・1 文字の行。dirty が立つと無編集で自動保存が走って
-    /// mtime が動く（`Ctrl+K` の行末と同じ約束）。
+    /// （前の行の改行とは入れ替えない）・空行・1 文字の行・同じ 2 文字が並ぶ行末（入れ替えても本文が
+    /// 変わらない）。dirty が立つと無編集で自動保存が走って mtime が動く（`Ctrl+K` の行末と同じ約束）。
     #[test]
     fn ctrl_t_does_nothing_without_two_characters() {
         use iced::advanced::text::editor::Position;
@@ -7342,6 +7346,8 @@ mod tests {
             ("", 0, 0),
             ("a", 0, "a".len()),
             ("あ", 0, "あ".len()),
+            ("aa", 0, "aa".len()),
+            ("ああ", 0, "ああ".len()),
         ] {
             let (_dir, app) = ctrl_t_at("ctrl-t-nothing", text, line, column);
 
