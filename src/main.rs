@@ -406,6 +406,10 @@ enum Message {
     ///
     /// **`Binding::Sequence` では書けないのでメッセージにしてある。** 理由は `update()` 側。
     DeleteWordBackward,
+    /// `Option+Delete`（`Option+fn+⌫`）。後ろの単語を消す。選択があれば選択だけを消す（issue 07）。
+    ///
+    /// **`Binding::Sequence` では書けないのでメッセージにしてある。** 理由は `update()` 側。
+    DeleteWordForward,
     /// `Tab` / `Shift+Tab`。カーソル行の行頭へ半角スペース 2 つを足す・行頭のスペースを
     /// 最大 2 つ消す（issue 03）。
     ///
@@ -1040,6 +1044,9 @@ enum EditKind {
     /// `Option+⌫`（issue 01）。`Backspace` と分け、押したキーの単位で戻せるようにする。
     /// 日本語は 1 文字ずつ消えるので、連打はまとめる。
     DeleteWord,
+    /// `Option+Delete`（issue 07）。`DeleteWord` と分ける（素の `⌫` と `Delete` が別なのと同じ）。
+    /// 連打はまとめる。
+    DeleteWordForward,
     /// 貼り付けは 1 回で 1 ステップ。連続しても混ぜない意味はないのでまとめる。
     Paste,
     /// `Tab` / `Shift+Tab`（issue 03）。連打は 1 回の `Cmd+Z` でまとめて戻る。
@@ -1800,6 +1807,28 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             perform(app, Action::Edit(Edit::Backspace));
         }
+        // `Option+Delete`（issue 07）。`Option+⌫` の鏡像で、**選択があれば選択だけを消し、
+        // 無ければ後ろの単語まで選んで消す。** `Sequence[Select(WordRight), Delete]` にしない理由も、
+        // undo へ**単語を選ぶ前に**積む理由も `DeleteWordBackward` と同じ。
+        Message::DeleteWordForward => {
+            use iced::advanced::text::editor::{Action, Edit, Motion, Position};
+
+            let has_selection = app.content.selection().is_some_and(|s| !s.is_empty());
+            let last = app.content.line_count().saturating_sub(1);
+            let end = Position {
+                line: last,
+                column: app.content.line(last).map_or(0, |l| l.text.len()),
+            };
+            // 文書末尾では消すものが無い。**ここで返すので dirty も立たず、undo も積まない。**
+            if !has_selection && app.content.cursor().position == end {
+                return Task::none();
+            }
+            begin_edit_group(app, EditKind::DeleteWordForward);
+            if !has_selection {
+                app.content.perform(Action::Select(Motion::WordRight));
+            }
+            perform(app, Action::Edit(Edit::Delete));
+        }
         // `Tab`（issue 03）。**カーソル行の行頭へ半角スペース 2 つを入れ、カーソルは文字に対して
         // 同じ位置へ戻す。** 選択があっても範囲の全行には効かせない（行頭へ動かすので選択は解ける）。
         //
@@ -2510,6 +2539,15 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
         && key == keyboard::Key::Named(keyboard::key::Named::Backspace)
     {
         return Some(text_editor::Binding::Custom(Message::DeleteWordBackward));
+    }
+
+    // `Option+Delete`（`Option+fn+⌫`）。既定は修飾を見ずに `Delete` を返すので、**既定より先に**見る
+    // （issue 07。`Option+⌫` と同じ理由）。
+    if focused
+        && kp.modifiers == keyboard::Modifiers::ALT
+        && key == keyboard::Key::Named(keyboard::key::Named::Delete)
+    {
+        return Some(text_editor::Binding::Custom(Message::DeleteWordForward));
     }
 
     // `Tab` / `Shift+Tab` でインデント・アウトデント（issue 03）。既定は `text`（macOS では
@@ -5141,6 +5179,195 @@ mod tests {
 
         assert_eq!(app.content.text(), "foo");
         assert!(!is_dirty(&app), "文書先頭で dirty が立った");
+    }
+
+    /// `Option+Delete`（`Option+fn+⌫`）の打鍵を組み立てる。macOS の実機は `text` に DEL
+    /// （`"\u{7f}"`）を載せる見込み（issue 07）。
+    fn option_delete(text: Option<&str>) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key: named(keyboard::key::Named::Delete),
+            modified_key: named(keyboard::key::Named::Delete),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers: keyboard::Modifiers::ALT,
+            text: text.map(Into::into),
+            status: text_editor::Status::Focused { is_hovered: false },
+        }
+    }
+
+    /// **`Option+Delete` は `update()` へ回すこと。** 既定は修飾を見ずに `Delete` を返すので、
+    /// 補わないと 1 文字しか消えない（issue 07）。
+    #[test]
+    fn option_delete_is_handled_by_the_update_loop() {
+        for text in [Some("\u{7f}"), None] {
+            let binding = editor_key_binding(option_delete(text));
+            assert!(
+                matches!(
+                    binding,
+                    Some(text_editor::Binding::Custom(Message::DeleteWordForward))
+                ),
+                "Option+Delete（text: {text:?}）が単語削除にならない: {binding:?}",
+            );
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（見ていない本文から単語が消える）。
+    #[test]
+    fn option_delete_does_nothing_while_the_editor_is_unfocused() {
+        let mut kp = option_delete(Some("\u{7f}"));
+        kp.status = text_editor::Status::Active;
+        assert!(editor_key_binding(kp).is_none());
+    }
+
+    /// **カーソルの後ろの単語が消えること。** 効果は本文の文字列で見る（Ctrl+K の教訓）。
+    #[test]
+    fn option_delete_deletes_the_next_word() {
+        let (_dir, mut app) = app_with_vault("option-delete-word");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo bar");
+
+        send(&mut app, Message::DeleteWordForward);
+
+        assert_eq!(app.content.text(), " bar", "後ろの単語が消えていない");
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+    }
+
+    /// 行末で押すと次の行と繋がる（改行 1 文字を消す）。
+    #[test]
+    fn option_delete_at_a_line_end_joins_the_next_line() {
+        let (_dir, mut app) = app_with_vault("option-delete-line-end");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "一行目\n二行目");
+        put_cursor_at(&mut app, 0, "一行目".len());
+
+        send(&mut app, Message::DeleteWordForward);
+
+        assert_eq!(app.content.text(), "一行目二行目");
+    }
+
+    /// **選択があれば選択だけを消すこと**（Cocoa と同じ）。後ろの単語まで巻き込まない。
+    #[test]
+    fn option_delete_deletes_only_the_selection() {
+        use iced::advanced::text::editor::{Action, Motion};
+
+        let (_dir, mut app) = app_with_vault("option-delete-selection");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "今日は 晴れ です");
+        for _ in 0..4 {
+            app.content.perform(Action::Move(Motion::Right));
+        }
+        for _ in 0..2 {
+            app.content.perform(Action::Select(Motion::Right));
+        }
+        assert_eq!(app.content.selection().as_deref(), Some("晴れ"), "前提: 選択がずれている");
+
+        send(&mut app, Message::DeleteWordForward);
+
+        assert_eq!(app.content.text(), "今日は  です", "選択より多く消えた");
+    }
+
+    /// 日本語は 1 文字ずつ消える（`unicode_word_indices` が漢字・ひらがなを 1 文字ずつ単語にする）。
+    /// issue 01 の実機確認と同じ性質。辞書で区切る Cocoa とは違う可能性がある。
+    #[test]
+    fn option_delete_deletes_one_japanese_character() {
+        let (_dir, mut app) = app_with_vault("option-delete-japanese");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "日本語の文章");
+
+        send(&mut app, Message::DeleteWordForward);
+
+        assert_eq!(app.content.text(), "本語の文章");
+    }
+
+    /// 打鍵から binding を経て `update()` まで、本番と同じ経路で `Option+Delete` を押す。
+    fn press_option_delete(app: &mut App) {
+        let Some(text_editor::Binding::Custom(message)) =
+            editor_key_binding(option_delete(Some("\u{7f}")))
+        else {
+            panic!("Option+Delete が Custom メッセージにならない");
+        };
+        send(app, message);
+    }
+
+    /// **直前の `Delete` とは別の undo ステップになり、戻したらカーソルも押した位置へ戻ること。**
+    /// 単語の選択を undo へ積んだ後に行うと、戻したときにカーソルが単語の後ろへ行く（issue 01 と同じ）。
+    #[test]
+    fn option_delete_is_its_own_undo_step() {
+        use iced::advanced::text::editor::{Action, Edit};
+
+        let (_dir, mut app) = app_with_vault("option-delete-undo");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "Xfoo bar");
+
+        send(&mut app, Message::Edit(Action::Edit(Edit::Delete)));
+        let before = app.content.cursor();
+        press_option_delete(&mut app);
+        assert_eq!(app.content.text(), " bar");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "foo bar", "Delete の分まで一緒に戻った");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
+    }
+
+    /// **直前の `Option+⌫` とも別の undo ステップになること。** 前後の単語削除は別のまとまり
+    /// （素の `⌫` と `Delete` が別なのと同じ）。
+    #[test]
+    fn option_delete_is_separate_from_option_backspace_in_undo() {
+        let (_dir, mut app) = app_with_vault("option-delete-undo-backward");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo bar baz");
+        put_cursor_at(&mut app, 0, "foo bar".len());
+
+        press_option_backspace(&mut app);
+        assert_eq!(app.content.text(), "foo  baz", "前提: Option+⌫ の結果がずれている");
+        press_option_delete(&mut app);
+        assert_eq!(app.content.text(), "foo ");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "foo  baz", "Option+⌫ の分まで一緒に戻った");
+    }
+
+    /// **`Option+Delete` の連打は 1 回の `Cmd+Z` で戻り、カーソルも押した位置へ戻ること。**
+    /// 日本語は 1 文字ずつ消えるので、押した回数だけ戻させると使えない。
+    #[test]
+    fn repeated_option_delete_undoes_at_once() {
+        let (_dir, mut app) = app_with_vault("option-delete-undo-run");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "日本語の文章");
+        put_cursor_at(&mut app, 0, "日本".len());
+        let before = app.content.cursor();
+
+        for _ in 0..3 {
+            press_option_delete(&mut app);
+        }
+        assert_eq!(app.content.text(), "日本章", "前提: 連打の結果がずれている");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "日本語の文章", "連打の分がまとめて戻っていない");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
+    }
+
+    /// **文書末尾では本文も dirty も undo も変えないこと。** 立てると無編集なのに「編集中」になり、
+    /// 空の undo ステップが 1 つ積まれる。
+    #[test]
+    fn option_delete_does_nothing_at_the_end_of_the_document() {
+        use iced::advanced::text::editor::{Action, Motion};
+
+        let (_dir, mut app) = app_with_vault("option-delete-doc-end");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo\nbar");
+        app.content.perform(Action::Move(Motion::DocumentEnd));
+        app.dirty_since = None;
+
+        send(&mut app, Message::DeleteWordForward);
+
+        assert_eq!(app.content.text(), "foo\nbar");
+        assert!(!is_dirty(&app), "文書末尾で dirty が立った");
+        assert!(app.undo.is_empty(), "文書末尾で undo が積まれた");
     }
 
     /// 矢印キーの打鍵を組み立てる。macOS の実機は矢印に `text` を載せないので `None`。
