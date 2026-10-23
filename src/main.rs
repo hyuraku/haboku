@@ -391,6 +391,13 @@ enum PendingAction {
     Close(iced::window::Id),
 }
 
+/// 上下の向き。`Option+↑/↓` の行移動（issue 10）と `Shift+Option+↑/↓` の行複製（issue 16）が使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Vertical {
+    Up,
+    Down,
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     /// フォルダを選ぶ。`None` は全件表示に戻す。
@@ -406,6 +413,76 @@ enum Message {
     ///
     /// **`Binding::Sequence` では書けないのでメッセージにしてある。** 理由は `update()` 側。
     DeleteWordBackward,
+    /// `Option+Delete`（`Option+fn+⌫`）。後ろの単語を消す。選択があれば選択だけを消す（issue 07）。
+    ///
+    /// **`Binding::Sequence` では書けないのでメッセージにしてある。** 理由は `update()` 側。
+    DeleteWordForward,
+    /// `Tab` / `Shift+Tab`。カーソル行の行頭へ半角スペース 2 つを足す・行頭のスペースを
+    /// 最大 2 つ消す（issue 03）。
+    ///
+    /// **`Binding` では書けないのでメッセージにしてある。** `Shift+Tab` で消すスペースの数は
+    /// 本文から数える必要があり、`KeyPress` からは読めない。カーソルを元の位置へ戻すのも同じ。
+    Indent,
+    Unindent,
+    /// `Shift+Cmd+K`。カーソル行を改行ごと消す。選択があれば選択範囲を含む行を全部（issue 04）。
+    ///
+    /// **`Binding` では書けないのでメッセージにしてある。** 消す範囲は行の長さと選択から決まり、
+    /// `KeyPress` からは読めない。
+    DeleteLine,
+    /// `Enter`。Markdown のリスト行では次の行へ記号を継ぎ、記号だけの行ではリストを抜ける（issue 05）。
+    ///
+    /// **`Binding` では書けないのでメッセージにしてある。** 継ぐ記号はカーソル行の本文から読む必要があり、
+    /// `KeyPress` からは読めない。
+    NewlineInList,
+    /// `Cmd+Enter` / `Shift+Cmd+Enter`。行を割らずに下・上へ空行を作り、そこへ移る（issue 08）。
+    ///
+    /// **`Binding::Sequence` では書けないのでメッセージにしてある。** 行の端へは `Move(Home)` /
+    /// `Move(End)` では行けず（折り返した見た目の行の端へ行く。issue 03）、論理行の長さは
+    /// `KeyPress` からは読めない。
+    InsertLineBelow,
+    InsertLineAbove,
+    /// `Ctrl+O`。カーソル位置に改行を入れ、カーソルは改行の手前に残す。選択があれば選択を改行に
+    /// 置き換える（issue 17）。
+    ///
+    /// **`Binding::Sequence` では書けないのでメッセージにしてある。** `Sequence[Enter, Move(Left)]` の
+    /// `Motion::Left` は画面方向で、RTL 行では逆へ動く。
+    OpenLine,
+    /// `Ctrl+T`。カーソル前後の 2 文字を入れ替えて 1 つ進む。行末では手前の 2 文字を入れ替える
+    /// （issue 19）。
+    ///
+    /// **`Binding` では書けないのでメッセージにしてある。** 入れ替える 2 文字はカーソル行の本文から
+    /// 読む必要があり、`KeyPress` からは読めない。
+    Transpose,
+    /// `Option+↑/↓`。カーソル行（選択があれば選択範囲の行）を 1 つ上・下の行と入れ替える。カーソルと
+    /// 選択は行と一緒に動く（issue 10）。
+    ///
+    /// **`Binding` では書けないのでメッセージにしてある。** `Action` / `Edit` に行の入れ替えは無く、
+    /// 入れ替える行の本文は `KeyPress` からは読めない。
+    MoveLine(Vertical),
+    /// `Shift+Option+↑/↓`。カーソル行（選択があれば選択範囲の行）を下・上に複製する。本文はどちらも
+    /// 同じで、違うのはカーソルの行き先だけ（issue 16）。
+    ///
+    /// **`Binding` では書けないのでメッセージにしてある。** `Action` / `Edit` に行の複製は無く、
+    /// 複製する行の本文は `KeyPress` からは読めない。
+    DuplicateLine(Vertical),
+    /// `Cmd+B` / `Cmd+I`。選択を `**` / `*` で囲む。既に囲まれていれば外す。選択が無ければ
+    /// 記号を 2 つ入れてカーソルを中に置く（issue 06）。中身は囲む記号。
+    ///
+    /// **`Binding` では書けないのでメッセージにしてある。** 囲むか外すかは選択の中身で決まり、
+    /// `KeyPress` からは読めない。
+    Wrap(&'static str),
+    /// `Cmd+K`。選択を `[選択]()` にしてカーソルを `()` の中へ置く。選択が無ければ `[]()` を入れて
+    /// カーソルを `[]` の中に置く（issue 14）。外す（トグル）は無い。
+    ///
+    /// **`Binding` では書けないのでメッセージにしてある。** 包む文字列は選択の中身から作り、
+    /// `KeyPress` からは読めない。
+    WrapLink,
+    /// `Cmd+1`〜`Cmd+6`。カーソル行を `#` × N + 空白の見出しにする。既に見出しなら `#` の数を置き換え、
+    /// 同じレベルなら外す（issue 15）。中身は見出しのレベル（1〜6）。
+    ///
+    /// **`Binding` では書けないのでメッセージにしてある。** 置き換える接頭辞の長さはカーソル行の本文から
+    /// 読む必要があり、`KeyPress` からは読めない。カーソルを元の位置へ戻すのも同じ。
+    SetHeading(usize),
     /// `Cmd+Z` / `Cmd+Shift+Z`（ADR-0017）。
     Undo,
     Redo,
@@ -1017,10 +1094,28 @@ enum EditKind {
     /// `Option+⌫`（issue 01）。`Backspace` と分け、押したキーの単位で戻せるようにする。
     /// 日本語は 1 文字ずつ消えるので、連打はまとめる。
     DeleteWord,
+    /// `Option+Delete`（issue 07）。`DeleteWord` と分ける（素の `⌫` と `Delete` が別なのと同じ）。
+    /// 連打はまとめる。
+    DeleteWordForward,
     /// 貼り付けは 1 回で 1 ステップ。連続しても混ぜない意味はないのでまとめる。
     Paste,
-    /// インデント操作（このアプリからは出ないが、`Edit` の網羅性のために持つ）。
+    /// `Tab` / `Shift+Tab`（issue 03）。連打は 1 回の `Cmd+Z` でまとめて戻る。
+    /// `Edit::Indent` / `Edit::Unindent`（このアプリからは出ない）もここへ分類する。
     Indent,
+    /// `Shift+Cmd+K`（issue 04）。`Delete` と分け、連打は 1 回の `Cmd+Z` でまとめて戻る。
+    DeleteLine,
+    /// `Cmd+1`〜`Cmd+6`（issue 15）。置き換えは `Edit::Paste` で流すが `Paste` とは分け、直前の
+    /// 貼り付けと 1 回の `Cmd+Z` で一緒に消えないようにする。連打はまとめる。
+    Heading,
+    /// `Ctrl+T`（issue 19）。`Edit::Paste` で流すが `Paste` とは分ける（`Heading` と同じ理由）。
+    /// 連打はまとめる。
+    Transpose,
+    /// `Option+↑/↓`（issue 10）。`Edit::Paste` で流すが `Paste` とは分ける（`Heading` と同じ理由）。
+    /// **連打はまとめない**（1 回の押下 = 1 ステップ）。行を何段か運んだあと、1 段ずつ戻せるようにする。
+    MoveLine,
+    /// `Shift+Option+↑/↓`（issue 16）。`Edit::Paste` で流すが `Paste` とは分ける（`Heading` と同じ理由）。
+    /// **連打はまとめない**（`MoveLine` と同じ。1 回の押下 = 1 ステップ）。
+    DuplicateLine,
 }
 
 /// undo に積める段数の上限。
@@ -1123,6 +1218,57 @@ fn begin_edit_group(app: &mut App, kind: EditKind) {
     if app.undo.len() > UNDO_LIMIT {
         app.undo.remove(0);
     }
+}
+
+/// カーソルを `line` 行目（論理行）の先頭へ置き、選択を解く。`Tab` / `Shift+Tab` 用（issue 03）。
+///
+/// **`Move(Home)` だけでは足りない。** cosmic-text の `Home` は**折り返した見た目の行**の先頭へ
+/// 行く（`buffer.rs` の `Motion::Home` は layout 行の glyph 0）。本文は折り返す
+/// （`Wrapping::WordOrGlyph`）ので、長い行の 2 段目にカーソルがあると行の途中に字下げが入り、
+/// `Shift+Tab` は行頭ではない文字を消す。`Move(Home)` は選択を解くためだけに当て、
+/// 位置は `move_to` で論理行の先頭へ合わせる（`move_to` は選択を解かない）。
+fn move_to_line_start(app: &mut App, line: usize) {
+    use iced::advanced::text::editor::{Action, Motion};
+
+    app.content.perform(Action::Move(Motion::Home));
+    put_cursor_at(app, line, 0);
+}
+
+/// カーソルを `line` 行目の `column` バイト目へ置く（選択なし）。
+fn put_cursor_at(app: &mut App, line: usize, column: usize) {
+    use iced::advanced::text::editor::{Cursor, Position};
+
+    app.content.move_to(Cursor {
+        position: Position { line, column },
+        selection: None,
+    });
+}
+
+/// Markdown のリスト行の接頭辞を読む（issue 05）。`(接頭辞のバイト長, 次の行に入れる接頭辞)` を返す。
+///
+/// 形は `空白*` + (`- ` | `* ` | `+ ` | `数字+. `) + (`[ ] ` | `[x] ` | `[X] `)?。番号は + 1、
+/// チェックボックスは常に未チェックで継ぐ。番号が `usize` に収まらなければリスト行とみなさない。
+fn list_prefix(line: &str) -> Option<(usize, String)> {
+    let rest = line.trim_start_matches([' ', '\t']);
+    let indent = &line[..line.len() - rest.len()];
+    let (marker_len, marker) = if ["- ", "* ", "+ "].iter().any(|m| rest.starts_with(m)) {
+        (2, rest[..2].to_string())
+    } else {
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits == 0 || !rest[digits..].starts_with(". ") {
+            return None;
+        }
+        let number: usize = rest[..digits].parse().ok()?;
+        (digits + 2, format!("{}. ", number.checked_add(1)?))
+    };
+    let checkbox = ["[ ] ", "[x] ", "[X] "]
+        .iter()
+        .any(|c| rest[marker_len..].starts_with(c));
+    let (checkbox_len, checkbox) = if checkbox { (4, "[ ] ") } else { (0, "") };
+    Some((
+        indent.len() + marker_len + checkbox_len,
+        format!("{indent}{marker}{checkbox}"),
+    ))
 }
 
 fn open_note(app: &mut App, index: usize) {
@@ -1723,6 +1869,464 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             perform(app, Action::Edit(Edit::Backspace));
         }
+        // `Option+Delete`（issue 07）。`Option+⌫` の鏡像で、**選択があれば選択だけを消し、
+        // 無ければ後ろの単語まで選んで消す。** `Sequence[Select(WordRight), Delete]` にしない理由も、
+        // undo へ**単語を選ぶ前に**積む理由も `DeleteWordBackward` と同じ。
+        Message::DeleteWordForward => {
+            use iced::advanced::text::editor::{Action, Edit, Motion, Position};
+
+            let has_selection = app.content.selection().is_some_and(|s| !s.is_empty());
+            let last = app.content.line_count().saturating_sub(1);
+            let end = Position {
+                line: last,
+                column: app.content.line(last).map_or(0, |l| l.text.len()),
+            };
+            // 文書末尾では消すものが無い。**ここで返すので dirty も立たず、undo も積まない。**
+            if !has_selection && app.content.cursor().position == end {
+                return Task::none();
+            }
+            begin_edit_group(app, EditKind::DeleteWordForward);
+            if !has_selection {
+                app.content.perform(Action::Select(Motion::WordRight));
+            }
+            perform(app, Action::Edit(Edit::Delete));
+        }
+        // `Tab`（issue 03）。**カーソル行の行頭へ半角スペース 2 つを入れ、カーソルは文字に対して
+        // 同じ位置へ戻す。** 選択があっても範囲の全行には効かせない（行頭へ動かすので選択は解ける）。
+        //
+        // cosmic-text の `Edit::Indent` は使わない。8 スペース入り、CommonMark では 4 桁以上の
+        // 字下げがコードブロックになるので Markdown のリストに合わない。
+        //
+        // **`Message::Edit` を通さない**（issue 01 と同じ型）。undo へは**行頭へ動かす前に**積む。
+        // 後で積むと、戻したときにカーソルが行頭へ行く。連打は `EditKind::Indent` で 1 つにまとまる。
+        Message::Indent => {
+            use iced::advanced::text::editor::{Action, Edit, Position};
+
+            let Position { line, column } = app.content.cursor().position;
+            begin_edit_group(app, EditKind::Indent);
+            move_to_line_start(app, line);
+            perform(app, Action::Edit(Edit::Paste(std::sync::Arc::new("  ".to_string()))));
+            // 列はバイト位置。スペースは 1 バイトなので足し算で合う。
+            put_cursor_at(app, line, column + 2);
+        }
+        // `Shift+Tab`（issue 03）。**行頭のスペースを最大 2 つ消す。** 1 つしか無ければ 1 つだけ。
+        // タブ文字は対象外（このアプリの `Tab` はタブ文字を入れない）。
+        Message::Unindent => {
+            use iced::advanced::text::editor::{Action, Cursor, Edit, Position};
+
+            let Position { line, column } = app.content.cursor().position;
+            let spaces = app.content.line(line).map_or(0, |l| {
+                l.text.chars().take(2).take_while(|&c| c == ' ').count()
+            });
+            // 消すものが無い。**ここで返すので dirty も立たず、undo も積まない**（`Ctrl+K` の行末と同じ約束）。
+            if spaces == 0 {
+                return Task::none();
+            }
+            begin_edit_group(app, EditKind::Indent);
+            move_to_line_start(app, line);
+            // **選択はモーションで作らず、バイト位置で直接張る。** `Select(Right)` は画面の向きで、
+            // 右書き（RTL）の行では手前へ動く。列 0 からだと前の行末まで選び、改行が消えて行が繋がる
+            // （cosmic-text の `buffer.rs` の `Motion::Right`）。先頭のスペースは 1 バイトずつなので、
+            // `spaces` は必ず文字境界に当たる。
+            app.content.move_to(Cursor {
+                position: Position { line, column: spaces },
+                selection: Some(Position { line, column: 0 }),
+            });
+            perform(app, Action::Edit(Edit::Delete));
+            // カーソルが消したスペースの中にいたときは行頭で止める（引き算が桁あふれする）。
+            put_cursor_at(app, line, column.saturating_sub(spaces));
+        }
+        // `Shift+Cmd+K`（issue 04）。**カーソル行（選択があれば選択にかかる行全部）を改行ごと消す。**
+        // 次の行があれば行末の改行ごと、最終行なら手前の改行ごと消すので、行数がちょうど減る。
+        //
+        // **`Move(Home)` / `Select(End)` では組まない。** cosmic-text の `Home` / `End` は折り返した
+        // 見た目の行の端へ行くので、長い行の途中までしか消えない（issue 03 の逸脱）。範囲は論理行の
+        // バイト長から作り、`move_to` で選択を直接張って `Edit::Delete` 1 回で消す。カーソルは
+        // 削除後に選択の先頭（次の行の行頭・前の行の末尾・空の本文の先頭）へ自然に落ちる。
+        //
+        // **`Message::Edit` を通さない**（issue 01 / 03 と同じ型）。undo へは**選択を張る前に**積む。
+        // 後で積むと、戻したときにカーソルが選択の端へ行く。
+        Message::DeleteLine => {
+            use iced::advanced::text::editor::{Action, Cursor, Edit, Position};
+
+            let len = |app: &App, line: usize| app.content.line(line).map_or(0, |l| l.text.len());
+            let last = app.content.line_count().saturating_sub(1);
+            // 本文が空。消すものが無いので、**dirty も立てず、undo も積まない**。
+            if last == 0 && len(app, 0) == 0 {
+                return Task::none();
+            }
+            let cursor = app.content.cursor();
+            let anchor = cursor.selection.unwrap_or(cursor.position).line;
+            let (first, end) = (
+                cursor.position.line.min(anchor),
+                cursor.position.line.max(anchor),
+            );
+            let (from, to) = if end < last {
+                (Position { line: first, column: 0 }, Position { line: end + 1, column: 0 })
+            } else if first > 0 {
+                (
+                    Position { line: first - 1, column: len(app, first - 1) },
+                    Position { line: end, column: len(app, end) },
+                )
+            } else {
+                (Position { line: 0, column: 0 }, Position { line: end, column: len(app, end) })
+            };
+
+            begin_edit_group(app, EditKind::DeleteLine);
+            app.content.move_to(Cursor { position: to, selection: Some(from) });
+            perform(app, Action::Edit(Edit::Delete));
+        }
+        // `Enter`（issue 05）。**リスト行では次の行へ記号（インデント込み）を継ぎ、記号だけの行では
+        // 記号を消してリストを抜ける。** 選択がある・リストでない・カーソルが記号の途中、のときは
+        // 今までどおりの素の改行（`Message::Edit` へ流す）。
+        //
+        // **継ぐ・抜けるは `Message::Edit` を通さない。** 改行と貼り付けを 2 回通すと `Enter` と
+        // `Paste` の 2 ステップに割れ、1 回の `Cmd+Z` で記号だけが消える。`EditKind::Enter` を先に
+        // 1 回積み、`perform` を直接呼ぶ（dirty は `perform` が共有する。ADR-0017）。
+        Message::NewlineInList => {
+            use iced::advanced::text::editor::{Action, Cursor, Edit, Position};
+
+            let enter = Message::Edit(Action::Edit(Edit::Enter));
+            if app.content.selection().is_some_and(|s| !s.is_empty()) {
+                return update(app, enter);
+            }
+            let Position { line, column } = app.content.cursor().position;
+            let parsed = app
+                .content
+                .line(line)
+                .and_then(|l| Some((l.text.len(), list_prefix(&l.text)?)));
+            let Some((len, (prefix_len, next))) = parsed.filter(|(_, (p, _))| column >= *p) else {
+                return update(app, enter);
+            };
+
+            begin_edit_group(app, EditKind::Enter);
+            if len == prefix_len {
+                // **選択はモーションで作らず、バイト位置で直接張る**（issue 03 / 04 と同じ型）。
+                // インデントごと消して空行にする（1 段戻すアウトデントは作らない）。
+                app.content.move_to(Cursor {
+                    position: Position { line, column: len },
+                    selection: Some(Position { line, column: 0 }),
+                });
+                perform(app, Action::Edit(Edit::Delete));
+            } else {
+                // `Edit::Enter` は改行 1 文字しか入れない（cosmic-text の `auto_indent` は iced から
+                // 有効にならない）ので、インデントも接頭辞に含めて貼る。
+                perform(app, Action::Edit(Edit::Enter));
+                perform(app, Action::Edit(Edit::Paste(std::sync::Arc::new(next))));
+            }
+        }
+        // `Cmd+Enter` / `Shift+Cmd+Enter`（issue 08）。**行を割らずに下・上へ空行を作り、そこへ移る。**
+        // リスト記号は継がない素の改行（issue 05 の `NewlineInList` は修飾なしの `Enter` だけ）。
+        //
+        // **`Move(End)` / `Move(Home)` では行の端へ行かない。** 折り返した見た目の行の端へ行く
+        // （issue 03 の逸脱）。位置は論理行のバイト長から `put_cursor_at` で合わせる。その前に
+        // `Move(Home)` で選択を解く（`move_to` は選択を解かない）。解かないと `Edit::Enter` が
+        // 選択を改行に置き換え、選んだ文字が消える。
+        //
+        // **`Message::Edit` を通さない**（issue 03 / 05 と同じ型）。undo へは**カーソルを動かす前に**
+        // 積む。後で積むと、戻したときにカーソルが行の端へ行く。まとまりは素の `Enter` と同じ。
+        Message::InsertLineBelow | Message::InsertLineAbove => {
+            use iced::advanced::text::editor::{Action, Edit, Motion};
+
+            let line = app.content.cursor().position.line;
+            let below = matches!(message, Message::InsertLineBelow);
+            let column = if below { app.content.line(line).map_or(0, |l| l.text.len()) } else { 0 };
+            begin_edit_group(app, EditKind::Enter);
+            app.content.perform(Action::Move(Motion::Home));
+            put_cursor_at(app, line, column);
+            perform(app, Action::Edit(Edit::Enter));
+            // 下なら改行のあとのカーソルがそのまま新しい空行 `(line + 1, 0)`。上は元の行が 1 つ
+            // 下がるので、空いた `(line, 0)` へ戻す。
+            if !below {
+                put_cursor_at(app, line, 0);
+            }
+        }
+        // `Ctrl+O`（issue 17）。**改行を入れ、カーソルは改行の手前に残す**（Cocoa の
+        // `insertNewlineIgnoringFieldEditor:` → `moveBackward:`）。選択があれば `Edit::Enter` が選択を
+        // 改行に置き換える（Cocoa の `insertNewline` と同じ）ので、そのまま置き換える。リスト記号は
+        // 継がない（issue 05 の `NewlineInList` を通らない）。
+        //
+        // **`Sequence[Enter, Move(Left)]` にしない。** `Motion::Left` は画面方向で、RTL 行では逆へ動く。
+        // 改行の直前＝改行後のカーソル行の 1 つ上の行末を、論理行のバイト長から `put_cursor_at` で合わせる。
+        //
+        // **`Message::Edit` を通さない**（issue 08 と同じ型）。undo へは改行を入れる前に積む。まとまりは
+        // 素の `Enter` と同じ。
+        Message::OpenLine => {
+            use iced::advanced::text::editor::{Action, Edit};
+
+            begin_edit_group(app, EditKind::Enter);
+            perform(app, Action::Edit(Edit::Enter));
+            // 改行のあとのカーソルは新しい行の頭 `(line, 0)`。戻す先は `(line - 1, その行の長さ)`。
+            let line = app.content.cursor().position.line - 1;
+            let column = app.content.line(line).map_or(0, |l| l.text.len());
+            put_cursor_at(app, line, column);
+        }
+        // `Cmd+B` / `Cmd+I`（issue 06）。**選択があれば `{m}選択{m}` に置き換え、既に `{m}…{m}` なら
+        // 剥がす。** `*` だけは、選択が `**` で始まるときは剥がさず重ねる（太字の上に斜体で
+        // `***bar***`。剥がすと `*bar*` で太字が斜体に化ける）。`***bar***` にもう一度 `Cmd+I` を
+        // 押したときの挙動は決めていない。
+        //
+        // 置き換えは `Message::Edit(Paste)` に通す（`Paste` は選択を置き換える。cosmic-text の
+        // `insert_string` が先に選択を消す）。undo は `EditKind::Paste` の 1 ステップ、dirty は共有。
+        // **置き換えた後に結果を選び直す。** 選択が残らないと、もう一度押したときに外れず
+        // `****` の挿入になる。選択はバイト位置で直接張る（issue 03 / 04 と同じ型）。
+        Message::Wrap(marker) => {
+            use iced::advanced::text::editor::{Action, Cursor, Edit, Position};
+
+            let paste =
+                |text: String| Message::Edit(Action::Edit(Edit::Paste(std::sync::Arc::new(text))));
+            let Some(selected) = app.content.selection().filter(|s| !s.is_empty()) else {
+                let Position { line, column } = app.content.cursor().position;
+                let task = update(app, paste(format!("{marker}{marker}")));
+                // 列はバイト位置。記号は ASCII なので足し算で合う。
+                put_cursor_at(app, line, column + marker.len());
+                return task;
+            };
+            let wrapped = selected.len() >= 2 * marker.len()
+                && selected.starts_with(marker)
+                && selected.ends_with(marker)
+                && !(marker == "*" && selected.starts_with("**"));
+            let replaced = if wrapped {
+                selected[marker.len()..selected.len() - marker.len()].to_string()
+            } else {
+                format!("{marker}{selected}{marker}")
+            };
+            // 選び直す先頭は、貼った後のカーソル（貼った文字列の末尾）から文字列の長さで逆算する。
+            // **貼る前の `cursor()` からは取れない。** ダブルクリック（単語選択）・トリプルクリック
+            // （行選択）では `cursor()` の `position` も `selection` もクリックした位置を指し、
+            // 範囲の端にならない（iced_graphics は cosmic の `Selection::Word` / `Line` の起点を
+            // そのまま返す）。そこから張ると `*bar**` が選ばれ、もう一度押すと `****bar****` になる。
+            let rows = replaced.matches('\n').count();
+            let first = replaced.lines().next().map_or(0, str::len);
+            let task = update(app, paste(replaced));
+            let end = app.content.cursor().position;
+            let line = end.line - rows;
+            let column = if rows == 0 {
+                end.column - first
+            } else {
+                app.content.line(line).map_or(0, |l| l.text.len()) - first
+            };
+            let start = Position { line, column };
+            app.content.move_to(Cursor { position: end, selection: Some(start) });
+            return task;
+        }
+        // `Cmd+K` でリンクを挿入する（issue 14）。置き換えは `Message::Edit(Paste)` に通す
+        // （`Paste` は選択を置き換える。undo は `EditKind::Paste` の 1 ステップ、dirty は共有）。
+        Message::WrapLink => {
+            use iced::advanced::text::editor::{Action, Edit, Position};
+
+            let paste =
+                |text: String| Message::Edit(Action::Edit(Edit::Paste(std::sync::Arc::new(text))));
+            let Some(selected) = app.content.selection().filter(|s| !s.is_empty()) else {
+                let Position { line, column } = app.content.cursor().position;
+                let task = update(app, paste("[]()".to_string()));
+                // `[` と `]` の間。列はバイト位置で、`[` は 1 バイト。
+                put_cursor_at(app, line, column + 1);
+                return task;
+            };
+            // 括弧の中は、貼った後のカーソル（貼った文字列の末尾 = `)` の後ろ）の 1 バイト手前。
+            // 複数行の選択でも `)` は最終行の末尾にあるので同じ式で済む。**貼る前の `cursor()` は
+            // 使わない。** ダブルクリック・トリプルクリックの選択では範囲の端を指さない（issue 06）。
+            let task = update(app, paste(format!("[{selected}]()")));
+            let end = app.content.cursor().position;
+            put_cursor_at(app, end.line, end.column - 1);
+            return task;
+        }
+        // `Cmd+1`〜`Cmd+6`（issue 15）。**カーソル行の行頭の `#` × 1〜6 + 半角スペースを、`#` × N + 空白に
+        // 置き換える。** 同じレベルなら外す。見出しでない行（`#foo` や `####### `）は接頭辞なしとして
+        // 行頭へ足す。選択があってもカーソル行だけに効く（行頭へ動かすので選択は解ける）。Setext
+        // 見出し（下線）は扱わない。
+        //
+        // **`Message::Edit` を通さない**（issue 03 と同じ型）。undo へは**行頭へ動かす前に**積む。後で積むと、
+        // 戻したときにカーソルが行頭へ行く。連打は `EditKind::Heading` で 1 つにまとまる。
+        Message::SetHeading(level) => {
+            use iced::advanced::text::editor::{Action, Cursor, Edit, Position};
+
+            let Position { line, column } = app.content.cursor().position;
+            // 今の接頭辞のバイト長（`#` の数 + 空白 1 つ）。見出しでなければ 0。
+            let old = app.content.line(line).map_or(0, |l| {
+                let hashes = l.text.bytes().take_while(|&b| b == b'#').count();
+                let spaced = l.text.as_bytes().get(hashes) == Some(&b' ');
+                if (1..=6).contains(&hashes) && spaced { hashes + 1 } else { 0 }
+            });
+            let new = if old == level + 1 { String::new() } else { "#".repeat(level) + " " };
+            begin_edit_group(app, EditKind::Heading);
+            move_to_line_start(app, line);
+            // **選択はモーションで作らず、バイト位置で直接張る**（issue 03 の RTL の罠）。接頭辞は
+            // ASCII なので `old` は必ず文字境界に当たる。`old == 0` なら選択を張らずに行頭へ貼る。
+            if old > 0 {
+                app.content.move_to(Cursor {
+                    position: Position { line, column: old },
+                    selection: Some(Position { line, column: 0 }),
+                });
+            }
+            // `Paste` は選択を置き換える（cosmic-text の `insert_string` が先に選択を消す）。
+            let edit = if new.is_empty() {
+                Edit::Delete
+            } else {
+                Edit::Paste(std::sync::Arc::new(new.clone()))
+            };
+            perform(app, Action::Edit(edit));
+            // カーソルが古い接頭辞の中にいたときは新しい接頭辞の直後で止める（引き算が桁あふれする）。
+            put_cursor_at(app, line, column.saturating_sub(old) + new.len());
+        }
+        // `Ctrl+T`（issue 19）。**`a|b` → `ba|`、行末の `ab|` → `ba|`**（Cocoa の `transpose:`）。
+        // 文字は `chars()` 単位（結合文字は分かれたまま）。行頭・1 文字以下の行・選択があるときは
+        // 何もしない。行をまたいで前の行の改行とは入れ替えない。
+        //
+        // **`Message::Edit` を通さない**（issue 15 と同じ型）。undo へは**選択を張る前に**積む。後で積むと、
+        // 戻したときに 2 文字が選ばれた状態になる。連打は `EditKind::Transpose` で 1 つにまとまる。
+        Message::Transpose => {
+            use iced::advanced::text::editor::{Action, Cursor, Edit, Position};
+
+            if app.content.selection().is_some_and(|s| !s.is_empty()) {
+                return Task::none();
+            }
+            let Position { line, column } = app.content.cursor().position;
+            let text = app.content.line(line).map_or(String::new(), |l| l.text.to_string());
+            // 列はバイト位置。cosmic-text は文字境界にしか置かないが、割れたら `text[..column]` が
+            // パニックするので確かめる（行の長さを超えた列もここで弾く）。
+            if column == 0 || !text.is_char_boundary(column) {
+                return Task::none();
+            }
+            // 入れ替える範囲の末尾。行の途中ならカーソルの後ろの 1 文字まで、行末ならカーソル位置。
+            // どちらも範囲の末尾から手前の 2 文字が入れ替える 2 文字になる。
+            let end = column + text[column..].chars().next().map_or(0, char::len_utf8);
+            let mut before = text[..end].chars().rev();
+            // 2 文字無い（1 文字の行の行末）。**ここで返すので dirty も立たず、undo も積まない**
+            // （`Ctrl+K` の行末と同じ約束）。
+            let (Some(b), Some(a)) = (before.next(), before.next()) else {
+                return Task::none();
+            };
+            // 同じ 2 文字（`aa|`）は入れ替えても本文が変わらないので、dirty も undo も触らずに返す。
+            if a == b {
+                return Task::none();
+            }
+            let start = end - a.len_utf8() - b.len_utf8();
+            begin_edit_group(app, EditKind::Transpose);
+            // **選択はモーションで作らず、バイト位置で直接張る**（issue 03 の RTL の罠）。
+            app.content.move_to(Cursor {
+                position: Position { line, column: end },
+                selection: Some(Position { line, column: start }),
+            });
+            // `Paste` は選択を置き換える（cosmic-text の `insert_string` が先に選択を消す）。
+            perform(app, Action::Edit(Edit::Paste(std::sync::Arc::new(format!("{b}{a}")))));
+            // 2 文字の長さの和は変わらないので、範囲の末尾がそのまま入れ替えた 2 文字の後ろになる。
+            put_cursor_at(app, line, end);
+        }
+        // `Option+↑/↓`（issue 10）。**行範囲 s..=e（選択があれば選択がかかる行全部）を 1 つ上・下の行と
+        // 入れ替える。** `Content` は作り直さず、入れ替える 2 つの行範囲をまとめてバイト位置で選び、
+        // 入れ替えた本文を 1 回貼る（issue 04 / 15 と同じ型）。行の結合は `"\n"`（CRLF のノートでは新しい
+        // 改行が LF になる。issue 06 / 08 と同じ既存の性質）。折り返しには左右されない（論理行で組む）。
+        //
+        // **`Message::Edit` を通さない**（issue 15 と同じ型）。undo へは**選択を張る前に**積む。後で積むと、
+        // 戻したときに入れ替えた範囲が選ばれた状態になる。**連打はまとめない**ので、積む前と貼った後の
+        // 両方でまとまりを切る（1 回の押下 = 1 ステップ）。
+        Message::MoveLine(direction) => {
+            use iced::advanced::text::editor::{Action, Cursor, Edit, Position};
+
+            let line =
+                |app: &App, n: usize| app.content.line(n).map_or(String::new(), |l| l.text.to_string());
+            let last = app.content.line_count().saturating_sub(1);
+            let cursor = app.content.cursor();
+            let anchor = cursor.selection.unwrap_or(cursor.position).line;
+            let (first, end) = (
+                cursor.position.line.min(anchor),
+                cursor.position.line.max(anchor),
+            );
+            // 先頭行の `↑`・最終行の `↓`。**ここで返すので dirty も立たず、undo も積まない**
+            // （`Ctrl+K` の行末と同じ約束）。
+            let at_edge = match direction {
+                Vertical::Up => first == 0,
+                Vertical::Down => end >= last,
+            };
+            if at_edge {
+                return Task::none();
+            }
+            let block = (first..=end).map(|n| line(app, n)).collect::<Vec<_>>().join("\n");
+            let (from, to, swapped) = match direction {
+                Vertical::Up => {
+                    let above = line(app, first - 1);
+                    (
+                        Position { line: first - 1, column: 0 },
+                        Position { line: end, column: line(app, end).len() },
+                        format!("{block}\n{above}"),
+                    )
+                }
+                Vertical::Down => {
+                    let below = line(app, end + 1);
+                    (
+                        Position { line: first, column: 0 },
+                        Position { line: end + 1, column: below.len() },
+                        format!("{below}\n{block}"),
+                    )
+                }
+            };
+            // 範囲の中の列は変わらないので、カーソルと選択は行番号だけずらせば同じ文字の位置へ戻る。
+            // トリプルクリックの行選択は anchor がクリック位置なので、動かした後は通常の選択になる
+            // （既知の近似。`cursor().selection` は範囲の端ではない）。
+            let shift = |p: Position| Position {
+                line: match direction {
+                    Vertical::Up => p.line - 1,
+                    Vertical::Down => p.line + 1,
+                },
+                ..p
+            };
+
+            app.edit_group = None;
+            begin_edit_group(app, EditKind::MoveLine);
+            // **選択はモーションで作らず、バイト位置で直接張る**（issue 03 の RTL の罠）。`move_to` は
+            // `selection` が `Some` なら選択を張り直すので、既存の選択を先に解かなくてよい。
+            app.content.move_to(Cursor { position: to, selection: Some(from) });
+            // `Paste` は選択を置き換える（cosmic-text の `insert_string` が先に選択を消す）。貼った後は
+            // 選択が無いので、選択の無いカーソルへ戻すときも `move_to` だけで足りる。
+            perform(app, Action::Edit(Edit::Paste(std::sync::Arc::new(swapped))));
+            app.content.move_to(Cursor {
+                position: shift(cursor.position),
+                selection: cursor.selection.map(shift),
+            });
+            app.edit_group = None;
+        }
+        // `Shift+Option+↑/↓`（issue 16）。**行範囲 s..=e（選択があれば選択がかかる行全部）の本文を、
+        // e 行の末尾に `"\n" + 本文` として貼る。** 複製は元と同じ本文なので、上下どちらも貼る位置は同じで、
+        // 違うのはカーソルの行き先だけ。`Content` は作り直さない（issue 10 と同じ型）。行の結合は `"\n"`
+        // （CRLF のノートでは新しい改行が LF になる。issue 10 と同じ既存の性質）。空行・空のノートでも
+        // 複製する（改行が 1 つ増える。VS Code と同じ）。
+        //
+        // **`Message::Edit` を通さない**（issue 10 と同じ型）。undo へは**カーソルを動かす前に**積む。後で
+        // 積むと、戻したときにカーソルが行末へ行く。**連打はまとめない**ので、積む前と貼った後の両方で
+        // まとまりを切る（1 回の押下 = 1 ステップ）。
+        Message::DuplicateLine(direction) => {
+            use iced::advanced::text::editor::{Action, Edit, Motion};
+
+            let line =
+                |app: &App, n: usize| app.content.line(n).map_or(String::new(), |l| l.text.to_string());
+            let cursor = app.content.cursor();
+            let anchor = cursor.selection.unwrap_or(cursor.position).line;
+            let (first, end) = (
+                cursor.position.line.min(anchor),
+                cursor.position.line.max(anchor),
+            );
+            let block = (first..=end).map(|n| line(app, n)).collect::<Vec<_>>().join("\n");
+            // `↓` は下の複製へ移る（範囲の行数だけ下がる）。`↑` は元の行番号＝上の複製に留まる。
+            // 選択は解く（複製後にブロックを選び直さない。issue 16 の決定）。
+            let target = match direction {
+                Vertical::Up => cursor.position.line,
+                Vertical::Down => cursor.position.line + (end - first + 1),
+            };
+
+            app.edit_group = None;
+            begin_edit_group(app, EditKind::DuplicateLine);
+            // **`move_to` は選択を解かない**（`selection: None` を渡しても張ったまま）。`Move(Home)` で
+            // 解いてから e 行の末尾へ置く（`move_to_line_start` と同じ手）。選択が残ったまま貼ると、
+            // `Paste` が選択を置き換えて選んだ文字が消える。
+            app.content.perform(Action::Move(Motion::Home));
+            put_cursor_at(app, end, line(app, end).len());
+            perform(app, Action::Edit(Edit::Paste(std::sync::Arc::new(format!("\n{block}")))));
+            // 範囲の中の列は変わらないので、列はそのままで同じ文字の位置へ戻る。
+            put_cursor_at(app, target, cursor.position.column);
+            app.edit_group = None;
+        }
         Message::Tick(now) => {
             if app.saved_flash_until.is_some_and(|until| now >= until) {
                 app.saved_flash_until = None;
@@ -2240,6 +2844,8 @@ fn note_pane(app: &App) -> Element<'_, Message> {
 /// 決定ではなかった。iced 既定の矢印キーが shift で `Move` と `Select` を切り替えるのと
 /// 揃えて、`macos_control_binding` 側で同じ切り替えを行う。
 fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
+    use iced::advanced::text::editor::Motion;
+
     let command = kp.modifiers.command();
     // **フォーカスが無いときは補わない。** `key_binding` はフォーカスの有無に関わらず
     // 呼ばれる（`Status::Active` で来る）。パレット・リネーム欄を開いている間に
@@ -2250,6 +2856,10 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
     // `Cmd+Ctrl+A` まで拾ってしまう（iced の `convert_macos_shortcut` も完全一致）。
     let control_only = kp.modifiers == keyboard::Modifiers::CTRL;
     let control_shift = kp.modifiers == keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+    // `Ctrl+Option` / `Ctrl+Option+Shift` も完全一致（issue 18）。`Cmd+Ctrl+Option+B` などは拾わない。
+    let control_alt = kp.modifiers == keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT;
+    let control_alt_shift = kp.modifiers
+        == keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT;
     let key = kp.key.clone();
 
     // `Option+⌫`。既定は修飾を見ずに `Backspace` を返すので、**既定より先に**見る（issue 01）。
@@ -2260,11 +2870,184 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
         return Some(text_editor::Binding::Custom(Message::DeleteWordBackward));
     }
 
+    // `Option+Delete`（`Option+fn+⌫`）。既定は修飾を見ずに `Delete` を返すので、**既定より先に**見る
+    // （issue 07。`Option+⌫` と同じ理由）。
+    if focused
+        && kp.modifiers == keyboard::Modifiers::ALT
+        && key == keyboard::Key::Named(keyboard::key::Named::Delete)
+    {
+        return Some(text_editor::Binding::Custom(Message::DeleteWordForward));
+    }
+
+    // `Tab` / `Shift+Tab` でインデント・アウトデント（issue 03）。既定は `text`（macOS では
+    // `"\t"` / `"\u{19}"`）が制御文字なので `None` を返し、後ろで補っても届く。それでも**既定より
+    // 先に**見るのは、答えを `text` に依存させないため。修飾は完全一致で、`Ctrl+Tab` などは拾わない。
+    if focused && key == keyboard::Key::Named(keyboard::key::Named::Tab) {
+        if kp.modifiers.is_empty() {
+            return Some(text_editor::Binding::Custom(Message::Indent));
+        }
+        if kp.modifiers == keyboard::Modifiers::SHIFT {
+            return Some(text_editor::Binding::Custom(Message::Unindent));
+        }
+    }
+
+    // 修飾なしの `Enter` でリスト記号を継ぐ（issue 05）。既定は `text`（macOS では `"\r"`）に関係なく
+    // `Binding::Enter` を返す＝答えを出すので、後ろでは補えない。**既定より先に**見る（ADR-0016 の
+    // 例外）。修飾は空との完全一致で、`Shift+Enter`（素の改行の抜け道）・`Cmd+Enter`（issue 08）は
+    // 既定に任せる。
+    if focused
+        && kp.modifiers.is_empty()
+        && key == keyboard::Key::Named(keyboard::key::Named::Enter)
+    {
+        return Some(text_editor::Binding::Custom(Message::NewlineInList));
+    }
+
+    // `Cmd+Enter` / `Shift+Cmd+Enter` で下・上に行を挿入する（issue 08）。既定は修飾を見ずに
+    // `Binding::Enter`（カーソル位置で行を割る）を返す＝答えを出すので、後ろでは補えない。
+    // **既定より先に**見る（issue 05 と同じ ADR-0016 の例外）。修飾は完全一致で、`Cmd+Option+Enter`
+    // などは既定に任せる。実機の `text` は `"\r"`。
+    if focused && key == keyboard::Key::Named(keyboard::key::Named::Enter) {
+        if kp.modifiers == keyboard::Modifiers::COMMAND {
+            return Some(text_editor::Binding::Custom(Message::InsertLineBelow));
+        }
+        if kp.modifiers == keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT {
+            return Some(text_editor::Binding::Custom(Message::InsertLineAbove));
+        }
+    }
+
+    // `Cmd+↑/↓` で文書の先頭・末尾へ（`Shift` 付きで選択）。既定は `Cmd` を見ても
+    // `←/→` しか `Home/End` に変えず、`↑/↓` には `Move(Up/Down)` を返すので、**既定より先に**
+    // 見る（issue 02。ADR-0016 の「既定が答えを出せなかったときだけ補う」の例外）。
+    // 修飾は完全一致で、`Cmd+Option+↑/↓` などは既定に任せる。
+    let document_edge = match key.as_ref() {
+        keyboard::Key::Named(keyboard::key::Named::ArrowUp) => Some(Motion::DocumentStart),
+        keyboard::Key::Named(keyboard::key::Named::ArrowDown) => Some(Motion::DocumentEnd),
+        _ => None,
+    };
+    if focused && let Some(motion) = document_edge {
+        if kp.modifiers == keyboard::Modifiers::COMMAND {
+            return Some(text_editor::Binding::Move(motion));
+        }
+        if kp.modifiers == keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT {
+            return Some(text_editor::Binding::Select(motion));
+        }
+    }
+
+    // `Shift+Option+↑/↓` でカーソル行（選択があれば選択範囲の行）を下・上に複製する（issue 16）。既定は
+    // `Select(Up/Down)`（1 行分の選択）を返す＝答えを出すので、後ろでは補えない。**既定より先に**見る
+    // （issue 10 と同じ ADR-0016 の例外）。このキーの「1 行分の選択」は失われる（利用者の決定。
+    // `Shift+↑/↓`・`Shift+Cmd+↑/↓` の選択は残る）。修飾は完全一致。
+    if focused && kp.modifiers == keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT {
+        match key.as_ref() {
+            keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                return Some(text_editor::Binding::Custom(Message::DuplicateLine(Vertical::Up)));
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
+                return Some(text_editor::Binding::Custom(Message::DuplicateLine(Vertical::Down)));
+            }
+            _ => {}
+        }
+    }
+
+    // `Option+↑/↓` でカーソル行（選択があれば選択範囲の行）を上下の行と入れ替える（issue 10）。既定は
+    // `Move(Up/Down)` を返す（`jump()` の `widen()` が `Up/Down` を変えない）＝答えを出すので、後ろでは
+    // 補えない。**既定より先に**見る（issue 02 と同じ ADR-0016 の例外）。修飾は完全一致で、
+    // `Shift+Option+↑/↓` は直前の分岐（issue 16 の行複製）が拾い、`Cmd+Option+↑/↓` は既定に任せる。
+    if focused && kp.modifiers == keyboard::Modifiers::ALT {
+        match key.as_ref() {
+            keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                return Some(text_editor::Binding::Custom(Message::MoveLine(Vertical::Up)));
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
+                return Some(text_editor::Binding::Custom(Message::MoveLine(Vertical::Down)));
+            }
+            _ => {}
+        }
+    }
+
+    // `Shift+Cmd+K` で行を削除する（issue 04）。既定は `text`（`"K"`）から `Insert('K')` を返し、
+    // それは下の ⌘ ガード（ADR-0010）で捨てられる。既定の答えを捨てたあとでは何を押したかが
+    // 分からないので、**既定より先に**見る。macOS の winit は ⌘ 付きのとき Shift の効いた文字を
+    // `key` にするので実機は `"K"`。大文字小文字の両方を受ける。修飾は完全一致で、
+    // `Cmd+K`（issue 14）や `Ctrl+Shift+K`（ADR-0023 で未定義）は拾わない。
+    if focused
+        && kp.modifiers == keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT
+        && matches!(key.as_ref(), keyboard::Key::Character(c) if c.eq_ignore_ascii_case("k"))
+    {
+        return Some(text_editor::Binding::Custom(Message::DeleteLine));
+    }
+
+    // `Cmd+B` / `Cmd+I` で太字・斜体を付け外しする（issue 06）。**ADR-0010 の帰結にある「⌘ 付きで
+    // 文字を入れる機能」の最初の例外。** 既定は `text`（`"b"` / `"i"`）から `Insert` を返し、それは下の
+    // ⌘ ガードで捨てられる。捨てたあとでは何を押したかが分からないので、**既定より先に**見る。
+    // 本文へ入るのは `**` / `*` だけで、"b" / "i" は入らない。修飾は完全一致で、`Shift+Cmd+B` などは
+    // 拾わない。アプリ側の ⌘ ショートカット（subscription）は `b` / `i` を使っていない。
+    let wrap_marker = match key.as_ref() {
+        keyboard::Key::Character(c) if c.eq_ignore_ascii_case("b") => Some("**"),
+        keyboard::Key::Character(c) if c.eq_ignore_ascii_case("i") => Some("*"),
+        _ => None,
+    };
+    if focused
+        && kp.modifiers == keyboard::Modifiers::COMMAND
+        && let Some(marker) = wrap_marker
+    {
+        return Some(text_editor::Binding::Custom(Message::Wrap(marker)));
+    }
+
+    // `Cmd+K` でリンクを挿入する（issue 14）。issue 06 と同じ ADR-0010 の例外で、本文へ入るのは
+    // `[` `]` `(` `)` だけで "k" は入らない。既定は `text`（`"k"`）から `Insert` を返し、それは下の
+    // ⌘ ガードで捨てられる。捨てたあとでは何を押したかが分からないので、**既定より先に**見る。
+    // 修飾は完全一致で、`Shift+Cmd+K`（issue 04、行削除）・`Ctrl+K`（ADR-0016、行末まで切り取り）は
+    // 拾わない。アプリ側の ⌘ ショートカット（subscription）は `k` を使っていない。
+    if focused
+        && kp.modifiers == keyboard::Modifiers::COMMAND
+        && matches!(key.as_ref(), keyboard::Key::Character(c) if c.eq_ignore_ascii_case("k"))
+    {
+        return Some(text_editor::Binding::Custom(Message::WrapLink));
+    }
+
+    // `Cmd+1`〜`Cmd+6` で見出しレベルを付け外しする（issue 15）。issue 06 と同じ ADR-0010 の例外で、
+    // 本文へ入るのは `#` と空白だけで数字は入らない。既定は `text`（`"1"`）から `Insert('1')` を返し、
+    // それは下の ⌘ ガードで捨てられる。捨てたあとでは何を押したかが分からないので、**既定より先に**
+    // 見る（issue 04 / 06 と同じ理由）。修飾は完全一致で、`Shift+Cmd+1` などは拾わない。アプリ側の
+    // ⌘ ショートカット（subscription）は数字キーを使っていない。
+    let heading = match key.as_ref() {
+        keyboard::Key::Character(c) => match c.as_bytes() {
+            [digit @ b'1'..=b'6'] => Some(usize::from(digit - b'0')),
+            _ => None,
+        },
+        _ => None,
+    };
+    if focused
+        && kp.modifiers == keyboard::Modifiers::COMMAND
+        && let Some(level) = heading
+    {
+        return Some(text_editor::Binding::Custom(Message::SetHeading(level)));
+    }
+
+    // `Cmd+D` / `Cmd+L` で単語・行を選択する（issue 09）。既定は `text`（`"d"` / `"l"`）から `Insert` を
+    // 返し、それは下の ⌘ ガード（ADR-0010）で捨てられる。捨てたあとでは何を押したかが分からないので、
+    // **既定より先に**見る（issue 04 / 06 と同じ理由）。選択は widget が本文に当てるだけで本文を
+    // 変えない。修飾は完全一致で、`Shift+Cmd+D` などは拾わない。`Ctrl+D`（ADR-0016）とも衝突しない。
+    if focused && kp.modifiers == keyboard::Modifiers::COMMAND {
+        match key.as_ref() {
+            keyboard::Key::Character(c) if c.eq_ignore_ascii_case("d") => {
+                return Some(text_editor::Binding::SelectWord);
+            }
+            keyboard::Key::Character(c) if c.eq_ignore_ascii_case("l") => {
+                return Some(text_editor::Binding::SelectLine);
+            }
+            _ => {}
+        }
+    }
+
     match text_editor::Binding::from_key_press(kp) {
         Some(text_editor::Binding::Insert(_)) if command => None,
         Some(other) => Some(other),
         None if focused && control_only => macos_control_binding(&key, false),
         None if focused && control_shift => macos_control_binding(&key, true),
+        None if focused && control_alt => macos_control_alt_binding(&key, false),
+        None if focused && control_alt_shift => macos_control_alt_binding(&key, true),
         None => None,
     }
 }
@@ -2276,12 +3059,12 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
 /// iced 0.14.2 の既定は `Ctrl+A` を `Home` へ変換しておきながら、その後の分岐で
 /// **変換前のキーと `text`（macOS では制御文字が入る）を見てしまい `None` を返す**。
 ///
-/// `Ctrl+K`（行末まで切り取り）だけは `Binding` を組み合わせず**メッセージにして
-/// `update()` で処理する**（ADR-0016）。`Sequence` の中では `Select` の結果を
-/// `Cut` が見られないため（`Message::CutToLineEnd` の分岐に理由を書いた）。
+/// `Ctrl+K`（行末まで切り取り）・`Ctrl+O`（行を開く）・`Ctrl+T`（入れ替え）は `Binding` を組み合わせず
+/// **メッセージにして `update()` で処理する**（ADR-0016）。理由はそれぞれ `Message::CutToLineEnd` /
+/// `Message::OpenLine` / `Message::Transpose` の分岐に書いた。
 /// `select` は `Ctrl+Shift+<key>` かどうか。移動系（a/e/b/f/n/p）だけが対応し、
-/// `d`（削除）・`k`（切り取り）は shift 版の意味を定義していないので `None` で見送る
-/// （ADR-0023）。
+/// `d`（削除）・`k`（切り取り）・`o`（行を開く）・`t`（入れ替え）は shift 版の意味を定義していないので
+/// `None` で見送る（ADR-0023）。
 fn macos_control_binding(
     key: &keyboard::Key,
     select: bool,
@@ -2301,6 +3084,40 @@ fn macos_control_binding(
         keyboard::Key::Character("k") if !select => {
             return Some(text_editor::Binding::Custom(Message::CutToLineEnd));
         }
+        // カーソル位置に改行を入れ、カーソルは動かさない（issue 17。`Message::OpenLine` の分岐に理由）。
+        keyboard::Key::Character("o") if !select => {
+            return Some(text_editor::Binding::Custom(Message::OpenLine));
+        }
+        // カーソル前後の 2 文字を入れ替える（issue 19。`Message::Transpose` の分岐に理由）。
+        keyboard::Key::Character("t") if !select => {
+            return Some(text_editor::Binding::Custom(Message::Transpose));
+        }
+        _ => return None,
+    };
+    Some(if select {
+        text_editor::Binding::Select(motion)
+    } else {
+        text_editor::Binding::Move(motion)
+    })
+}
+
+/// macOS の `Ctrl+Option+B` / `F`（Emacs の `M-b` / `M-f`）で単語単位に動く（issue 18）。
+///
+/// 既定は `text`（macOS では `"\u{2}"` などの制御文字）を見て `None` を返すので、後ろで補う
+/// （ADR-0016）。`select` は `Shift` 付きかどうかで、`Move` と `Select` を切り替える（ADR-0023）。
+/// `macos_control_binding` は `b` / `f` を 1 文字移動に使っているので、引数を増やさず分けた。
+///
+/// **キーは大文字小文字の両方を受ける。** macOS の winit は Ctrl 付きのとき Shift の効いた文字を
+/// `key` にする（Option は無視される）ので、`Ctrl+Option+Shift+B` の実機は `"B"` になる。
+fn macos_control_alt_binding(
+    key: &keyboard::Key,
+    select: bool,
+) -> Option<text_editor::Binding<Message>> {
+    use iced::advanced::text::editor::Motion;
+
+    let motion = match key.as_ref() {
+        keyboard::Key::Character(c) if c.eq_ignore_ascii_case("b") => Motion::WordLeft,
+        keyboard::Key::Character(c) if c.eq_ignore_ascii_case("f") => Motion::WordRight,
         _ => return None,
     };
     Some(if select {
@@ -4821,6 +5638,2297 @@ mod tests {
         assert!(!is_dirty(&app), "文書先頭で dirty が立った");
     }
 
+    /// `Option+Delete`（`Option+fn+⌫`）の打鍵を組み立てる。macOS の実機は `text` に DEL
+    /// （`"\u{7f}"`）を載せる見込み（issue 07）。
+    fn option_delete(text: Option<&str>) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key: named(keyboard::key::Named::Delete),
+            modified_key: named(keyboard::key::Named::Delete),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers: keyboard::Modifiers::ALT,
+            text: text.map(Into::into),
+            status: text_editor::Status::Focused { is_hovered: false },
+        }
+    }
+
+    /// **`Option+Delete` は `update()` へ回すこと。** 既定は修飾を見ずに `Delete` を返すので、
+    /// 補わないと 1 文字しか消えない（issue 07）。
+    #[test]
+    fn option_delete_is_handled_by_the_update_loop() {
+        for text in [Some("\u{7f}"), None] {
+            let binding = editor_key_binding(option_delete(text));
+            assert!(
+                matches!(
+                    binding,
+                    Some(text_editor::Binding::Custom(Message::DeleteWordForward))
+                ),
+                "Option+Delete（text: {text:?}）が単語削除にならない: {binding:?}",
+            );
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（見ていない本文から単語が消える）。
+    #[test]
+    fn option_delete_does_nothing_while_the_editor_is_unfocused() {
+        let mut kp = option_delete(Some("\u{7f}"));
+        kp.status = text_editor::Status::Active;
+        assert!(editor_key_binding(kp).is_none());
+    }
+
+    /// **カーソルの後ろの単語が消えること。** 効果は本文の文字列で見る（Ctrl+K の教訓）。
+    #[test]
+    fn option_delete_deletes_the_next_word() {
+        let (_dir, mut app) = app_with_vault("option-delete-word");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo bar");
+
+        send(&mut app, Message::DeleteWordForward);
+
+        assert_eq!(app.content.text(), " bar", "後ろの単語が消えていない");
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+    }
+
+    /// 行末で押すと次の行と繋がる（改行 1 文字を消す）。
+    #[test]
+    fn option_delete_at_a_line_end_joins_the_next_line() {
+        let (_dir, mut app) = app_with_vault("option-delete-line-end");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "一行目\n二行目");
+        put_cursor_at(&mut app, 0, "一行目".len());
+
+        send(&mut app, Message::DeleteWordForward);
+
+        assert_eq!(app.content.text(), "一行目二行目");
+    }
+
+    /// **選択があれば選択だけを消すこと**（Cocoa と同じ）。後ろの単語まで巻き込まない。
+    #[test]
+    fn option_delete_deletes_only_the_selection() {
+        use iced::advanced::text::editor::{Action, Motion};
+
+        let (_dir, mut app) = app_with_vault("option-delete-selection");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "今日は 晴れ です");
+        for _ in 0..4 {
+            app.content.perform(Action::Move(Motion::Right));
+        }
+        for _ in 0..2 {
+            app.content.perform(Action::Select(Motion::Right));
+        }
+        assert_eq!(app.content.selection().as_deref(), Some("晴れ"), "前提: 選択がずれている");
+
+        send(&mut app, Message::DeleteWordForward);
+
+        assert_eq!(app.content.text(), "今日は  です", "選択より多く消えた");
+    }
+
+    /// 日本語は 1 文字ずつ消える（`unicode_word_indices` が漢字・ひらがなを 1 文字ずつ単語にする）。
+    /// issue 01 の実機確認と同じ性質。辞書で区切る Cocoa とは違う可能性がある。
+    #[test]
+    fn option_delete_deletes_one_japanese_character() {
+        let (_dir, mut app) = app_with_vault("option-delete-japanese");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "日本語の文章");
+
+        send(&mut app, Message::DeleteWordForward);
+
+        assert_eq!(app.content.text(), "本語の文章");
+    }
+
+    /// 打鍵から binding を経て `update()` まで、本番と同じ経路で `Option+Delete` を押す。
+    fn press_option_delete(app: &mut App) {
+        let Some(text_editor::Binding::Custom(message)) =
+            editor_key_binding(option_delete(Some("\u{7f}")))
+        else {
+            panic!("Option+Delete が Custom メッセージにならない");
+        };
+        send(app, message);
+    }
+
+    /// **直前の `Delete` とは別の undo ステップになり、戻したらカーソルも押した位置へ戻ること。**
+    /// 単語の選択を undo へ積んだ後に行うと、戻したときにカーソルが単語の後ろへ行く（issue 01 と同じ）。
+    #[test]
+    fn option_delete_is_its_own_undo_step() {
+        use iced::advanced::text::editor::{Action, Edit};
+
+        let (_dir, mut app) = app_with_vault("option-delete-undo");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "Xfoo bar");
+
+        send(&mut app, Message::Edit(Action::Edit(Edit::Delete)));
+        let before = app.content.cursor();
+        press_option_delete(&mut app);
+        assert_eq!(app.content.text(), " bar");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "foo bar", "Delete の分まで一緒に戻った");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
+    }
+
+    /// **直前の `Option+⌫` とも別の undo ステップになること。** 前後の単語削除は別のまとまり
+    /// （素の `⌫` と `Delete` が別なのと同じ）。
+    #[test]
+    fn option_delete_is_separate_from_option_backspace_in_undo() {
+        let (_dir, mut app) = app_with_vault("option-delete-undo-backward");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo bar baz");
+        put_cursor_at(&mut app, 0, "foo bar".len());
+
+        press_option_backspace(&mut app);
+        assert_eq!(app.content.text(), "foo  baz", "前提: Option+⌫ の結果がずれている");
+        press_option_delete(&mut app);
+        assert_eq!(app.content.text(), "foo ");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "foo  baz", "Option+⌫ の分まで一緒に戻った");
+    }
+
+    /// **`Option+Delete` の連打は 1 回の `Cmd+Z` で戻り、カーソルも押した位置へ戻ること。**
+    /// 日本語は 1 文字ずつ消えるので、押した回数だけ戻させると使えない。
+    #[test]
+    fn repeated_option_delete_undoes_at_once() {
+        let (_dir, mut app) = app_with_vault("option-delete-undo-run");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "日本語の文章");
+        put_cursor_at(&mut app, 0, "日本".len());
+        let before = app.content.cursor();
+
+        for _ in 0..3 {
+            press_option_delete(&mut app);
+        }
+        assert_eq!(app.content.text(), "日本章", "前提: 連打の結果がずれている");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "日本語の文章", "連打の分がまとめて戻っていない");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
+    }
+
+    /// **文書末尾では本文も dirty も undo も変えないこと。** 立てると無編集なのに「編集中」になり、
+    /// 空の undo ステップが 1 つ積まれる。
+    #[test]
+    fn option_delete_does_nothing_at_the_end_of_the_document() {
+        use iced::advanced::text::editor::{Action, Motion};
+
+        let (_dir, mut app) = app_with_vault("option-delete-doc-end");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo\nbar");
+        app.content.perform(Action::Move(Motion::DocumentEnd));
+        app.dirty_since = None;
+
+        send(&mut app, Message::DeleteWordForward);
+
+        assert_eq!(app.content.text(), "foo\nbar");
+        assert!(!is_dirty(&app), "文書末尾で dirty が立った");
+        assert!(app.undo.is_empty(), "文書末尾で undo が積まれた");
+    }
+
+    /// 矢印キーの打鍵を組み立てる。macOS の実機は矢印に `text` を載せないので `None`。
+    fn arrow_press(
+        k: keyboard::key::Named,
+        modifiers: keyboard::Modifiers,
+    ) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key: named(k),
+            modified_key: named(k),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers,
+            text: None,
+            status: text_editor::Status::Focused { is_hovered: false },
+        }
+    }
+
+    /// **`Cmd+↑/↓` で文書の先頭・末尾へ移動すること。** 既定は `Move(Up/Down)` を返すので、
+    /// 補わないと 1 行しか動かない（issue 02）。
+    ///
+    /// `text` は実機の `None` に加えて、想定外の `Some("")` でも同じ答えになることを見る。
+    #[test]
+    fn cmd_up_down_moves_to_the_document_edges() {
+        use iced::advanced::text::editor::Motion;
+        use keyboard::key::Named;
+
+        for (k, motion) in [
+            (Named::ArrowUp, Motion::DocumentStart),
+            (Named::ArrowDown, Motion::DocumentEnd),
+        ] {
+            for text in [None, Some("")] {
+                let mut kp = arrow_press(k, keyboard::Modifiers::COMMAND);
+                kp.text = text.map(Into::into);
+                let binding = editor_key_binding(kp);
+                assert!(
+                    matches!(binding, Some(text_editor::Binding::Move(m)) if m == motion),
+                    "Cmd+{k:?}（text: {text:?}）が {motion:?} にならない: {binding:?}",
+                );
+            }
+        }
+    }
+
+    /// **`Shift+Cmd+↑/↓` で文書の先頭・末尾まで選択すること。**
+    #[test]
+    fn shift_cmd_up_down_selects_to_the_document_edges() {
+        use iced::advanced::text::editor::Motion;
+        use keyboard::key::Named;
+
+        for (k, motion) in [
+            (Named::ArrowUp, Motion::DocumentStart),
+            (Named::ArrowDown, Motion::DocumentEnd),
+        ] {
+            let binding = editor_key_binding(arrow_press(
+                k,
+                keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+            ));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Select(m)) if m == motion),
+                "Shift+Cmd+{k:?} が {motion:?} の選択にならない: {binding:?}",
+            );
+        }
+    }
+
+    /// `Cmd+←/→` の行頭・行末は変わらないこと（既定が `Home/End` を返している）。
+    #[test]
+    fn cmd_left_right_still_move_to_the_line_edges() {
+        use iced::advanced::text::editor::Motion;
+        use keyboard::key::Named;
+
+        for (k, motion) in [
+            (Named::ArrowLeft, Motion::Home),
+            (Named::ArrowRight, Motion::End),
+        ] {
+            let binding = editor_key_binding(arrow_press(k, keyboard::Modifiers::COMMAND));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Move(m)) if m == motion),
+                "Cmd+{k:?} が {motion:?} にならない: {binding:?}",
+            );
+        }
+    }
+
+    /// **修飾キーは完全一致で見ること。** `Cmd+Option+↑/↓` は拾わず、既定（`Move(Up/Down)`）に任せる。
+    #[test]
+    fn cmd_option_up_down_is_left_to_the_default() {
+        use iced::advanced::text::editor::Motion;
+        use keyboard::key::Named;
+
+        for (k, motion) in [
+            (Named::ArrowUp, Motion::Up),
+            (Named::ArrowDown, Motion::Down),
+        ] {
+            let binding = editor_key_binding(arrow_press(
+                k,
+                keyboard::Modifiers::COMMAND | keyboard::Modifiers::ALT,
+            ));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Move(m)) if m == motion),
+                "Cmd+Option+{k:?} を既定以外で拾っている: {binding:?}",
+            );
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット表示中に裏の本文のカーソルが飛ぶ）。
+    #[test]
+    fn cmd_up_down_does_nothing_while_the_editor_is_unfocused() {
+        use keyboard::key::Named;
+
+        for k in [Named::ArrowUp, Named::ArrowDown] {
+            let mut kp = arrow_press(k, keyboard::Modifiers::COMMAND);
+            kp.status = text_editor::Status::Active;
+            assert!(
+                editor_key_binding(kp).is_none(),
+                "フォーカスの無いエディタが Cmd+{k:?} に反応している"
+            );
+        }
+    }
+
+    /// `Tab` の打鍵を組み立てる。macOS の実機は `Tab` に `"\t"`、`Shift+Tab` に `"\u{19}"` を載せる。
+    fn tab_press(modifiers: keyboard::Modifiers, text: Option<&str>) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key: named(keyboard::key::Named::Tab),
+            modified_key: named(keyboard::key::Named::Tab),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers,
+            text: text.map(Into::into),
+            status: text_editor::Status::Focused { is_hovered: false },
+        }
+    }
+
+    /// **`Tab` / `Shift+Tab` は `update()` へ回すこと。** 既定は制御文字の `text` を捨てて
+    /// `None` を返すので、補わないと何も起きない（issue 03）。
+    #[test]
+    fn tab_and_shift_tab_are_handled_by_the_update_loop() {
+        for text in [Some("\t"), None] {
+            let binding = editor_key_binding(tab_press(keyboard::Modifiers::empty(), text));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Custom(Message::Indent))),
+                "Tab（text: {text:?}）がインデントにならない: {binding:?}",
+            );
+        }
+        for text in [Some("\u{19}"), None] {
+            let binding = editor_key_binding(tab_press(keyboard::Modifiers::SHIFT, text));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Custom(Message::Unindent))),
+                "Shift+Tab（text: {text:?}）がアウトデントにならない: {binding:?}",
+            );
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット表示中に裏の本文がずれる）。
+    #[test]
+    fn tab_does_nothing_while_the_editor_is_unfocused() {
+        for (modifiers, control) in [
+            (keyboard::Modifiers::empty(), "\t"),
+            (keyboard::Modifiers::SHIFT, "\u{19}"),
+        ] {
+            for text in [Some(control), None] {
+                let mut kp = tab_press(modifiers, text);
+                kp.status = text_editor::Status::Active;
+                assert!(
+                    editor_key_binding(kp).is_none(),
+                    "フォーカスの無いエディタが {modifiers:?}+Tab（text: {text:?}）に反応している",
+                );
+            }
+        }
+    }
+
+    /// 打鍵から binding を経て `update()` まで、本番と同じ経路で `Tab` / `Shift+Tab` を押す。
+    fn press_tab(app: &mut App, modifiers: keyboard::Modifiers) {
+        let Some(text_editor::Binding::Custom(message)) =
+            editor_key_binding(tab_press(modifiers, None))
+        else {
+            panic!("{modifiers:?}+Tab が Custom メッセージにならない");
+        };
+        send(app, message);
+    }
+
+    /// **`- item|` で `Tab` → `  - item|`、`Shift+Tab` で戻ること。** カーソル行だけに効き、
+    /// カーソルは文字に対して同じ位置に残る。効果は本文とカーソルで見る（ADR-0016 の教訓）。
+    #[test]
+    fn tab_indents_the_line_and_shift_tab_unindents_it() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("tab-indent");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "見出し\n- item");
+        put_cursor_at(&mut app, 1, "- item".len());
+
+        press_tab(&mut app, keyboard::Modifiers::empty());
+
+        assert_eq!(app.content.text(), "見出し\n  - item", "行頭にインデントが入っていない");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 8 });
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+
+        press_tab(&mut app, keyboard::Modifiers::SHIFT);
+
+        assert_eq!(app.content.text(), "見出し\n- item", "インデントが戻っていない");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 6 });
+    }
+
+    /// **カーソルが行の途中にあっても行頭に入ること**（行頭固定）。列はバイト位置なので、
+    /// 日本語の途中でも 2 バイトずれた位置へ戻る。
+    #[test]
+    fn tab_indents_at_the_line_start_wherever_the_cursor_is() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("tab-indent-mid-line");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "- 項目");
+        put_cursor_at(&mut app, 0, "- 項".len());
+
+        press_tab(&mut app, keyboard::Modifiers::empty());
+
+        assert_eq!(app.content.text(), "  - 項目");
+        assert_eq!(
+            app.content.cursor().position,
+            Position { line: 0, column: "  - 項".len() },
+            "カーソルが元の文字の後ろへ戻っていない",
+        );
+    }
+
+    /// **戻すものが無い行の `Shift+Tab` は本文を変えず、dirty も立てず、undo も積まないこと。**
+    /// dirty が立つと無編集で自動保存が走って mtime が動く（`Ctrl+K` の行末と同じ約束）。
+    #[test]
+    fn shift_tab_does_nothing_without_leading_spaces() {
+        let (_dir, mut app) = app_with_vault("shift-tab-nothing");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "- item");
+        put_cursor_at(&mut app, 0, "- item".len());
+        app.dirty_since = None;
+
+        press_tab(&mut app, keyboard::Modifiers::SHIFT);
+
+        assert_eq!(app.content.text(), "- item");
+        assert!(!is_dirty(&app), "戻すものが無いのに dirty が立った");
+        assert!(app.undo.is_empty(), "戻すものが無いのに undo が積まれた");
+    }
+
+    /// 行頭のスペースが 1 つしか無ければ 1 つだけ消すこと。
+    #[test]
+    fn shift_tab_removes_a_single_leading_space() {
+        let (_dir, mut app) = app_with_vault("shift-tab-single-space");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, " - item");
+        put_cursor_at(&mut app, 0, " - item".len());
+
+        press_tab(&mut app, keyboard::Modifiers::SHIFT);
+
+        assert_eq!(app.content.text(), "- item");
+    }
+
+    /// **日本語の行でもカーソルが文字に対して同じ位置へ戻ること。** 列はバイト位置なので、
+    /// 「項」の後ろ（バイト 7）は消した 2 つぶん手前のバイト 5 になる。
+    #[test]
+    fn shift_tab_keeps_the_cursor_after_the_same_character() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("shift-tab-japanese-cursor");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "  - 項目");
+        put_cursor_at(&mut app, 0, "  - 項".len());
+
+        press_tab(&mut app, keyboard::Modifiers::SHIFT);
+
+        assert_eq!(app.content.text(), "- 項目");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: 5 });
+    }
+
+    /// **右書き（RTL）の行でも行頭のスペースだけを消し、前の行と繋がらないこと。**
+    ///
+    /// cosmic-text の `Motion::Right` は画面の向きなので、RTL の行では手前（`Previous`）へ動く。
+    /// 列 0 から `Select(Right)` で選ぶと前の行末まで選び、改行が消えて行が繋がった（レビューで再現）。
+    #[test]
+    fn shift_tab_on_a_right_to_left_line_removes_only_the_leading_space() {
+        let (_dir, mut app) = app_with_vault("shift-tab-rtl");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "abc\n مرحبا");
+        put_cursor_at(&mut app, 1, " مرحبا".len());
+
+        press_tab(&mut app, keyboard::Modifiers::SHIFT);
+
+        assert_eq!(app.content.text(), "abc\nمرحبا", "行頭のスペース以外が消えた");
+    }
+
+    /// **カーソルがインデントの中にあっても落ちず、行頭に止まること。** 列を引き算で戻すので、
+    /// 消した数より手前にいると桁あふれする。
+    #[test]
+    fn shift_tab_with_the_cursor_inside_the_indent_stops_at_the_line_start() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("shift-tab-cursor-in-indent");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "  - item");
+        put_cursor_at(&mut app, 0, 1);
+
+        press_tab(&mut app, keyboard::Modifiers::SHIFT);
+
+        assert_eq!(app.content.text(), "- item");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: 0 });
+    }
+
+    /// **`Tab` の連打は 1 回の `Cmd+Z` で戻り、カーソルも押した位置へ戻ること。**
+    ///
+    /// undo へは行頭へ動かす**前に**積む。後で積むと、戻したカーソルが行頭へ行く（issue 01 と同じ）。
+    #[test]
+    fn repeated_tab_undoes_at_once_back_to_the_cursor() {
+        let (_dir, mut app) = app_with_vault("tab-undo");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "- item");
+        put_cursor_at(&mut app, 0, "- it".len());
+        let before = app.content.cursor();
+
+        press_tab(&mut app, keyboard::Modifiers::empty());
+        press_tab(&mut app, keyboard::Modifiers::empty());
+        assert_eq!(app.content.text(), "    - item", "前提: 2 段入っていない");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "- item", "連打の分がまとめて戻っていない");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
+    }
+
+    /// `Shift+Cmd+K` の打鍵を組み立てる。macOS の実機は Shift が効いて `key` も `text` も
+    /// 大文字の `"K"` になる（winit が `charactersIgnoringModifiers` を論理キーにするため）。
+    fn shift_cmd_k(c: &str, text: Option<&str>) -> text_editor::KeyPress {
+        press(c, keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT, text)
+    }
+
+    /// **`Shift+Cmd+K` は `update()` へ回すこと。** 既定は `text` から `Insert('K')` を返し、
+    /// ⌘ 付きなので捨てられる（ADR-0010）。補わないと何も起きない（issue 04）。
+    #[test]
+    fn shift_cmd_k_is_handled_by_the_update_loop() {
+        for c in ["K", "k"] {
+            for text in [Some("K"), None] {
+                let binding = editor_key_binding(shift_cmd_k(c, text));
+                assert!(
+                    matches!(binding, Some(text_editor::Binding::Custom(Message::DeleteLine))),
+                    "Shift+Cmd+{c}（text: {text:?}）が行削除にならない: {binding:?}",
+                );
+            }
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット表示中に見ていない本文から行が消える）。
+    #[test]
+    fn shift_cmd_k_does_nothing_while_the_editor_is_unfocused() {
+        for c in ["K", "k"] {
+            for text in [Some("K"), None] {
+                let mut kp = shift_cmd_k(c, text);
+                kp.status = text_editor::Status::Active;
+                assert!(
+                    editor_key_binding(kp).is_none(),
+                    "フォーカスの無いエディタが Shift+Cmd+{c}（text: {text:?}）に反応している",
+                );
+            }
+        }
+    }
+
+    /// 打鍵から binding を経て `update()` まで、本番と同じ経路で `Shift+Cmd+K` を押す。
+    fn press_shift_cmd_k(app: &mut App) {
+        let Some(text_editor::Binding::Custom(message)) =
+            editor_key_binding(shift_cmd_k("K", Some("K")))
+        else {
+            panic!("Shift+Cmd+K が Custom メッセージにならない");
+        };
+        send(app, message);
+    }
+
+    /// **`a\nb|c\nd` で押すと `a\nd` になり、カーソルは `d` の行頭へ行くこと。**
+    /// 効果は本文とカーソルで見る（ADR-0016 の教訓）。
+    #[test]
+    fn shift_cmd_k_deletes_the_cursor_line_with_its_newline() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("delete-line");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "a\nbc\nd");
+        put_cursor_at(&mut app, 1, 1);
+
+        press_shift_cmd_k(&mut app);
+
+        assert_eq!(app.content.text(), "a\nd", "カーソル行が消えていない");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 0 });
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+    }
+
+    /// **最終行で押すと手前の改行ごと消え、カーソルは前の行の末尾へ行くこと。** 列はバイト位置
+    /// なので、日本語の行の末尾は文字数ではなくバイト数になる。
+    #[test]
+    fn shift_cmd_k_on_the_last_line_deletes_the_preceding_newline() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("delete-line-last");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "一行目\n二行目");
+        put_cursor_at(&mut app, 1, "二".len());
+
+        press_shift_cmd_k(&mut app);
+
+        assert_eq!(app.content.text(), "一行目", "最終行が改行ごと消えていない");
+        assert_eq!(
+            app.content.cursor().position,
+            Position { line: 0, column: "一行目".len() },
+            "カーソルが前の行の末尾にない",
+        );
+    }
+
+    /// **選択が 2 行にまたがるときは両方の行を消すこと。**
+    #[test]
+    fn shift_cmd_k_deletes_every_line_the_selection_touches() {
+        use iced::advanced::text::editor::{Cursor, Position};
+
+        let (_dir, mut app) = app_with_vault("delete-line-selection");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "a\nbc\nde\nf");
+        app.content.move_to(Cursor {
+            position: Position { line: 2, column: 1 },
+            selection: Some(Position { line: 1, column: 1 }),
+        });
+
+        press_shift_cmd_k(&mut app);
+
+        assert_eq!(app.content.text(), "a\nf", "選択にかかる行が全部消えていない");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 0 });
+    }
+
+    /// 空行で押すと改行だけ消える（1 行減る）。
+    #[test]
+    fn shift_cmd_k_on_an_empty_line_deletes_just_the_newline() {
+        let (_dir, mut app) = app_with_vault("delete-line-empty-line");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "a\n\nb");
+        put_cursor_at(&mut app, 1, 0);
+
+        press_shift_cmd_k(&mut app);
+
+        assert_eq!(app.content.text(), "a\nb");
+    }
+
+    /// 1 行だけの本文で押すと本文が空になり、カーソルは先頭に残る。
+    #[test]
+    fn shift_cmd_k_on_the_only_line_empties_the_note() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("delete-line-only");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "abc");
+        put_cursor_at(&mut app, 0, 1);
+
+        press_shift_cmd_k(&mut app);
+
+        assert_eq!(app.content.text(), "");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: 0 });
+    }
+
+    /// **本文が空のときは何もせず、dirty も立てず、undo も積まないこと。** dirty が立つと
+    /// 無編集で自動保存が走って mtime が動く（`Ctrl+K` の行末と同じ約束）。
+    #[test]
+    fn shift_cmd_k_does_nothing_on_an_empty_note() {
+        let (_dir, mut app) = app_with_vault("delete-line-empty-note");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "");
+        app.dirty_since = None;
+
+        press_shift_cmd_k(&mut app);
+
+        assert_eq!(app.content.text(), "");
+        assert!(!is_dirty(&app), "空の本文で dirty が立った");
+        assert!(app.undo.is_empty(), "空の本文で undo が積まれた");
+    }
+
+    /// **`Shift+Cmd+K` の連打は 1 回の `Cmd+Z` で戻り、カーソルも押した位置へ戻ること。**
+    ///
+    /// undo へは選択を張る**前に**積む。後で積むと、戻したカーソルが選択の端へ行く（issue 01 と同じ）。
+    #[test]
+    fn repeated_shift_cmd_k_undoes_at_once_back_to_the_cursor() {
+        let (_dir, mut app) = app_with_vault("delete-line-undo");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "a\nbc\nd\ne");
+        put_cursor_at(&mut app, 1, 1);
+        let before = app.content.cursor();
+
+        press_shift_cmd_k(&mut app);
+        press_shift_cmd_k(&mut app);
+        assert_eq!(app.content.text(), "a\ne", "前提: 2 行消えていない");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "a\nbc\nd\ne", "連打の分がまとめて戻っていない");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
+    }
+
+    /// `Enter` の打鍵を組み立てる。macOS の実機は `Enter` に `"\r"` を載せる。
+    fn enter_press(modifiers: keyboard::Modifiers, text: Option<&str>) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key: named(keyboard::key::Named::Enter),
+            modified_key: named(keyboard::key::Named::Enter),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers,
+            text: text.map(Into::into),
+            status: text_editor::Status::Focused { is_hovered: false },
+        }
+    }
+
+    /// **修飾なしの `Enter` は `update()` へ回すこと。** 既定は `Binding::Enter`（素の改行）を返すので、
+    /// 既定より先に拾わないとリスト記号を継げない（issue 05）。
+    #[test]
+    fn enter_is_handled_by_the_update_loop() {
+        for text in [Some("\r"), None] {
+            let binding = editor_key_binding(enter_press(keyboard::Modifiers::empty(), text));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Custom(Message::NewlineInList))),
+                "Enter（text: {text:?}）がリスト継続にならない: {binding:?}",
+            );
+        }
+    }
+
+    /// **`Shift+Enter` は既定の素の改行のままであること**（リストを継がない抜け道）。
+    #[test]
+    fn shift_enter_stays_a_plain_newline() {
+        for text in [Some("\r"), None] {
+            let binding = editor_key_binding(enter_press(keyboard::Modifiers::SHIFT, text));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Enter)),
+                "Shift+Enter（text: {text:?}）が素の改行でない: {binding:?}",
+            );
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット表示中に裏の本文へ改行が入る）。
+    #[test]
+    fn enter_does_nothing_while_the_editor_is_unfocused() {
+        for text in [Some("\r"), None] {
+            let mut kp = enter_press(keyboard::Modifiers::empty(), text);
+            kp.status = text_editor::Status::Active;
+            assert!(
+                editor_key_binding(kp).is_none(),
+                "フォーカスの無いエディタが Enter（text: {text:?}）に反応している",
+            );
+        }
+    }
+
+    /// 打鍵から binding を経て `update()` まで、本番と同じ経路で `Enter` を押す。
+    fn press_enter(app: &mut App) {
+        let Some(text_editor::Binding::Custom(message)) =
+            editor_key_binding(enter_press(keyboard::Modifiers::empty(), Some("\r")))
+        else {
+            panic!("Enter が Custom メッセージにならない");
+        };
+        send(app, message);
+    }
+
+    /// `text` を本文にして、`line` 行目の `column` バイト目で `Enter` を押す。
+    fn enter_at(name: &str, text: &str, line: usize, column: usize) -> (TempDir, App) {
+        let (dir, mut app) = app_with_vault(name);
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, text);
+        put_cursor_at(&mut app, line, column);
+        press_enter(&mut app);
+        (dir, app)
+    }
+
+    /// 接頭辞の読み取り。記号・番号・チェックボックス・インデントと、リストではない行。
+    #[test]
+    fn list_prefix_reads_markdown_list_markers() {
+        for (line, expected) in [
+            ("- a", Some((2, "- "))),
+            ("* a", Some((2, "* "))),
+            ("+ a", Some((2, "+ "))),
+            ("9. a", Some((3, "10. "))),
+            ("- [ ] a", Some((6, "- [ ] "))),
+            ("- [x] a", Some((6, "- [ ] "))),
+            ("- [X] a", Some((6, "- [ ] "))),
+            ("  1. [ ] a", Some((9, "  2. [ ] "))),
+            ("- ", Some((2, "- "))),
+            ("-a", None),
+            ("1.a", None),
+            (". a", None),
+            ("本文", None),
+            ("", None),
+            ("99999999999999999999. a", None),
+        ] {
+            assert_eq!(
+                list_prefix(line),
+                expected.map(|(len, next)| (len, next.to_string())),
+                "{line:?} の接頭辞",
+            );
+        }
+    }
+
+    /// **`- foo|` で `Enter` → `- foo\n- |`。** 効果は本文とカーソルで見る（ADR-0016 の教訓）。
+    #[test]
+    fn enter_continues_a_bullet_list() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = enter_at("enter-bullet", "- foo", 0, "- foo".len());
+
+        assert_eq!(app.content.text(), "- foo\n- ", "記号が継がれていない");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 2 });
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+    }
+
+    /// **`1. foo|` で `Enter` → `1. foo\n2. |`**（直前の番号 + 1）。
+    #[test]
+    fn enter_increments_an_ordered_list_number() {
+        let (_dir, app) = enter_at("enter-ordered", "1. foo", 0, "1. foo".len());
+
+        assert_eq!(app.content.text(), "1. foo\n2. ");
+    }
+
+    /// **`- [ ] foo|` で `Enter` → `- [ ] foo\n- [ ] |`。**
+    #[test]
+    fn enter_continues_a_task_list() {
+        let (_dir, app) = enter_at("enter-task", "- [ ] foo", 0, "- [ ] foo".len());
+
+        assert_eq!(app.content.text(), "- [ ] foo\n- [ ] ");
+    }
+
+    /// **記号だけの行（`- |`）で `Enter` → 記号を消して空行にする**（リストを抜ける）。
+    #[test]
+    fn enter_on_a_bare_marker_leaves_the_list() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = enter_at("enter-leave", "- foo\n- ", 1, "- ".len());
+
+        assert_eq!(app.content.text(), "- foo\n", "記号が消えていない");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 0 });
+    }
+
+    /// **インデントを引き継ぐこと。** `Edit::Enter` は改行 1 文字しか入れないので自前で貼る。
+    #[test]
+    fn enter_carries_the_indent_over() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = enter_at("enter-indent", "  - foo", 0, "  - foo".len());
+
+        assert_eq!(app.content.text(), "  - foo\n  - ");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 4 });
+    }
+
+    /// **日本語の項目でも継ぐこと。** 列はバイト位置なので、行末は文字数ではなくバイト数。
+    #[test]
+    fn enter_continues_a_japanese_list_item() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = enter_at("enter-japanese", "- 項目", 0, "- 項目".len());
+
+        assert_eq!(app.content.text(), "- 項目\n- ");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 2 });
+    }
+
+    /// **行の途中で押すと、残りは新しい項目の本文になること**（`- foo|bar` → `- foo\n- |bar`）。
+    #[test]
+    fn enter_mid_item_moves_the_rest_into_the_new_item() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = enter_at("enter-mid-item", "- foobar", 0, "- foo".len());
+
+        assert_eq!(app.content.text(), "- foo\n- bar");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 2 });
+    }
+
+    /// **リストでない行では今までどおりの素の改行。**
+    #[test]
+    fn enter_on_a_plain_line_is_a_plain_newline() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = enter_at("enter-plain", "本文", 0, "本文".len());
+
+        assert_eq!(app.content.text(), "本文\n");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 0 });
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+    }
+
+    /// **カーソルが記号の途中にあるときは素の改行。** 記号を割って継ぐと `-\n- foo` のように壊れる。
+    #[test]
+    fn enter_inside_the_marker_is_a_plain_newline() {
+        let (_dir, app) = enter_at("enter-in-marker", "- foo", 0, 1);
+
+        assert_eq!(app.content.text(), "-\n foo");
+    }
+
+    /// **選択があるときは選択を改行に置き換えるだけ**（既定の挙動のまま）。
+    #[test]
+    fn enter_with_a_selection_replaces_it_with_a_plain_newline() {
+        use iced::advanced::text::editor::{Cursor, Position};
+
+        let (_dir, mut app) = app_with_vault("enter-selection");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "- foo bar");
+        app.content.move_to(Cursor {
+            position: Position { line: 0, column: "- foo".len() },
+            selection: Some(Position { line: 0, column: 2 }),
+        });
+
+        press_enter(&mut app);
+
+        assert_eq!(app.content.text(), "- \n bar");
+    }
+
+    /// **1 回の `Cmd+Z` で改行と記号がまとめて戻り、カーソルも押した位置へ戻ること。**
+    ///
+    /// `Message::Edit` を 2 回通すと `Enter` と `Paste` の 2 ステップに割れ、記号だけが消える。
+    #[test]
+    fn enter_in_a_list_undoes_the_newline_and_marker_at_once() {
+        let (_dir, mut app) = app_with_vault("enter-undo");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "- foo");
+        put_cursor_at(&mut app, 0, "- foo".len());
+        let before = app.content.cursor();
+
+        press_enter(&mut app);
+        assert_eq!(app.content.text(), "- foo\n- ", "前提: 記号が継がれていない");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "- foo", "改行と記号がまとめて戻っていない");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
+    }
+
+    /// 打鍵から binding を経て `update()` まで、本番と同じ経路で `Cmd+Enter`（`Shift` 付きなら
+    /// `Shift+Cmd+Enter`）を押す。
+    fn press_cmd_enter(app: &mut App, modifiers: keyboard::Modifiers) {
+        let Some(text_editor::Binding::Custom(message)) =
+            editor_key_binding(enter_press(modifiers, Some("\r")))
+        else {
+            panic!("{modifiers:?}+Enter が Custom メッセージにならない");
+        };
+        send(app, message);
+    }
+
+    /// `text` を本文にして、`line` 行目の `column` バイト目で `Cmd+Enter` / `Shift+Cmd+Enter` を押す。
+    fn cmd_enter_at(
+        name: &str,
+        text: &str,
+        line: usize,
+        column: usize,
+        modifiers: keyboard::Modifiers,
+    ) -> (TempDir, App) {
+        let (dir, mut app) = app_with_vault(name);
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, text);
+        put_cursor_at(&mut app, line, column);
+        press_cmd_enter(&mut app, modifiers);
+        (dir, app)
+    }
+
+    /// **`Cmd+Enter` / `Shift+Cmd+Enter` は `update()` へ回すこと。** 既定は修飾を見ずに
+    /// `Binding::Enter`（カーソル位置で行を割る）を返すので、既定より先に拾う（issue 08）。
+    #[test]
+    fn cmd_enter_and_shift_cmd_enter_are_handled_by_the_update_loop() {
+        for text in [Some("\r"), None] {
+            let below = editor_key_binding(enter_press(keyboard::Modifiers::COMMAND, text));
+            assert!(
+                matches!(below, Some(text_editor::Binding::Custom(Message::InsertLineBelow))),
+                "Cmd+Enter（text: {text:?}）が下への行挿入にならない: {below:?}",
+            );
+            let above = editor_key_binding(enter_press(
+                keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+                text,
+            ));
+            assert!(
+                matches!(above, Some(text_editor::Binding::Custom(Message::InsertLineAbove))),
+                "Shift+Cmd+Enter（text: {text:?}）が上への行挿入にならない: {above:?}",
+            );
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット表示中に裏の本文へ行が入る）。
+    #[test]
+    fn cmd_enter_does_nothing_while_the_editor_is_unfocused() {
+        for modifiers in [
+            keyboard::Modifiers::COMMAND,
+            keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+        ] {
+            for text in [Some("\r"), None] {
+                let mut kp = enter_press(modifiers, text);
+                kp.status = text_editor::Status::Active;
+                assert!(
+                    editor_key_binding(kp).is_none(),
+                    "フォーカスの無いエディタが {modifiers:?}+Enter（text: {text:?}）に反応している",
+                );
+            }
+        }
+    }
+
+    /// **`fo|o` で `Cmd+Enter` → `foo\n|`。** 行を割らずに下へ空行を作り、そこへ移る。
+    #[test]
+    fn cmd_enter_inserts_a_line_below() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) =
+            cmd_enter_at("cmd-enter-below", "foo", 0, "fo".len(), keyboard::Modifiers::COMMAND);
+
+        assert_eq!(app.content.text(), "foo\n", "行が割れたか、下に行が入っていない");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 0 });
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+    }
+
+    /// **`fo|o` で `Shift+Cmd+Enter` → `|\nfoo`。** 上へ空行を作り、そこへ移る。
+    #[test]
+    fn shift_cmd_enter_inserts_a_line_above() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = cmd_enter_at(
+            "cmd-enter-above",
+            "foo",
+            0,
+            "fo".len(),
+            keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+        );
+
+        assert_eq!(app.content.text(), "\nfoo", "行が割れたか、上に行が入っていない");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: 0 });
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+    }
+
+    /// **2 行目以降・日本語の行でも、押した行の真下・真上に入ること。** 行末は文字数ではなく
+    /// バイト数（`fo|o` の 1 行だけでは、行番号と列のずれが表に出ない）。
+    #[test]
+    fn cmd_enter_inserts_around_a_later_japanese_line() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, below) = cmd_enter_at(
+            "cmd-enter-japanese-below",
+            "a\n日本語\nb",
+            1,
+            "日本".len(),
+            keyboard::Modifiers::COMMAND,
+        );
+        assert_eq!(below.content.text(), "a\n日本語\n\nb");
+        assert_eq!(below.content.cursor().position, Position { line: 2, column: 0 });
+
+        let (_dir, above) = cmd_enter_at(
+            "cmd-enter-japanese-above",
+            "a\n日本語\nb",
+            1,
+            "日本".len(),
+            keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+        );
+        assert_eq!(above.content.text(), "a\n\n日本語\nb");
+        assert_eq!(above.content.cursor().position, Position { line: 1, column: 0 });
+    }
+
+    /// **リスト行でも `Cmd+Enter` は記号を継がない素の改行**（`- foo|` → `- foo\n|`）。
+    /// issue 05 の binding は修飾なしの `Enter` だけを拾う。
+    #[test]
+    fn cmd_enter_does_not_continue_a_list() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = cmd_enter_at(
+            "cmd-enter-list",
+            "- foo",
+            0,
+            "- foo".len(),
+            keyboard::Modifiers::COMMAND,
+        );
+
+        assert_eq!(app.content.text(), "- foo\n", "記号が継がれている");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 0 });
+    }
+
+    /// **選択があっても選択した文字は消えず、下に行が入ること。** `Edit::Enter` は選択を
+    /// 置き換えるので、先に選択を解いておかないと選んだ文字が改行に化ける。
+    #[test]
+    fn cmd_enter_with_a_selection_keeps_the_selected_text() {
+        use iced::advanced::text::editor::{Cursor, Position};
+
+        let (_dir, mut app) = app_with_vault("cmd-enter-selection");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo bar");
+        app.content.move_to(Cursor {
+            position: Position { line: 0, column: "foo".len() },
+            selection: Some(Position { line: 0, column: 0 }),
+        });
+
+        press_cmd_enter(&mut app, keyboard::Modifiers::COMMAND);
+
+        assert_eq!(app.content.text(), "foo bar\n", "選択した文字が消えた");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: 0 });
+    }
+
+    /// **1 回の `Cmd+Z` で戻り、カーソル（選択込み）も押した位置へ戻ること。** undo は
+    /// カーソルを動かす前に積む。
+    #[test]
+    fn cmd_enter_undoes_in_one_step() {
+        use iced::advanced::text::editor::{Cursor, Position};
+
+        for modifiers in [
+            keyboard::Modifiers::COMMAND,
+            keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+        ] {
+            let (_dir, mut app) = app_with_vault("cmd-enter-undo");
+            send(&mut app, Message::NoteSelected(0));
+            replace_content(&mut app, "foo bar");
+            app.content.move_to(Cursor {
+                position: Position { line: 0, column: "foo".len() },
+                selection: Some(Position { line: 0, column: 1 }),
+            });
+            let before = app.content.cursor();
+
+            press_cmd_enter(&mut app, modifiers);
+            assert_ne!(app.content.text(), "foo bar", "前提: {modifiers:?}+Enter で行が入っていない");
+
+            send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+            assert_eq!(app.content.text(), "foo bar", "{modifiers:?}+Enter が 1 回で戻らない");
+            assert_eq!(
+                app.content.cursor(),
+                before,
+                "{modifiers:?}+Enter: カーソルが押した位置へ戻っていない",
+            );
+        }
+    }
+
+    /// **`Cmd+B` / `Cmd+I` は `update()` へ回すこと。** 既定は `text` から `Insert('b')` を返し、
+    /// ⌘ 付きなので捨てられる（ADR-0010）。補わないと何も起きない（issue 06）。
+    #[test]
+    fn cmd_b_and_cmd_i_are_handled_by_the_update_loop() {
+        for (c, marker) in [("b", "**"), ("i", "*")] {
+            for text in [Some(c), None] {
+                let binding = editor_key_binding(press(c, keyboard::Modifiers::COMMAND, text));
+                assert!(
+                    matches!(binding, Some(text_editor::Binding::Custom(Message::Wrap(m))) if m == marker),
+                    "Cmd+{c}（text: {text:?}）が {marker:?} で囲む操作にならない: {binding:?}",
+                );
+            }
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット・リネーム中に見ていない本文へ記号が入る）。
+    #[test]
+    fn cmd_b_and_cmd_i_do_nothing_while_the_editor_is_unfocused() {
+        for c in ["b", "i"] {
+            for text in [Some(c), None] {
+                let mut kp = press(c, keyboard::Modifiers::COMMAND, text);
+                kp.status = text_editor::Status::Active;
+                assert!(
+                    editor_key_binding(kp).is_none(),
+                    "フォーカスの無いエディタが Cmd+{c}（text: {text:?}）に反応している",
+                );
+            }
+        }
+    }
+
+    /// 打鍵から binding を経て `update()` まで、本番と同じ経路で `Cmd+<c>` を押す。
+    fn press_cmd(app: &mut App, c: &str) {
+        let Some(text_editor::Binding::Custom(message)) =
+            editor_key_binding(key_press(c, keyboard::Modifiers::COMMAND))
+        else {
+            panic!("Cmd+{c} が Custom メッセージにならない");
+        };
+        send(app, message);
+    }
+
+    /// `text` を本文にして、`anchor` から `head`（どちらも `(行, バイト位置)`）までを選ぶ。
+    fn note_with_selection(
+        name: &str,
+        text: &str,
+        anchor: (usize, usize),
+        head: (usize, usize),
+    ) -> (TempDir, App) {
+        use iced::advanced::text::editor::{Cursor, Position};
+
+        let (dir, mut app) = app_with_vault(name);
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, text);
+        app.content.move_to(Cursor {
+            position: Position { line: head.0, column: head.1 },
+            selection: Some(Position { line: anchor.0, column: anchor.1 }),
+        });
+        (dir, app)
+    }
+
+    /// **`foo [bar] baz` で `Cmd+B` → `foo **bar** baz`、`**bar**` は選ばれたまま。もう一度で戻る。**
+    /// 選択が残らないと 2 回目は `****` の挿入になり、「もう一度押すと戻る」が成立しない。
+    #[test]
+    fn cmd_b_toggles_bold_around_the_selection() {
+        let (_dir, mut app) = note_with_selection("wrap-bold", "foo bar baz", (0, 4), (0, 7));
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), "foo **bar** baz", "選択が太字で囲まれていない");
+        assert_eq!(app.content.selection().as_deref(), Some("**bar**"), "囲んだ結果が選ばれていない");
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), "foo bar baz", "もう一度押しても太字が外れない");
+        assert_eq!(app.content.selection().as_deref(), Some("bar"));
+    }
+
+    /// **選択なしで `Cmd+B` → `**|**`（カーソルが記号の中）。**
+    #[test]
+    fn cmd_b_without_a_selection_puts_the_cursor_between_the_markers() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("wrap-bold-empty");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "");
+
+        press_cmd(&mut app, "b");
+
+        assert_eq!(app.content.text(), "****");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: 2 });
+    }
+
+    /// **`Cmd+I` は `*` 版。** 囲んで選び直し、もう一度で外す。
+    #[test]
+    fn cmd_i_toggles_italics_around_the_selection() {
+        let (_dir, mut app) = note_with_selection("wrap-italic", "foo bar baz", (0, 4), (0, 7));
+
+        press_cmd(&mut app, "i");
+        assert_eq!(app.content.text(), "foo *bar* baz", "選択が斜体で囲まれていない");
+        assert_eq!(app.content.selection().as_deref(), Some("*bar*"));
+
+        press_cmd(&mut app, "i");
+        assert_eq!(app.content.text(), "foo bar baz", "もう一度押しても斜体が外れない");
+        assert_eq!(app.content.selection().as_deref(), Some("bar"));
+    }
+
+    /// 選択なしで `Cmd+I` → `*|*`。
+    #[test]
+    fn cmd_i_without_a_selection_puts_the_cursor_between_the_markers() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("wrap-italic-empty");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo");
+        put_cursor_at(&mut app, 0, 3);
+
+        press_cmd(&mut app, "i");
+
+        assert_eq!(app.content.text(), "foo**");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: 4 });
+    }
+
+    /// **太字の選択 `**bar**` に `Cmd+I` → `***bar***`。** `*` で始まって終わるが、剥がすと
+    /// `*bar*` になって太字が斜体に化ける。`**` で始まるときは剥がさず重ねる（Obsidian と同じ）。
+    #[test]
+    fn cmd_i_on_a_bold_selection_adds_italics() {
+        let (_dir, mut app) =
+            note_with_selection("wrap-bold-italic", "foo **bar** baz", (0, 4), (0, 11));
+
+        press_cmd(&mut app, "i");
+
+        assert_eq!(app.content.text(), "foo ***bar*** baz");
+        assert_eq!(app.content.selection().as_deref(), Some("***bar***"));
+    }
+
+    /// **複数行の選択も同じ式で囲み、選び直し、外せること。** 選択は後ろから前へ張る
+    /// （カーソルが先頭側）ので、先頭を `position` と `selection` の小さい方で取れているかも見る。
+    #[test]
+    fn cmd_b_toggles_bold_around_a_multiline_selection() {
+        let (_dir, mut app) = note_with_selection("wrap-multiline", "ab\ncd\nef", (2, 1), (0, 1));
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), "a**b\ncd\ne**f", "複数行の選択が囲まれていない");
+        assert_eq!(app.content.selection().as_deref(), Some("**b\ncd\ne**"));
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), "ab\ncd\nef", "もう一度押しても太字が外れない");
+    }
+
+    /// **日本語の選択（`[晴れ]`）を囲み、外せること。** 列はバイト位置。
+    #[test]
+    fn cmd_b_toggles_bold_around_japanese_text() {
+        let text = "今日は晴れ";
+        let (_dir, mut app) =
+            note_with_selection("wrap-japanese", text, (0, "今日は".len()), (0, text.len()));
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), "今日は**晴れ**", "日本語の選択が囲まれていない");
+        assert_eq!(app.content.selection().as_deref(), Some("**晴れ**"));
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), text, "もう一度押しても太字が外れない");
+    }
+
+    /// **ダブルクリックで選んだ単語でも、囲んだ結果が選ばれ、もう一度で戻ること。** 単語選択の
+    /// `cursor()` は両端ともクリックした位置を指すので、そこから選び直すと `*bar**` が選ばれる。
+    #[test]
+    fn cmd_b_toggles_bold_around_a_double_clicked_word() {
+        use iced::advanced::text::editor::Action;
+
+        let (_dir, mut app) = app_with_vault("wrap-word");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo bar baz");
+        put_cursor_at(&mut app, 0, 5);
+        app.content.perform(Action::SelectWord);
+        assert_eq!(app.content.selection().as_deref(), Some("bar"), "前提: 単語が選ばれていない");
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), "foo **bar** baz");
+        assert_eq!(app.content.selection().as_deref(), Some("**bar**"), "囲んだ結果が選ばれていない");
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), "foo bar baz", "もう一度押しても太字が外れない");
+    }
+
+    /// **1 回の `Cmd+Z` で囲む前に戻り、選択も元どおりになること。**
+    #[test]
+    fn cmd_b_undoes_in_one_step() {
+        let (_dir, mut app) = note_with_selection("wrap-undo", "foo bar baz", (0, 4), (0, 7));
+        let before = app.content.cursor();
+
+        press_cmd(&mut app, "b");
+        assert_eq!(app.content.text(), "foo **bar** baz", "前提: 囲まれていない");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "foo bar baz", "1 回の Cmd+Z で戻っていない");
+        assert_eq!(app.content.cursor(), before, "選択が囲む前へ戻っていない");
+    }
+
+    /// **`Cmd+K` は `update()` へ回すこと。** 既定は `text` から `Insert('k')` を返し、
+    /// ⌘ 付きなので捨てられる（ADR-0010）。補わないと何も起きない（issue 14）。
+    #[test]
+    fn cmd_k_is_handled_by_the_update_loop() {
+        for c in ["k", "K"] {
+            for text in [Some("k"), None] {
+                let binding = editor_key_binding(press(c, keyboard::Modifiers::COMMAND, text));
+                assert!(
+                    matches!(binding, Some(text_editor::Binding::Custom(Message::WrapLink))),
+                    "Cmd+{c}（text: {text:?}）がリンクの挿入にならない: {binding:?}",
+                );
+            }
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット・リネーム中に見ていない本文へ `[]()` が入る）。
+    #[test]
+    fn cmd_k_does_nothing_while_the_editor_is_unfocused() {
+        for text in [Some("k"), None] {
+            let mut kp = press("k", keyboard::Modifiers::COMMAND, text);
+            kp.status = text_editor::Status::Active;
+            assert!(
+                editor_key_binding(kp).is_none(),
+                "フォーカスの無いエディタが Cmd+K（text: {text:?}）に反応している",
+            );
+        }
+    }
+
+    /// **`see [here]` で `Cmd+K` → `see [here](|)`（カーソルが括弧の中、選択なし）。**
+    #[test]
+    fn cmd_k_wraps_the_selection_in_a_link() {
+        use iced::advanced::text::editor::{Cursor, Position};
+
+        let (_dir, mut app) = note_with_selection("link", "see here", (0, 4), (0, 8));
+
+        press_cmd(&mut app, "k");
+
+        assert_eq!(app.content.text(), "see [here]()", "選択がリンクになっていない");
+        assert_eq!(
+            app.content.cursor(),
+            Cursor { position: Position { line: 0, column: "see [here](".len() }, selection: None },
+            "カーソルが括弧の中にない",
+        );
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+    }
+
+    /// **選択なしで `Cmd+K` → `[|]()`（カーソルが角括弧の中）。**
+    #[test]
+    fn cmd_k_without_a_selection_puts_the_cursor_between_the_brackets() {
+        use iced::advanced::text::editor::{Cursor, Position};
+
+        let (_dir, mut app) = app_with_vault("link-empty");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "");
+
+        press_cmd(&mut app, "k");
+
+        assert_eq!(app.content.text(), "[]()");
+        assert_eq!(
+            app.content.cursor(),
+            Cursor { position: Position { line: 0, column: 1 }, selection: None },
+        );
+    }
+
+    /// **ダブルクリックで選んだ単語でも、カーソルが括弧の中へ行くこと。** 単語選択の `cursor()` は
+    /// 両端ともクリックした位置を指すので、貼る前の選択から位置を出すとずれる（issue 06）。
+    #[test]
+    fn cmd_k_wraps_a_double_clicked_word() {
+        use iced::advanced::text::editor::{Action, Position};
+
+        let (_dir, mut app) = app_with_vault("link-word");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo bar baz");
+        put_cursor_at(&mut app, 0, 5);
+        app.content.perform(Action::SelectWord);
+        assert_eq!(app.content.selection().as_deref(), Some("bar"), "前提: 単語が選ばれていない");
+
+        press_cmd(&mut app, "k");
+
+        assert_eq!(app.content.text(), "foo [bar]() baz");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "foo [bar](".len() });
+        assert_eq!(app.content.selection(), None, "選択が残っている");
+    }
+
+    /// **日本語の選択（`[晴れ]`）もリンクにでき、カーソルが括弧の中へ行くこと。** 列はバイト位置。
+    #[test]
+    fn cmd_k_wraps_japanese_text() {
+        use iced::advanced::text::editor::Position;
+
+        let text = "今日は晴れ";
+        let (_dir, mut app) =
+            note_with_selection("link-japanese", text, (0, "今日は".len()), (0, text.len()));
+
+        press_cmd(&mut app, "k");
+
+        assert_eq!(app.content.text(), "今日は[晴れ]()", "日本語の選択がリンクになっていない");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "今日は[晴れ](".len() });
+    }
+
+    /// **複数行の選択でも `)` は最終行にあるので、同じ式で括弧の中へ行くこと。** 選択は後ろから
+    /// 前へ張る（カーソルが先頭側）。
+    #[test]
+    fn cmd_k_wraps_a_multiline_selection() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = note_with_selection("link-multiline", "ab\ncd\nef", (2, 1), (0, 1));
+
+        press_cmd(&mut app, "k");
+
+        assert_eq!(app.content.text(), "a[b\ncd\ne]()f", "複数行の選択がリンクになっていない");
+        assert_eq!(app.content.cursor().position, Position { line: 2, column: "e](".len() });
+    }
+
+    /// **1 回の `Cmd+Z` でリンクにする前に戻り、選択も元どおりになること。**
+    #[test]
+    fn cmd_k_undoes_in_one_step() {
+        let (_dir, mut app) = note_with_selection("link-undo", "see here", (0, 4), (0, 8));
+        let before = app.content.cursor();
+
+        press_cmd(&mut app, "k");
+        assert_eq!(app.content.text(), "see [here]()", "前提: リンクになっていない");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "see here", "1 回の Cmd+Z で戻っていない");
+        assert_eq!(app.content.cursor(), before, "選択がリンクにする前へ戻っていない");
+    }
+
+    /// **`Cmd+D` は単語選択、`Cmd+L` は行選択になること。** 既定は `text` から `Insert('d')` を返し、
+    /// ⌘ 付きなので捨てられる（ADR-0010）。補わないと何も起きない（issue 09）。
+    #[test]
+    fn cmd_d_and_cmd_l_select_the_word_and_the_line() {
+        for c in ["d", "l"] {
+            for text in [Some(c), None] {
+                let binding = editor_key_binding(press(c, keyboard::Modifiers::COMMAND, text));
+                let selects = match c {
+                    "d" => matches!(binding, Some(text_editor::Binding::SelectWord)),
+                    _ => matches!(binding, Some(text_editor::Binding::SelectLine)),
+                };
+                assert!(selects, "Cmd+{c}（text: {text:?}）が選択にならない: {binding:?}");
+            }
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット・リネーム中に裏の本文の選択が動く）。
+    #[test]
+    fn cmd_d_and_cmd_l_do_nothing_while_the_editor_is_unfocused() {
+        for c in ["d", "l"] {
+            for text in [Some(c), None] {
+                let mut kp = press(c, keyboard::Modifiers::COMMAND, text);
+                kp.status = text_editor::Status::Active;
+                assert!(
+                    editor_key_binding(kp).is_none(),
+                    "フォーカスの無いエディタが Cmd+{c}（text: {text:?}）に反応している",
+                );
+            }
+        }
+    }
+
+    /// **`日本語のメ|モを書く` で `Cmd+D` → `メモ` が選ばれ、本文も dirty も変わらないこと。**
+    /// 選んだ範囲がそのまま `Cmd+C` でコピーされる（コピー自体は iced の既定）。列はバイト位置。
+    #[test]
+    fn cmd_d_selects_the_word_under_the_cursor() {
+        use iced::advanced::text::editor::Action;
+
+        let (_dir, mut app) = app_with_vault("select-word");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "見出し\n日本語のメモを書く\n末尾");
+        put_cursor_at(&mut app, 1, "日本語のメ".len());
+
+        send(&mut app, Message::Edit(Action::SelectWord));
+
+        assert_eq!(app.content.selection().as_deref(), Some("メモ"), "カーソル位置の単語が選ばれていない");
+        assert_eq!(app.content.text(), "見出し\n日本語のメモを書く\n末尾", "選択で本文が変わった");
+        assert!(!is_dirty(&app), "選んだだけで dirty が立った");
+    }
+
+    /// **`日本語の|メモを書く` で `Cmd+L` → その行だけが（改行を含まず）選ばれること。**
+    #[test]
+    fn cmd_l_selects_the_cursor_line() {
+        use iced::advanced::text::editor::Action;
+
+        let (_dir, mut app) = app_with_vault("select-line");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "見出し\n日本語のメモを書く\n末尾");
+        put_cursor_at(&mut app, 1, "日本語の".len());
+
+        send(&mut app, Message::Edit(Action::SelectLine));
+
+        assert_eq!(app.content.selection().as_deref(), Some("日本語のメモを書く"), "カーソル行が選ばれていない");
+        assert_eq!(app.content.text(), "見出し\n日本語のメモを書く\n末尾", "選択で本文が変わった");
+        assert!(!is_dirty(&app), "選んだだけで dirty が立った");
+    }
+
+    /// **`Cmd+1`〜`Cmd+6` は `update()` へ回すこと。** 既定は `text` から `Insert('1')` を返し、
+    /// ⌘ 付きなので捨てられる（ADR-0010）。補わないと何も起きない（issue 15）。`Cmd+0` / `Cmd+7` は
+    /// 見出しではないので、今までどおり捨てる。
+    #[test]
+    fn cmd_1_to_6_are_handled_by_the_update_loop() {
+        for (c, level) in [("1", 1), ("2", 2), ("3", 3), ("4", 4), ("5", 5), ("6", 6)] {
+            for text in [Some(c), None] {
+                let binding = editor_key_binding(press(c, keyboard::Modifiers::COMMAND, text));
+                assert!(
+                    matches!(binding, Some(text_editor::Binding::Custom(Message::SetHeading(n))) if n == level),
+                    "Cmd+{c}（text: {text:?}）が見出しにならない: {binding:?}",
+                );
+            }
+        }
+        for c in ["0", "7"] {
+            assert!(
+                editor_key_binding(key_press(c, keyboard::Modifiers::COMMAND)).is_none(),
+                "Cmd+{c} を拾っている",
+            );
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット・リネーム中に見ていない本文へ `#` が入る）。
+    #[test]
+    fn cmd_1_to_6_do_nothing_while_the_editor_is_unfocused() {
+        for c in ["1", "6"] {
+            for text in [Some(c), None] {
+                let mut kp = press(c, keyboard::Modifiers::COMMAND, text);
+                kp.status = text_editor::Status::Active;
+                assert!(
+                    editor_key_binding(kp).is_none(),
+                    "フォーカスの無いエディタが Cmd+{c}（text: {text:?}）に反応している",
+                );
+            }
+        }
+    }
+
+    /// **`foo|` で `Cmd+2` → `## foo|`、`Cmd+3` → `### foo|`、もう一度 `Cmd+3` → `foo|`。**
+    /// 既に見出しなら `#` の数を置き換え、同じレベルなら外す。カーソルは文字に対して同じ位置に残る。
+    #[test]
+    fn cmd_number_sets_replaces_and_removes_the_heading() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("heading");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo");
+        put_cursor_at(&mut app, 0, "foo".len());
+
+        press_cmd(&mut app, "2");
+        assert_eq!(app.content.text(), "## foo", "見出しになっていない");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "## foo".len() });
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+
+        press_cmd(&mut app, "3");
+        assert_eq!(app.content.text(), "### foo", "見出しのレベルが置き換わっていない");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "### foo".len() });
+
+        press_cmd(&mut app, "3");
+        assert_eq!(app.content.text(), "foo", "同じレベルをもう一度押しても見出しが外れない");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "foo".len() });
+    }
+
+    /// **カーソルが接頭辞の中にあっても落ちず、新しい接頭辞の直後に止まること。** 列を引き算で
+    /// 戻すので、古い接頭辞より手前にいると桁あふれする。
+    #[test]
+    fn cmd_number_with_the_cursor_inside_the_prefix_stops_after_the_new_prefix() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("heading-cursor-in-prefix");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "### foo");
+        put_cursor_at(&mut app, 0, 1);
+
+        press_cmd(&mut app, "1");
+
+        assert_eq!(app.content.text(), "# foo");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "# ".len() });
+    }
+
+    /// **日本語の行でもカーソルが文字に対して同じ位置へ戻ること。** 列はバイト位置。
+    #[test]
+    fn cmd_number_keeps_the_cursor_after_the_same_japanese_character() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("heading-japanese");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "# 日本語の見出し");
+        put_cursor_at(&mut app, 0, "# 日本語".len());
+
+        press_cmd(&mut app, "2");
+
+        assert_eq!(app.content.text(), "## 日本語の見出し", "日本語の行の見出しが置き換わっていない");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "## 日本語".len() });
+    }
+
+    /// **`#` の後ろに半角スペースが無い行・`#` が 7 つ以上の行は見出しではないこと。**
+    /// 接頭辞なしとして扱い、行頭へ新しい接頭辞を足す（消さない）。
+    #[test]
+    fn cmd_number_treats_hashes_without_a_space_as_text() {
+        let (_dir, mut app) = app_with_vault("heading-not-a-heading");
+        send(&mut app, Message::NoteSelected(0));
+
+        for (before, after) in [("#foo", "# #foo"), ("####### foo", "# ####### foo")] {
+            replace_content(&mut app, before);
+            put_cursor_at(&mut app, 0, before.len());
+
+            press_cmd(&mut app, "1");
+
+            assert_eq!(app.content.text(), after, "{before:?} を見出しとして扱った");
+        }
+    }
+
+    /// **カーソル行だけに効き、他の行は変わらないこと。**
+    #[test]
+    fn cmd_number_applies_to_the_cursor_line_only() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, mut app) = app_with_vault("heading-second-line");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "# 一行目\nfoo\n三行目");
+        put_cursor_at(&mut app, 1, "fo".len());
+
+        press_cmd(&mut app, "1");
+
+        assert_eq!(app.content.text(), "# 一行目\n# foo\n三行目", "カーソル行以外が変わった");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: "# fo".len() });
+    }
+
+    /// **連打は 1 回の `Cmd+Z` で戻り、カーソルも押した位置へ戻ること。**
+    ///
+    /// undo へは行頭へ動かす**前に**積む。後で積むと、戻したカーソルが行頭へ行く（issue 03 と同じ）。
+    #[test]
+    fn repeated_cmd_number_undoes_at_once_back_to_the_cursor() {
+        let (_dir, mut app) = app_with_vault("heading-undo");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo");
+        put_cursor_at(&mut app, 0, "fo".len());
+        let before = app.content.cursor();
+
+        press_cmd(&mut app, "1");
+        press_cmd(&mut app, "2");
+        assert_eq!(app.content.text(), "## foo", "前提: 見出しになっていない");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "foo", "連打の分がまとめて戻っていない");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
+    }
+
+    /// 打鍵から binding を経て `update()` まで、本番と同じ経路で `Ctrl+O` を押す。実機の `text` は
+    /// 制御文字 `"\u{f}"`。
+    fn press_ctrl_o(app: &mut App) {
+        let Some(text_editor::Binding::Custom(message)) =
+            editor_key_binding(ctrl_press("o", Some("\u{f}")))
+        else {
+            panic!("Ctrl+O が Custom メッセージにならない");
+        };
+        send(app, message);
+    }
+
+    /// `text` を本文にして、`line` 行目の `column` バイト目で `Ctrl+O` を押す。
+    fn ctrl_o_at(name: &str, text: &str, line: usize, column: usize) -> (TempDir, App) {
+        let (dir, mut app) = app_with_vault(name);
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, text);
+        put_cursor_at(&mut app, line, column);
+        press_ctrl_o(&mut app);
+        (dir, app)
+    }
+
+    /// **`Ctrl+O` は `update()` へ回すこと。** 既定は `text`（macOS では `"\u{f}"`）が制御文字なので
+    /// `None` を返す（issue 17）。`Sequence[Enter, Move(Left)]` にしないのは、`Motion::Left` が画面方向で
+    /// RTL 行では逆へ動くため。
+    #[test]
+    fn ctrl_o_is_handled_by_the_update_loop() {
+        for text in [Some("\u{f}"), None] {
+            let binding = editor_key_binding(ctrl_press("o", text));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Custom(Message::OpenLine))),
+                "Ctrl+O（text: {text:?}）が行を開く操作にならない: {binding:?}",
+            );
+        }
+    }
+
+    /// **`Ctrl+Shift+O` は何もしないこと。** 移動系ではないので shift 版の意味を定義していない
+    /// （ADR-0023）。
+    #[test]
+    fn ctrl_shift_o_stays_undefined() {
+        for text in [Some("\u{f}"), None] {
+            let binding = editor_key_binding(ctrl_shift_press("o", text));
+            assert!(binding.is_none(), "Ctrl+Shift+O（text: {text:?}）が拾われている: {binding:?}");
+        }
+    }
+
+    /// **`fo|o` で `Ctrl+O` → `fo|\no`。** 改行を入れ、カーソルは改行の手前に残る。
+    #[test]
+    fn ctrl_o_inserts_a_newline_and_keeps_the_cursor() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = ctrl_o_at("ctrl-o", "foo", 0, "fo".len());
+
+        assert_eq!(app.content.text(), "fo\no", "カーソル位置に改行が入っていない");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "fo".len() });
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+    }
+
+    /// **2 行目以降・日本語の行でも、押した位置に改行が入りカーソルが残ること。** 列はバイト位置。
+    #[test]
+    fn ctrl_o_keeps_the_cursor_on_a_later_japanese_line() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = ctrl_o_at("ctrl-o-japanese", "a\n日本語\nb", 1, "日本".len());
+
+        assert_eq!(app.content.text(), "a\n日本\n語\nb");
+        assert_eq!(app.content.cursor().position, Position { line: 1, column: "日本".len() });
+    }
+
+    /// **RTL の行でもカーソルが改行の手前に残ること。** `Sequence[Enter, Move(Left)]` にしなかった
+    /// 理由の固定（`Motion::Left` は画面方向なので、RTL の行では改行の後ろ `(1, 1)` へ行く）。
+    #[test]
+    fn ctrl_o_keeps_the_cursor_on_an_rtl_line() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = ctrl_o_at("ctrl-o-rtl", "שלום עולם", 0, "שלום".len());
+
+        assert_eq!(app.content.text(), "שלום\n עולם");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "שלום".len() });
+    }
+
+    /// **リスト行でも `Ctrl+O` は記号を継がない素の改行**（`- foo|` → `- foo|\n`）。issue 05 の
+    /// `NewlineInList` を通らない。
+    #[test]
+    fn ctrl_o_does_not_continue_a_list() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = ctrl_o_at("ctrl-o-list", "- foo", 0, "- foo".len());
+
+        assert_eq!(app.content.text(), "- foo\n", "記号が継がれている");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "- foo".len() });
+    }
+
+    /// **選択があれば選択が改行に置き換わり、カーソルは改行の直前に残ること**（Cocoa の
+    /// `insertNewline` と同じ）。選択が複数行にまたがっても、向きが逆でも同じ。
+    #[test]
+    fn ctrl_o_replaces_the_selection_with_a_newline() {
+        use iced::advanced::text::editor::Position;
+
+        for (text, anchor, head, after, cursor) in [
+            ("foo bar", (0, 2), (0, 5), "fo\nar", (0, 2)),
+            ("foo bar", (0, 5), (0, 2), "fo\nar", (0, 2)),
+            ("一行目\n二行目", (0, "一".len()), (1, "二".len()), "一\n行目", (0, "一".len())),
+        ] {
+            let (_dir, mut app) = note_with_selection("ctrl-o-selection", text, anchor, head);
+
+            press_ctrl_o(&mut app);
+
+            assert_eq!(app.content.text(), after, "{text:?} の選択 {anchor:?}..{head:?} が改行にならない");
+            assert_eq!(
+                app.content.cursor().position,
+                Position { line: cursor.0, column: cursor.1 },
+                "{text:?} の選択 {anchor:?}..{head:?}: カーソルが改行の直前にない",
+            );
+        }
+    }
+
+    /// **1 回の `Cmd+Z` で戻り、カーソル（選択込み）も押した位置へ戻ること。** undo は改行を入れる
+    /// 前に積む。
+    #[test]
+    fn ctrl_o_undoes_in_one_step() {
+        let (_dir, mut app) = note_with_selection("ctrl-o-undo", "foo bar", (0, 1), (0, "foo".len()));
+        let before = app.content.cursor();
+
+        press_ctrl_o(&mut app);
+        assert_ne!(app.content.text(), "foo bar", "前提: Ctrl+O で改行が入っていない");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "foo bar", "Ctrl+O が 1 回で戻らない");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
+    }
+
+    /// 打鍵から binding を経て `update()` まで、本番と同じ経路で `Ctrl+T` を押す。実機の `text` は
+    /// 制御文字 `"\u{14}"`。
+    fn press_ctrl_t(app: &mut App) {
+        let Some(text_editor::Binding::Custom(message)) =
+            editor_key_binding(ctrl_press("t", Some("\u{14}")))
+        else {
+            panic!("Ctrl+T が Custom メッセージにならない");
+        };
+        send(app, message);
+    }
+
+    /// `text` を本文にして、`line` 行目の `column` バイト目で `Ctrl+T` を押す。
+    fn ctrl_t_at(name: &str, text: &str, line: usize, column: usize) -> (TempDir, App) {
+        let (dir, mut app) = app_with_vault(name);
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, text);
+        put_cursor_at(&mut app, line, column);
+        app.dirty_since = None;
+        press_ctrl_t(&mut app);
+        (dir, app)
+    }
+
+    /// **`Ctrl+T` は `update()` へ回すこと。** 既定は `text`（macOS では `"\u{14}"`）が制御文字なので
+    /// `None` を返す（issue 19）。
+    #[test]
+    fn ctrl_t_is_handled_by_the_update_loop() {
+        for text in [Some("\u{14}"), None] {
+            let binding = editor_key_binding(ctrl_press("t", text));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Custom(Message::Transpose))),
+                "Ctrl+T（text: {text:?}）が入れ替えの操作にならない: {binding:?}",
+            );
+        }
+    }
+
+    /// **`Ctrl+Shift+T` は何もしないこと。** 移動系ではないので shift 版の意味を定義していない
+    /// （ADR-0023）。
+    #[test]
+    fn ctrl_shift_t_stays_undefined() {
+        for text in [Some("\u{14}"), None] {
+            let binding = editor_key_binding(ctrl_shift_press("t", text));
+            assert!(binding.is_none(), "Ctrl+Shift+T（text: {text:?}）が拾われている: {binding:?}");
+        }
+    }
+
+    /// **`a|b` → `ba|`、行末の `ab|` → `ba|`。** 行の途中ではカーソル前後の 2 文字を入れ替えて 1 つ
+    /// 進め（Cocoa の `transpose:` と同じ）、行末では手前の 2 文字を入れ替えて行末に残る。列はバイト
+    /// 位置なので日本語でも割れないこと、2 行目以降でもその行だけに効くことも見る。
+    #[test]
+    fn ctrl_t_transposes_the_characters_around_the_cursor() {
+        use iced::advanced::text::editor::Position;
+
+        for (text, line, column, after, cursor) in [
+            ("ab", 0, "ab".len(), "ba", "ba".len()),
+            ("ab", 0, "a".len(), "ba", "ba".len()),
+            ("あい", 0, "あい".len(), "いあ", "いあ".len()),
+            ("あい", 0, "あ".len(), "いあ", "いあ".len()),
+            ("abc", 0, "a".len(), "bac", "ba".len()),
+            ("一行目\n日本語", 1, "日".len(), "一行目\n本日語", "本日".len()),
+        ] {
+            let (_dir, app) = ctrl_t_at("ctrl-t", text, line, column);
+
+            assert_eq!(app.content.text(), after, "{text:?} の ({line}, {column}) で入れ替わっていない");
+            assert_eq!(
+                app.content.cursor().position,
+                Position { line, column: cursor },
+                "{text:?} の ({line}, {column}): カーソルが入れ替えた 2 文字の後ろにない",
+            );
+            assert!(is_dirty(&app), "{text:?}: 編集したのに dirty が立っていない");
+        }
+    }
+
+    /// **RTL の行でも、バイト位置でカーソル前後の 2 文字が入れ替わること。** `Select(Left)` で選ばない理由の
+    /// 固定（`Motion::Left` は画面方向なので、RTL の行では後ろへ伸びる。issue 03）。
+    #[test]
+    fn ctrl_t_transposes_on_an_rtl_line() {
+        use iced::advanced::text::editor::Position;
+
+        let (_dir, app) = ctrl_t_at("ctrl-t-rtl", "שלום", 0, "שלו".len());
+
+        assert_eq!(app.content.text(), "שלםו");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "שלום".len() });
+    }
+
+    /// **入れ替える 2 文字が無い位置では本文を変えず、dirty も立てず、undo も積まないこと。** 行頭
+    /// （前の行の改行とは入れ替えない）・空行・1 文字の行・同じ 2 文字が並ぶ行末（入れ替えても本文が
+    /// 変わらない）。dirty が立つと無編集で自動保存が走って mtime が動く（`Ctrl+K` の行末と同じ約束）。
+    #[test]
+    fn ctrl_t_does_nothing_without_two_characters() {
+        use iced::advanced::text::editor::Position;
+
+        for (text, line, column) in [
+            ("ab", 0, 0),
+            ("ab\ncd", 1, 0),
+            ("", 0, 0),
+            ("a", 0, "a".len()),
+            ("あ", 0, "あ".len()),
+            ("aa", 0, "aa".len()),
+            ("ああ", 0, "ああ".len()),
+        ] {
+            let (_dir, app) = ctrl_t_at("ctrl-t-nothing", text, line, column);
+
+            assert_eq!(app.content.text(), text, "{text:?} の ({line}, {column}) で本文が変わった");
+            assert_eq!(app.content.cursor().position, Position { line, column }, "{text:?}: カーソルが動いた");
+            assert!(!is_dirty(&app), "{text:?} の ({line}, {column}): 入れ替えるものが無いのに dirty が立った");
+            assert!(app.undo.is_empty(), "{text:?} の ({line}, {column}): 入れ替えるものが無いのに undo が積まれた");
+        }
+    }
+
+    /// **選択があるときは何もしないこと。** 選択の中身を入れ替える意味は定義していない（issue 19）。
+    #[test]
+    fn ctrl_t_does_nothing_with_a_selection() {
+        let (_dir, mut app) = note_with_selection("ctrl-t-selection", "abc", (0, 0), (0, "ab".len()));
+        app.dirty_since = None;
+
+        press_ctrl_t(&mut app);
+
+        assert_eq!(app.content.text(), "abc", "選択があるのに本文が変わった");
+        assert_eq!(app.content.selection().as_deref(), Some("ab"), "選択が解けた");
+        assert!(!is_dirty(&app), "選択があるのに dirty が立った");
+        assert!(app.undo.is_empty(), "選択があるのに undo が積まれた");
+    }
+
+    /// **連打は 1 回の `Cmd+Z` で戻り、カーソルも押した位置へ戻ること。**
+    ///
+    /// undo へは選択を張る**前に**積む。後で積むと、戻したときに 2 文字が選ばれた状態になる。
+    #[test]
+    fn repeated_ctrl_t_undoes_at_once_back_to_the_cursor() {
+        let (_dir, mut app) = app_with_vault("ctrl-t-undo");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "abc");
+        put_cursor_at(&mut app, 0, "a".len());
+        let before = app.content.cursor();
+
+        press_ctrl_t(&mut app);
+        press_ctrl_t(&mut app);
+        assert_eq!(app.content.text(), "bca", "前提: 連打の結果がずれている");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+
+        assert_eq!(app.content.text(), "abc", "連打の分がまとめて戻っていない");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
+    }
+
+    /// **`Option+↑/↓` は `update()` へ回すこと。** 既定は `Move(Up/Down)` を返す（`jump()` の `widen()` が
+    /// `Up/Down` を変えない）ので、補わないと 1 行動くだけになる（issue 10）。
+    ///
+    /// `text` は実機の `None` に加えて、想定外の `Some("")` でも同じ答えになることを見る（issue 02 と同じ）。
+    #[test]
+    fn option_up_down_is_handled_by_the_update_loop() {
+        use keyboard::key::Named;
+
+        for (k, direction) in [(Named::ArrowUp, Vertical::Up), (Named::ArrowDown, Vertical::Down)] {
+            for text in [None, Some("")] {
+                let mut kp = arrow_press(k, keyboard::Modifiers::ALT);
+                kp.text = text.map(Into::into);
+                let binding = editor_key_binding(kp);
+                assert!(
+                    matches!(binding, Some(text_editor::Binding::Custom(Message::MoveLine(d))) if d == direction),
+                    "Option+{k:?}（text: {text:?}）が行移動にならない: {binding:?}",
+                );
+            }
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット表示中に見ていない本文の行が入れ替わる）。
+    #[test]
+    fn option_up_down_does_nothing_while_the_editor_is_unfocused() {
+        use keyboard::key::Named;
+
+        for k in [Named::ArrowUp, Named::ArrowDown] {
+            let mut kp = arrow_press(k, keyboard::Modifiers::ALT);
+            kp.status = text_editor::Status::Active;
+            assert!(
+                editor_key_binding(kp).is_none(),
+                "フォーカスの無いエディタが Option+{k:?} に反応している",
+            );
+        }
+    }
+
+    /// 打鍵から binding を経て `update()` まで、本番と同じ経路で `Option+↑/↓` を押す。
+    fn press_option_arrow(app: &mut App, k: keyboard::key::Named) {
+        let Some(text_editor::Binding::Custom(message)) =
+            editor_key_binding(arrow_press(k, keyboard::Modifiers::ALT))
+        else {
+            panic!("Option+{k:?} が Custom メッセージにならない");
+        };
+        send(app, message);
+    }
+
+    /// **`a\nb|\nc` で `Option+↑` → `b|\na\nc`、`Option+↓` で戻ること。** カーソルは行と一緒に動き、
+    /// 列は保つ。効果は本文とカーソルで見る（ADR-0016 の教訓）。
+    #[test]
+    fn option_up_down_swaps_the_cursor_line_with_the_neighbour() {
+        use iced::advanced::text::editor::{Cursor, Position};
+        use keyboard::key::Named;
+
+        let (_dir, mut app) = app_with_vault("move-line");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "a\nb\nc");
+        put_cursor_at(&mut app, 1, 1);
+
+        press_option_arrow(&mut app, Named::ArrowUp);
+        assert_eq!(app.content.text(), "b\na\nc", "カーソル行が上の行と入れ替わっていない");
+        assert_eq!(
+            app.content.cursor(),
+            Cursor { position: Position { line: 0, column: 1 }, selection: None },
+            "カーソルが行と一緒に動いていない",
+        );
+        assert!(is_dirty(&app), "編集したのに dirty が立っていない");
+
+        press_option_arrow(&mut app, Named::ArrowDown);
+        assert_eq!(app.content.text(), "a\nb\nc", "Option+↓ で元に戻らない");
+        assert_eq!(
+            app.content.cursor(),
+            Cursor { position: Position { line: 1, column: 1 }, selection: None },
+        );
+    }
+
+    /// **先頭行の `↑`・最終行の `↓` は何もせず、dirty も立てず、undo も積まないこと。** dirty が立つと
+    /// 無編集で自動保存が走って mtime が動く（`Ctrl+K` の行末と同じ約束）。
+    #[test]
+    fn option_up_on_the_first_line_and_down_on_the_last_line_do_nothing() {
+        use keyboard::key::Named;
+
+        let (_dir, mut app) = app_with_vault("move-line-edges");
+        send(&mut app, Message::NoteSelected(0));
+        for (line, k) in [(0, Named::ArrowUp), (2, Named::ArrowDown)] {
+            replace_content(&mut app, "a\nb\nc");
+            put_cursor_at(&mut app, line, 1);
+            let before = app.content.cursor();
+            app.dirty_since = None;
+
+            press_option_arrow(&mut app, k);
+
+            assert_eq!(app.content.text(), "a\nb\nc", "{line} 行目の Option+{k:?} で本文が変わった");
+            assert_eq!(app.content.cursor(), before, "{line} 行目の Option+{k:?} でカーソルが動いた");
+            assert!(!is_dirty(&app), "{line} 行目の Option+{k:?} で dirty が立った");
+            assert!(app.undo.is_empty(), "{line} 行目の Option+{k:?} で undo が積まれた");
+        }
+    }
+
+    /// **選択が 2 行にまたがるときは両方の行が動き、選択も行と一緒に動いて保たれること。**
+    /// 連打でブロックを運べる。
+    #[test]
+    fn option_up_down_moves_every_selected_line_with_the_selection() {
+        use iced::advanced::text::editor::{Cursor, Position};
+        use keyboard::key::Named;
+
+        let (_dir, mut app) = app_with_vault("move-line-selection");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "a\nbc\nde\nf");
+        app.content.move_to(Cursor {
+            position: Position { line: 2, column: 1 },
+            selection: Some(Position { line: 1, column: 1 }),
+        });
+
+        press_option_arrow(&mut app, Named::ArrowDown);
+        assert_eq!(app.content.text(), "a\nf\nbc\nde", "選択にかかる行がまとめて動いていない");
+        assert_eq!(
+            app.content.cursor(),
+            Cursor {
+                position: Position { line: 3, column: 1 },
+                selection: Some(Position { line: 2, column: 1 }),
+            },
+            "選択が行と一緒に動いていない",
+        );
+        assert_eq!(app.content.selection().as_deref(), Some("c\nd"), "選択の中身が変わった");
+
+        press_option_arrow(&mut app, Named::ArrowUp);
+        press_option_arrow(&mut app, Named::ArrowUp);
+        assert_eq!(app.content.text(), "bc\nde\na\nf", "選択を連打で運べていない");
+        assert_eq!(app.content.selection().as_deref(), Some("c\nd"), "選択の中身が変わった");
+    }
+
+    /// **日本語の行も 1 文字も欠けずに入れ替わり、カーソルは同じ文字の後ろに残ること。** 列はバイト位置。
+    #[test]
+    fn option_down_keeps_japanese_lines_intact() {
+        use iced::advanced::text::editor::Position;
+        use keyboard::key::Named;
+
+        let (_dir, mut app) = app_with_vault("move-line-japanese");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "一行目\n漢字の二行目\n三行目");
+        put_cursor_at(&mut app, 1, "漢字の".len());
+
+        press_option_arrow(&mut app, Named::ArrowDown);
+
+        assert_eq!(app.content.text(), "一行目\n三行目\n漢字の二行目", "日本語の行が入れ替わっていない");
+        assert_eq!(app.content.cursor().position, Position { line: 2, column: "漢字の".len() });
+    }
+
+    /// **連打は 1 回の押下ごとに 1 ステップで、`Cmd+Z` 1 回で 1 段ずつ戻ること。** カーソルもその段の
+    /// 位置へ戻る（`Shift+Cmd+K` などの「連打はまとめる」とは逆。issue 10 の受け入れ条件）。
+    #[test]
+    fn repeated_option_up_undoes_one_press_at_a_time() {
+        use iced::advanced::text::editor::{Cursor, Position};
+        use keyboard::key::Named;
+
+        let (_dir, mut app) = app_with_vault("move-line-undo");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "a\nb\nc");
+        put_cursor_at(&mut app, 2, 1);
+        let before = app.content.cursor();
+
+        press_option_arrow(&mut app, Named::ArrowUp);
+        press_option_arrow(&mut app, Named::ArrowUp);
+        assert_eq!(app.content.text(), "c\na\nb", "前提: 2 段運べていない");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+        assert_eq!(app.content.text(), "a\nc\nb", "1 回の Cmd+Z で 1 段だけ戻っていない");
+        assert_eq!(
+            app.content.cursor(),
+            Cursor { position: Position { line: 1, column: 1 }, selection: None },
+        );
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+        assert_eq!(app.content.text(), "a\nb\nc", "2 回目の Cmd+Z で元に戻っていない");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
+    }
+
+    /// **`Shift+Option+↑/↓` は `update()` へ回すこと。** 既定は `Select(Up/Down)`（1 行分の選択）を返す
+    /// ので、補わないと複製されずに選択が伸びるだけになる（issue 16）。修飾は完全一致。
+    ///
+    /// `text` は実機の `None` に加えて、想定外の `Some("")` でも同じ答えになることを見る（issue 02 と同じ）。
+    #[test]
+    fn shift_option_up_down_is_handled_by_the_update_loop() {
+        use keyboard::key::Named;
+
+        for (k, direction) in [(Named::ArrowUp, Vertical::Up), (Named::ArrowDown, Vertical::Down)] {
+            for text in [None, Some("")] {
+                let mut kp =
+                    arrow_press(k, keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT);
+                kp.text = text.map(Into::into);
+                let binding = editor_key_binding(kp);
+                assert!(
+                    matches!(binding, Some(text_editor::Binding::Custom(Message::DuplicateLine(d))) if d == direction),
+                    "Shift+Option+{k:?}（text: {text:?}）が行複製にならない: {binding:?}",
+                );
+            }
+        }
+    }
+
+    /// `Shift+↑/↓` の 1 行分の選択は変わらないこと（既定が `Select(Up/Down)` を返している）。
+    #[test]
+    fn shift_up_down_still_selects_one_line() {
+        use iced::advanced::text::editor::Motion;
+        use keyboard::key::Named;
+
+        for (k, motion) in [(Named::ArrowUp, Motion::Up), (Named::ArrowDown, Motion::Down)] {
+            let binding = editor_key_binding(arrow_press(k, keyboard::Modifiers::SHIFT));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Select(m)) if m == motion),
+                "Shift+{k:?} が {motion:?} の選択にならない: {binding:?}",
+            );
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット表示中に見ていない本文の行が増える）。
+    #[test]
+    fn shift_option_up_down_does_nothing_while_the_editor_is_unfocused() {
+        use keyboard::key::Named;
+
+        for k in [Named::ArrowUp, Named::ArrowDown] {
+            let mut kp = arrow_press(k, keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT);
+            kp.status = text_editor::Status::Active;
+            assert!(
+                editor_key_binding(kp).is_none(),
+                "フォーカスの無いエディタが Shift+Option+{k:?} に反応している",
+            );
+        }
+    }
+
+    /// 打鍵から binding を経て `update()` まで、本番と同じ経路で `Shift+Option+↑/↓` を押す。
+    fn press_shift_option_arrow(app: &mut App, k: keyboard::key::Named) {
+        let Some(text_editor::Binding::Custom(message)) = editor_key_binding(arrow_press(
+            k,
+            keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT,
+        )) else {
+            panic!("Shift+Option+{k:?} が Custom メッセージにならない");
+        };
+        send(app, message);
+    }
+
+    /// **`a|\nb` で `Shift+Option+↓` → `a\na|\nb`、`Shift+Option+↑` → `a|\na\nb` になること。** 本文は
+    /// どちらも同じで、カーソルは `↓` なら下の複製へ、`↑` なら元の行番号（上の複製）に残る。列は保つ。
+    #[test]
+    fn shift_option_up_down_duplicates_the_cursor_line() {
+        use iced::advanced::text::editor::{Cursor, Position};
+        use keyboard::key::Named;
+
+        let (_dir, mut app) = app_with_vault("duplicate-line");
+        send(&mut app, Message::NoteSelected(0));
+        for (k, line) in [(Named::ArrowDown, 1), (Named::ArrowUp, 0)] {
+            replace_content(&mut app, "a\nb");
+            put_cursor_at(&mut app, 0, 1);
+            app.dirty_since = None;
+
+            press_shift_option_arrow(&mut app, k);
+
+            assert_eq!(app.content.text(), "a\na\nb", "Shift+Option+{k:?} でカーソル行が複製されていない");
+            assert_eq!(
+                app.content.cursor(),
+                Cursor { position: Position { line, column: 1 }, selection: None },
+                "Shift+Option+{k:?} のカーソルの行き先が違う",
+            );
+            assert!(is_dirty(&app), "Shift+Option+{k:?} で編集したのに dirty が立っていない");
+        }
+    }
+
+    /// **選択が 2 行にまたがるときは両方の行をまとめて複製すること。** 選択は解けてよい（issue 16 の
+    /// 決定）。`↓` のカーソルは範囲の行数だけ下がる。
+    #[test]
+    fn shift_option_up_down_duplicates_every_selected_line() {
+        use iced::advanced::text::editor::{Cursor, Position};
+        use keyboard::key::Named;
+
+        let (_dir, mut app) = app_with_vault("duplicate-line-selection");
+        send(&mut app, Message::NoteSelected(0));
+        for (k, line) in [(Named::ArrowDown, 4), (Named::ArrowUp, 2)] {
+            replace_content(&mut app, "a\nbc\nde\nf");
+            app.content.move_to(Cursor {
+                position: Position { line: 2, column: 1 },
+                selection: Some(Position { line: 1, column: 1 }),
+            });
+
+            press_shift_option_arrow(&mut app, k);
+
+            assert_eq!(
+                app.content.text(),
+                "a\nbc\nde\nbc\nde\nf",
+                "Shift+Option+{k:?} で選択にかかる行がまとめて複製されていない",
+            );
+            assert_eq!(
+                app.content.cursor(),
+                Cursor { position: Position { line, column: 1 }, selection: None },
+                "Shift+Option+{k:?} のカーソルの行き先が違う",
+            );
+        }
+    }
+
+    /// **空行も複製すること（改行が 1 つ増える）。** 空のノートも同じ（VS Code と同じ）。
+    #[test]
+    fn shift_option_down_duplicates_an_empty_line() {
+        use iced::advanced::text::editor::Position;
+        use keyboard::key::Named;
+
+        let (_dir, mut app) = app_with_vault("duplicate-line-empty");
+        send(&mut app, Message::NoteSelected(0));
+        for (text, line, expected) in [("a\n\nb", 1, "a\n\n\nb"), ("", 0, "\n")] {
+            replace_content(&mut app, text);
+            put_cursor_at(&mut app, line, 0);
+
+            press_shift_option_arrow(&mut app, Named::ArrowDown);
+
+            assert_eq!(app.content.text(), expected, "{text:?} の空行が複製されていない");
+            assert_eq!(app.content.cursor().position, Position { line: line + 1, column: 0 });
+        }
+    }
+
+    /// **日本語の行も 1 文字も欠けずに複製され、カーソルは同じ文字の後ろに残ること。** 列はバイト位置。
+    #[test]
+    fn shift_option_down_keeps_japanese_lines_intact() {
+        use iced::advanced::text::editor::Position;
+        use keyboard::key::Named;
+
+        let (_dir, mut app) = app_with_vault("duplicate-line-japanese");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "一行目\n漢字の二行目\n三行目");
+        put_cursor_at(&mut app, 1, "漢字の".len());
+
+        press_shift_option_arrow(&mut app, Named::ArrowDown);
+
+        assert_eq!(
+            app.content.text(),
+            "一行目\n漢字の二行目\n漢字の二行目\n三行目",
+            "日本語の行が複製されていない",
+        );
+        assert_eq!(app.content.cursor().position, Position { line: 2, column: "漢字の".len() });
+    }
+
+    /// **連打は 1 回の押下ごとに 1 ステップで、`Cmd+Z` 1 回で 1 つずつ戻ること。** カーソルもその段の
+    /// 位置へ戻る（issue 10 と同じ。issue 16 の受け入れ条件）。
+    #[test]
+    fn repeated_shift_option_down_undoes_one_press_at_a_time() {
+        use iced::advanced::text::editor::{Cursor, Position};
+        use keyboard::key::Named;
+
+        let (_dir, mut app) = app_with_vault("duplicate-line-undo");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "a\nb");
+        put_cursor_at(&mut app, 0, 1);
+        let before = app.content.cursor();
+
+        press_shift_option_arrow(&mut app, Named::ArrowDown);
+        press_shift_option_arrow(&mut app, Named::ArrowDown);
+        assert_eq!(app.content.text(), "a\na\na\nb", "前提: 2 回複製できていない");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+        assert_eq!(app.content.text(), "a\na\nb", "1 回の Cmd+Z で 1 つだけ戻っていない");
+        assert_eq!(
+            app.content.cursor(),
+            Cursor { position: Position { line: 1, column: 1 }, selection: None },
+        );
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+        assert_eq!(app.content.text(), "a\nb", "2 回目の Cmd+Z で元に戻っていない");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
+    }
+
     /// **フォーカスが無いエディタでは Control 系を効かせないこと。**
     ///
     /// `key_binding` はフォーカスの有無に関わらず呼ばれる。パレットを開いている間に
@@ -4828,7 +7936,7 @@ mod tests {
     /// `Ctrl+D` に至っては、見ていない本文から 1 文字消える。
     #[test]
     fn control_keys_do_nothing_while_the_editor_is_unfocused() {
-        for c in ["a", "e", "n", "p", "d", "k"] {
+        for c in ["a", "e", "n", "p", "d", "k", "o", "t"] {
             let mut kp = ctrl_press(c, Some("\u{1}"));
             kp.status = text_editor::Status::Active;
             assert!(
@@ -4892,6 +8000,127 @@ mod tests {
             let binding = editor_key_binding(ctrl_shift_press(c, Some(&control.to_string())));
             assert!(binding.is_none(), "Ctrl+Shift+{c} が拾われている: {binding:?}");
         }
+    }
+
+    /// `Ctrl+Option` の打鍵を組み立てる（issue 18）。`shift` で `Ctrl+Option+Shift` にする。`text` は
+    /// `ctrl_press` と同じ理由で制御文字を使う（Option を足しても Ctrl 由来の制御文字が来る見込み。実機は未計測）。
+    fn ctrl_option_press(c: &str, shift: bool, text: Option<&str>) -> text_editor::KeyPress {
+        let mut modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT;
+        if shift {
+            modifiers |= keyboard::Modifiers::SHIFT;
+        }
+        press(c, modifiers, text)
+    }
+
+    /// **`Ctrl+Option+B` / `F` は単語単位で動き、`Shift` を足すと選択すること（issue 18）。**
+    ///
+    /// 既定は `text`（macOS では `"\u{2}"`）が制御文字なので `None` を返し、後ろで補う（ADR-0016）。
+    /// **`key` は大文字も受ける。** macOS の winit は Ctrl 付きのとき Shift の効いた文字を `key` に
+    /// するので、`Ctrl+Option+Shift+B` の実機は `"B"` になる。
+    #[test]
+    fn macos_control_option_keys_move_and_select_by_word() {
+        use iced::advanced::text::editor::Motion;
+
+        let expected = [
+            ("b", '\u{2}', Motion::WordLeft),
+            ("f", '\u{6}', Motion::WordRight),
+        ];
+
+        for (c, control, motion) in expected {
+            for key in [c.to_string(), c.to_ascii_uppercase()] {
+                for text in [Some(control.to_string()), None] {
+                    let binding =
+                        editor_key_binding(ctrl_option_press(&key, false, text.as_deref()));
+                    assert!(
+                        matches!(binding, Some(text_editor::Binding::Move(m)) if m == motion),
+                        "Ctrl+Option+{key}（text: {text:?}）が {motion:?} にならない: {binding:?}",
+                    );
+                    let binding =
+                        editor_key_binding(ctrl_option_press(&key, true, text.as_deref()));
+                    assert!(
+                        matches!(binding, Some(text_editor::Binding::Select(m)) if m == motion),
+                        "Ctrl+Option+Shift+{key}（text: {text:?}）が {motion:?} の選択にならない: {binding:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// **`Ctrl+Option` は `b` / `f` 以外を拾わず、他の修飾が乗っても拾わないこと（issue 18）。**
+    ///
+    /// `Ctrl+Option+A` を行頭移動にしたり、`Ctrl+Option+D` で本文を消したりしない。修飾は完全一致で、
+    /// `Cmd+Ctrl+Option+B` は拾わない。
+    #[test]
+    fn control_option_bindings_cover_only_b_and_f() {
+        for (c, control) in [
+            ("a", '\u{1}'),
+            ("e", '\u{5}'),
+            ("n", '\u{e}'),
+            ("p", '\u{10}'),
+            ("d", '\u{4}'),
+            ("k", '\u{b}'),
+            ("o", '\u{f}'),
+        ] {
+            for shift in [false, true] {
+                for text in [Some(control.to_string()), None] {
+                    let binding = editor_key_binding(ctrl_option_press(c, shift, text.as_deref()));
+                    assert!(
+                        binding.is_none(),
+                        "Ctrl+Option+{c}（shift: {shift}, text: {text:?}）が拾われている: {binding:?}",
+                    );
+                }
+            }
+        }
+
+        for shift in [false, true] {
+            for text in [Some("\u{2}"), None] {
+                let mut kp = ctrl_option_press("b", shift, text);
+                kp.modifiers |= keyboard::Modifiers::COMMAND;
+                let binding = editor_key_binding(kp);
+                assert!(
+                    binding.is_none(),
+                    "Cmd+Ctrl+Option+B（shift: {shift}, text: {text:?}）が拾われている: {binding:?}",
+                );
+            }
+        }
+    }
+
+    /// **フォーカスが無いエディタでは `Ctrl+Option+B` / `F` を効かせないこと（issue 18）。**
+    /// 理由は `control_keys_do_nothing_while_the_editor_is_unfocused` と同じ。
+    #[test]
+    fn control_option_keys_do_nothing_while_the_editor_is_unfocused() {
+        for (c, control) in [("b", "\u{2}"), ("f", "\u{6}")] {
+            for shift in [false, true] {
+                let mut kp = ctrl_option_press(c, shift, Some(control));
+                kp.status = text_editor::Status::Active;
+                assert!(
+                    editor_key_binding(kp).is_none(),
+                    "フォーカスの無いエディタが Ctrl+Option+{c}（shift: {shift}）に反応している",
+                );
+            }
+        }
+    }
+
+    /// **`Ctrl+Option+B` で本文のカーソルが 1 単語左へ動くこと（issue 18）。** binding の答えを
+    /// 本番と同じ `Message::Edit` で流し、`"foo bar"` の末尾から `"bar"` の頭へ移ることを見る。
+    #[test]
+    fn ctrl_option_b_moves_one_word_left_in_the_body() {
+        use iced::advanced::text::editor::{Action, Position};
+
+        let (_dir, mut app) = app_with_vault("ctrl-option-b-word-left");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "foo bar");
+        put_cursor_at(&mut app, 0, "foo bar".len());
+
+        let Some(text_editor::Binding::Move(motion)) =
+            editor_key_binding(ctrl_option_press("b", false, Some("\u{2}")))
+        else {
+            panic!("Ctrl+Option+B が Move にならない");
+        };
+        send(&mut app, Message::Edit(Action::Move(motion)));
+
+        assert_eq!(app.content.text(), "foo bar", "移動で本文が変わっている");
+        assert_eq!(app.content.cursor().position, Position { line: 0, column: "foo ".len() });
     }
 
     /// 修飾なしの打鍵はそのまま入ること（塞ぎすぎていないことの裏取り）。
