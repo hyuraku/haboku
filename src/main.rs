@@ -2952,7 +2952,7 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
     // `Option+↑/↓` でカーソル行（選択があれば選択範囲の行）を上下の行と入れ替える（issue 10）。既定は
     // `Move(Up/Down)` を返す（`jump()` の `widen()` が `Up/Down` を変えない）＝答えを出すので、後ろでは
     // 補えない。**既定より先に**見る（issue 02 と同じ ADR-0016 の例外）。修飾は完全一致で、
-    // `Shift+Option+↑/↓`（issue 16 の行複製に取ってある）・`Cmd+Option+↑/↓` は既定に任せる。
+    // `Shift+Option+↑/↓` は直前の分岐（issue 16 の行複製）が拾い、`Cmd+Option+↑/↓` は既定に任せる。
     if focused && kp.modifiers == keyboard::Modifiers::ALT {
         match key.as_ref() {
             keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
