@@ -391,7 +391,7 @@ enum PendingAction {
     Close(iced::window::Id),
 }
 
-/// 上下の向き。`Option+↑/↓` の行移動（issue 10）が使う。
+/// 上下の向き。`Option+↑/↓` の行移動（issue 10）と `Shift+Option+↑/↓` の行複製（issue 16）が使う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Vertical {
     Up,
@@ -459,6 +459,12 @@ enum Message {
     /// **`Binding` では書けないのでメッセージにしてある。** `Action` / `Edit` に行の入れ替えは無く、
     /// 入れ替える行の本文は `KeyPress` からは読めない。
     MoveLine(Vertical),
+    /// `Shift+Option+↑/↓`。カーソル行（選択があれば選択範囲の行）を下・上に複製する。本文はどちらも
+    /// 同じで、違うのはカーソルの行き先だけ（issue 16）。
+    ///
+    /// **`Binding` では書けないのでメッセージにしてある。** `Action` / `Edit` に行の複製は無く、
+    /// 複製する行の本文は `KeyPress` からは読めない。
+    DuplicateLine(Vertical),
     /// `Cmd+B` / `Cmd+I`。選択を `**` / `*` で囲む。既に囲まれていれば外す。選択が無ければ
     /// 記号を 2 つ入れてカーソルを中に置く（issue 06）。中身は囲む記号。
     ///
@@ -1107,6 +1113,9 @@ enum EditKind {
     /// `Option+↑/↓`（issue 10）。`Edit::Paste` で流すが `Paste` とは分ける（`Heading` と同じ理由）。
     /// **連打はまとめない**（1 回の押下 = 1 ステップ）。行を何段か運んだあと、1 段ずつ戻せるようにする。
     MoveLine,
+    /// `Shift+Option+↑/↓`（issue 16）。`Edit::Paste` で流すが `Paste` とは分ける（`Heading` と同じ理由）。
+    /// **連打はまとめない**（`MoveLine` と同じ。1 回の押下 = 1 ステップ）。
+    DuplicateLine,
 }
 
 /// undo に積める段数の上限。
@@ -2278,6 +2287,46 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             });
             app.edit_group = None;
         }
+        // `Shift+Option+↑/↓`（issue 16）。**行範囲 s..=e（選択があれば選択がかかる行全部）の本文を、
+        // e 行の末尾に `"\n" + 本文` として貼る。** 複製は元と同じ本文なので、上下どちらも貼る位置は同じで、
+        // 違うのはカーソルの行き先だけ。`Content` は作り直さない（issue 10 と同じ型）。行の結合は `"\n"`
+        // （CRLF のノートでは新しい改行が LF になる。issue 10 と同じ既存の性質）。空行・空のノートでも
+        // 複製する（改行が 1 つ増える。VS Code と同じ）。
+        //
+        // **`Message::Edit` を通さない**（issue 10 と同じ型）。undo へは**カーソルを動かす前に**積む。後で
+        // 積むと、戻したときにカーソルが行末へ行く。**連打はまとめない**ので、積む前と貼った後の両方で
+        // まとまりを切る（1 回の押下 = 1 ステップ）。
+        Message::DuplicateLine(direction) => {
+            use iced::advanced::text::editor::{Action, Edit, Motion};
+
+            let line =
+                |app: &App, n: usize| app.content.line(n).map_or(String::new(), |l| l.text.to_string());
+            let cursor = app.content.cursor();
+            let anchor = cursor.selection.unwrap_or(cursor.position).line;
+            let (first, end) = (
+                cursor.position.line.min(anchor),
+                cursor.position.line.max(anchor),
+            );
+            let block = (first..=end).map(|n| line(app, n)).collect::<Vec<_>>().join("\n");
+            // `↓` は下の複製へ移る（範囲の行数だけ下がる）。`↑` は元の行番号＝上の複製に留まる。
+            // 選択は解く（複製後にブロックを選び直さない。issue 16 の決定）。
+            let target = match direction {
+                Vertical::Up => cursor.position.line,
+                Vertical::Down => cursor.position.line + (end - first + 1),
+            };
+
+            app.edit_group = None;
+            begin_edit_group(app, EditKind::DuplicateLine);
+            // **`move_to` は選択を解かない**（`selection: None` を渡しても張ったまま）。`Move(Home)` で
+            // 解いてから e 行の末尾へ置く（`move_to_line_start` と同じ手）。選択が残ったまま貼ると、
+            // `Paste` が選択を置き換えて選んだ文字が消える。
+            app.content.perform(Action::Move(Motion::Home));
+            put_cursor_at(app, end, line(app, end).len());
+            perform(app, Action::Edit(Edit::Paste(std::sync::Arc::new(format!("\n{block}")))));
+            // 範囲の中の列は変わらないので、列はそのままで同じ文字の位置へ戻る。
+            put_cursor_at(app, target, cursor.position.column);
+            app.edit_group = None;
+        }
         Message::Tick(now) => {
             if app.saved_flash_until.is_some_and(|until| now >= until) {
                 app.saved_flash_until = None;
@@ -2881,6 +2930,22 @@ fn editor_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<
         }
         if kp.modifiers == keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT {
             return Some(text_editor::Binding::Select(motion));
+        }
+    }
+
+    // `Shift+Option+↑/↓` でカーソル行（選択があれば選択範囲の行）を下・上に複製する（issue 16）。既定は
+    // `Select(Up/Down)`（1 行分の選択）を返す＝答えを出すので、後ろでは補えない。**既定より先に**見る
+    // （issue 10 と同じ ADR-0016 の例外）。このキーの「1 行分の選択」は失われる（利用者の決定。
+    // `Shift+↑/↓`・`Shift+Cmd+↑/↓` の選択は残る）。修飾は完全一致。
+    if focused && kp.modifiers == keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT {
+        match key.as_ref() {
+            keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                return Some(text_editor::Binding::Custom(Message::DuplicateLine(Vertical::Up)));
+            }
+            keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
+                return Some(text_editor::Binding::Custom(Message::DuplicateLine(Vertical::Down)));
+            }
+            _ => {}
         }
     }
 
@@ -7519,25 +7584,6 @@ mod tests {
         }
     }
 
-    /// **修飾キーは完全一致で見ること。** `Shift+Option+↑/↓` は拾わず、既定（`Select(Up/Down)`）に任せる
-    /// （issue 16 の行複製で変えるまで）。
-    #[test]
-    fn shift_option_up_down_is_left_to_the_default() {
-        use iced::advanced::text::editor::Motion;
-        use keyboard::key::Named;
-
-        for (k, motion) in [(Named::ArrowUp, Motion::Up), (Named::ArrowDown, Motion::Down)] {
-            let binding = editor_key_binding(arrow_press(
-                k,
-                keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT,
-            ));
-            assert!(
-                matches!(binding, Some(text_editor::Binding::Select(m)) if m == motion),
-                "Shift+Option+{k:?} を既定以外で拾っている: {binding:?}",
-            );
-        }
-    }
-
     /// フォーカスが無いときは拾わない（パレット表示中に見ていない本文の行が入れ替わる）。
     #[test]
     fn option_up_down_does_nothing_while_the_editor_is_unfocused() {
@@ -7691,6 +7737,195 @@ mod tests {
 
         send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
         assert_eq!(app.content.text(), "a\nb\nc", "2 回目の Cmd+Z で元に戻っていない");
+        assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
+    }
+
+    /// **`Shift+Option+↑/↓` は `update()` へ回すこと。** 既定は `Select(Up/Down)`（1 行分の選択）を返す
+    /// ので、補わないと複製されずに選択が伸びるだけになる（issue 16）。修飾は完全一致。
+    ///
+    /// `text` は実機の `None` に加えて、想定外の `Some("")` でも同じ答えになることを見る（issue 02 と同じ）。
+    #[test]
+    fn shift_option_up_down_is_handled_by_the_update_loop() {
+        use keyboard::key::Named;
+
+        for (k, direction) in [(Named::ArrowUp, Vertical::Up), (Named::ArrowDown, Vertical::Down)] {
+            for text in [None, Some("")] {
+                let mut kp =
+                    arrow_press(k, keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT);
+                kp.text = text.map(Into::into);
+                let binding = editor_key_binding(kp);
+                assert!(
+                    matches!(binding, Some(text_editor::Binding::Custom(Message::DuplicateLine(d))) if d == direction),
+                    "Shift+Option+{k:?}（text: {text:?}）が行複製にならない: {binding:?}",
+                );
+            }
+        }
+    }
+
+    /// `Shift+↑/↓` の 1 行分の選択は変わらないこと（既定が `Select(Up/Down)` を返している）。
+    #[test]
+    fn shift_up_down_still_selects_one_line() {
+        use iced::advanced::text::editor::Motion;
+        use keyboard::key::Named;
+
+        for (k, motion) in [(Named::ArrowUp, Motion::Up), (Named::ArrowDown, Motion::Down)] {
+            let binding = editor_key_binding(arrow_press(k, keyboard::Modifiers::SHIFT));
+            assert!(
+                matches!(binding, Some(text_editor::Binding::Select(m)) if m == motion),
+                "Shift+{k:?} が {motion:?} の選択にならない: {binding:?}",
+            );
+        }
+    }
+
+    /// フォーカスが無いときは拾わない（パレット表示中に見ていない本文の行が増える）。
+    #[test]
+    fn shift_option_up_down_does_nothing_while_the_editor_is_unfocused() {
+        use keyboard::key::Named;
+
+        for k in [Named::ArrowUp, Named::ArrowDown] {
+            let mut kp = arrow_press(k, keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT);
+            kp.status = text_editor::Status::Active;
+            assert!(
+                editor_key_binding(kp).is_none(),
+                "フォーカスの無いエディタが Shift+Option+{k:?} に反応している",
+            );
+        }
+    }
+
+    /// 打鍵から binding を経て `update()` まで、本番と同じ経路で `Shift+Option+↑/↓` を押す。
+    fn press_shift_option_arrow(app: &mut App, k: keyboard::key::Named) {
+        let Some(text_editor::Binding::Custom(message)) = editor_key_binding(arrow_press(
+            k,
+            keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT,
+        )) else {
+            panic!("Shift+Option+{k:?} が Custom メッセージにならない");
+        };
+        send(app, message);
+    }
+
+    /// **`a|\nb` で `Shift+Option+↓` → `a\na|\nb`、`Shift+Option+↑` → `a|\na\nb` になること。** 本文は
+    /// どちらも同じで、カーソルは `↓` なら下の複製へ、`↑` なら元の行番号（上の複製）に残る。列は保つ。
+    #[test]
+    fn shift_option_up_down_duplicates_the_cursor_line() {
+        use iced::advanced::text::editor::{Cursor, Position};
+        use keyboard::key::Named;
+
+        let (_dir, mut app) = app_with_vault("duplicate-line");
+        send(&mut app, Message::NoteSelected(0));
+        for (k, line) in [(Named::ArrowDown, 1), (Named::ArrowUp, 0)] {
+            replace_content(&mut app, "a\nb");
+            put_cursor_at(&mut app, 0, 1);
+            app.dirty_since = None;
+
+            press_shift_option_arrow(&mut app, k);
+
+            assert_eq!(app.content.text(), "a\na\nb", "Shift+Option+{k:?} でカーソル行が複製されていない");
+            assert_eq!(
+                app.content.cursor(),
+                Cursor { position: Position { line, column: 1 }, selection: None },
+                "Shift+Option+{k:?} のカーソルの行き先が違う",
+            );
+            assert!(is_dirty(&app), "Shift+Option+{k:?} で編集したのに dirty が立っていない");
+        }
+    }
+
+    /// **選択が 2 行にまたがるときは両方の行をまとめて複製すること。** 選択は解けてよい（issue 16 の
+    /// 決定）。`↓` のカーソルは範囲の行数だけ下がる。
+    #[test]
+    fn shift_option_up_down_duplicates_every_selected_line() {
+        use iced::advanced::text::editor::{Cursor, Position};
+        use keyboard::key::Named;
+
+        let (_dir, mut app) = app_with_vault("duplicate-line-selection");
+        send(&mut app, Message::NoteSelected(0));
+        for (k, line) in [(Named::ArrowDown, 4), (Named::ArrowUp, 2)] {
+            replace_content(&mut app, "a\nbc\nde\nf");
+            app.content.move_to(Cursor {
+                position: Position { line: 2, column: 1 },
+                selection: Some(Position { line: 1, column: 1 }),
+            });
+
+            press_shift_option_arrow(&mut app, k);
+
+            assert_eq!(
+                app.content.text(),
+                "a\nbc\nde\nbc\nde\nf",
+                "Shift+Option+{k:?} で選択にかかる行がまとめて複製されていない",
+            );
+            assert_eq!(
+                app.content.cursor(),
+                Cursor { position: Position { line, column: 1 }, selection: None },
+                "Shift+Option+{k:?} のカーソルの行き先が違う",
+            );
+        }
+    }
+
+    /// **空行も複製すること（改行が 1 つ増える）。** 空のノートも同じ（VS Code と同じ）。
+    #[test]
+    fn shift_option_down_duplicates_an_empty_line() {
+        use iced::advanced::text::editor::Position;
+        use keyboard::key::Named;
+
+        let (_dir, mut app) = app_with_vault("duplicate-line-empty");
+        send(&mut app, Message::NoteSelected(0));
+        for (text, line, expected) in [("a\n\nb", 1, "a\n\n\nb"), ("", 0, "\n")] {
+            replace_content(&mut app, text);
+            put_cursor_at(&mut app, line, 0);
+
+            press_shift_option_arrow(&mut app, Named::ArrowDown);
+
+            assert_eq!(app.content.text(), expected, "{text:?} の空行が複製されていない");
+            assert_eq!(app.content.cursor().position, Position { line: line + 1, column: 0 });
+        }
+    }
+
+    /// **日本語の行も 1 文字も欠けずに複製され、カーソルは同じ文字の後ろに残ること。** 列はバイト位置。
+    #[test]
+    fn shift_option_down_keeps_japanese_lines_intact() {
+        use iced::advanced::text::editor::Position;
+        use keyboard::key::Named;
+
+        let (_dir, mut app) = app_with_vault("duplicate-line-japanese");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "一行目\n漢字の二行目\n三行目");
+        put_cursor_at(&mut app, 1, "漢字の".len());
+
+        press_shift_option_arrow(&mut app, Named::ArrowDown);
+
+        assert_eq!(
+            app.content.text(),
+            "一行目\n漢字の二行目\n漢字の二行目\n三行目",
+            "日本語の行が複製されていない",
+        );
+        assert_eq!(app.content.cursor().position, Position { line: 2, column: "漢字の".len() });
+    }
+
+    /// **連打は 1 回の押下ごとに 1 ステップで、`Cmd+Z` 1 回で 1 つずつ戻ること。** カーソルもその段の
+    /// 位置へ戻る（issue 10 と同じ。issue 16 の受け入れ条件）。
+    #[test]
+    fn repeated_shift_option_down_undoes_one_press_at_a_time() {
+        use iced::advanced::text::editor::{Cursor, Position};
+        use keyboard::key::Named;
+
+        let (_dir, mut app) = app_with_vault("duplicate-line-undo");
+        send(&mut app, Message::NoteSelected(0));
+        replace_content(&mut app, "a\nb");
+        put_cursor_at(&mut app, 0, 1);
+        let before = app.content.cursor();
+
+        press_shift_option_arrow(&mut app, Named::ArrowDown);
+        press_shift_option_arrow(&mut app, Named::ArrowDown);
+        assert_eq!(app.content.text(), "a\na\na\nb", "前提: 2 回複製できていない");
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+        assert_eq!(app.content.text(), "a\na\nb", "1 回の Cmd+Z で 1 つだけ戻っていない");
+        assert_eq!(
+            app.content.cursor(),
+            Cursor { position: Position { line: 1, column: 1 }, selection: None },
+        );
+
+        send(&mut app, pressed(key("z"), keyboard::Modifiers::COMMAND));
+        assert_eq!(app.content.text(), "a\nb", "2 回目の Cmd+Z で元に戻っていない");
         assert_eq!(app.content.cursor(), before, "カーソルが押した位置へ戻っていない");
     }
 
