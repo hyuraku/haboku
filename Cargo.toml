@@ -32,7 +32,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # default-features は Linux 向け backend（wayland / xdg-portal）と blocking API 用の
 # pollster なので全部切る。切った結果 Cargo.lock の増分は rfd 1 crate だけ
 # （objc2 系・block2・dispatch2 は既に依存ツリーにいた）。
-rfd = { version = "0.17.2", default-features = false }
+rfd = { version = "0.18.0", default-features = false }
 
 # 既定メニューの Quit 項目の飛び先を `terminate:` から `performClose:` へ付け替えるためだけ。
 # ADR-0021。**新しい依存ではない**（winit がこの版を使っており、既に依存ツリーにいる）。
